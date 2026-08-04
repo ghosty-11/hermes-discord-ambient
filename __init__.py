@@ -8,7 +8,7 @@ occasionally. Gateway hooks can't help (fire-and-forget observers; only
 pre_tool_call can veto) and `[SILENT]` suppression exists only in cron.
 
 This subclasses the bundled Discord adapter — never forks it, so upstream fixes
-to that 10k-line file keep flowing — and adds four opt-in behaviours:
+to that 10k-line file keep flowing — and adds six opt-in behaviours:
 
 1. AMBIENT JOINING — a message the stock gate rejects for lacking a mention may
    be re-dispatched as if the channel were free-response. Hard rate-limited.
@@ -26,6 +26,20 @@ to that 10k-line file keep flowing — and adds four opt-in behaviours:
    under multiplex every profile shares one process, so a profile that sets
    `auto_thread: false` still gets threads if any other profile wants them.
    This restores per-profile control by refusing thread creation outright.
+6. BOT BOUNCE — a circuit breaker for bot-to-bot conversations. Under
+   DISCORD_ALLOW_BOTS + require_mention in a server full of agents, two bots
+   whose replies auto-@mention each other volley FOREVER — upstream documents
+   the topology as unsupported with no breaker. After 3-5 replies to a given
+   bot in a given conversation (rolled per conversation so her patience
+   varies), the last reply carries a goodbye hint and every later message from
+   that bot is suppressed BEFORE admission: zero inference, zero reply. A
+   human speaking in the channel, or reset_after_seconds of quiet (measured
+   from HER last counted reply, so a bot chattering at a tripped pair cannot
+   hold it open), resets the pair. Humans are never gated. Suppressed ids are
+   claimed in the dedup cache AND the gate runs on the missed-message
+   backfill path too — otherwise reconnect recovery, which dispatches via
+   _dispatch_recovered_message and never touches _dispatch_discord_message,
+   would replay every suppressed message and re-ignite the volley.
 
 HOW (and why this exact seam)
 -----------------------------
@@ -52,11 +66,17 @@ UPSTREAM COUPLING (what discord-adapter-watch.sh guards)
 --------------------------------------------------------
   * DiscordAdapter._discord_free_response_channels() -> set
   * DiscordAdapter._dispatch_discord_message(message) -> bool
+  * DiscordAdapter._dispatch_recovered_message(message) -> bool  (backfill)
   * DiscordAdapter.connect(*, is_reconnect) -> bool
-  * DiscordAdapter.send(...)  (delegated via *args/**kwargs)
+  * DiscordAdapter.send(chat_id, content, reply_to=None, metadata=None)
+      - returns ONE SendResult per call, even when chunk-splitting a long
+        reply (bounce counting = at most one charge per reply)
+      - live replies carry reply_to=<inbound Discord message id>
+        (base.py _reply_anchor_for_event returns event.message_id for
+        Discord) — bounce counting correlates dispatch->send on it
   * DiscordAdapter._add_reaction(message, emoji) -> bool
   * DiscordAdapter._get_no_thread_channels() -> set
-  * self._dedup.discard(message_id) / self._client
+  * self._dedup.discard/contains/is_duplicate(message_id) / self._client
 """
 
 from __future__ import annotations
@@ -101,6 +121,13 @@ _RETURN_HINT = (
     "One or two sentences. If nothing good comes to mind, reply exactly {marker}.]"
 )
 
+_GOODBYE_HINT = (
+    "[ambient: you have been trading replies with {who} — another bot — for a "
+    "while now. This is your LAST reply of this exchange: give a short, "
+    "in-character farewell that clearly closes the conversation. Do not ask "
+    "any questions, do not invite a reply, do not @mention anyone.]"
+)
+
 _DEFAULT_REACTIONS = ["👀", "😹", "✨", "🐈", "💅", "🔥"]
 
 
@@ -115,6 +142,16 @@ class AmbientDiscordAdapter(DiscordAdapter):
         self._presence_task: Any = None
         self._seen_path = self._ambient_seen_path()
         self._last_seen: dict[str, float] = self._load_seen()
+        # Bot-bounce state, in-memory only (a restart resetting everyone's
+        # patience is harmless). (channel_id, bot_id) -> count/limit/last.
+        self._bounce_pairs: dict[tuple[str, str], dict[str, float]] = {}
+        # message_id -> (channel_key, bot_id, dispatched_at): dispatched bot
+        # messages whose reply has not been charged yet. Keyed by the INBOUND
+        # message id because every live Discord reply carries it back as
+        # send(reply_to=...) — exact correlation even when two bots interleave
+        # in one channel or the reply lands in an auto-created thread.
+        # Bounded (stale-purged + size-capped) in _bounce_note_dispatch.
+        self._bounce_pending: dict[str, tuple[str, str, float]] = {}
 
     # ---- config ---------------------------------------------------------
     def _ambient_cfg(self) -> dict:
@@ -291,26 +328,252 @@ class AmbientDiscordAdapter(DiscordAdapter):
         except Exception:
             logger.debug("ambient reaction failed", exc_info=True)
 
-    async def _dispatch_discord_message(self, message: Any) -> bool:
-        token = None
-        if self._ambient_enabled() and self._ambient_cfg().get("no_threads"):
+    # ---- bot-conversation circuit breaker ("bounces") ---------------------
+    # Under DISCORD_ALLOW_BOTS + require_mention among agents, two bots whose
+    # replies auto-@mention each other volley forever — upstream documents the
+    # topology as unsupported, with NO breaker. Sit BEFORE the stock dispatch:
+    # a tripped pair returns False before admission even runs, so suppression
+    # costs zero inference and zero reply. Counting happens at send() time,
+    # not dispatch time, so a [SILENT]-swallowed reply stays free.
+
+    def _bounce_enabled(self) -> bool:
+        return bool(self._sub("bot_bounce").get("enabled"))
+
+    def _bounce_reset_after(self) -> float:
+        return float(self._sub("bot_bounce").get("reset_after_seconds", 1800))
+
+    def _bounce_pair(self, channel_key: str, bot_id: str) -> dict:
+        """Live state for one (channel, bot) conversation, re-rolled if stale."""
+        now = time.time()
+        key = (channel_key, bot_id)
+        pair = self._bounce_pairs.get(key)
+        if pair is not None and now - pair["last"] > self._bounce_reset_after():
+            pair = None  # the conversation went quiet; her patience renews
+        if pair is None:
+            bc = self._sub("bot_bounce")
+            lo = max(1, int(bc.get("min_replies", 3)))
+            hi = max(lo, int(bc.get("max_replies", 5)))
+            # Rolled per conversation so her patience varies naturally.
+            pair = {"count": 0, "limit": random.randint(lo, hi), "last": now}
+            self._bounce_pairs[key] = pair
+            if len(self._bounce_pairs) > 256:
+                # Drop dead pairs first (past reset_after — this method would
+                # re-roll them anyway), then the oldest LIVE pair. A tripped
+                # pair is evicted only when nothing else remains: its "last"
+                # is frozen by design (suppression must not refresh it), so a
+                # plain LRU would preferentially evict tripped pairs and
+                # silently un-trip the breaker in a busy server.
+                cutoff = now - self._bounce_reset_after()
+                for k in [k for k, p in self._bounce_pairs.items()
+                          if p["last"] < cutoff and k != key]:
+                    self._bounce_pairs.pop(k, None)
+                while len(self._bounce_pairs) > 256:
+                    live = [k for k, p in self._bounce_pairs.items()
+                            if p["count"] < p["limit"] and k != key]
+                    pool = live or [k for k in self._bounce_pairs if k != key]
+                    if not pool:
+                        break
+                    oldest = min(pool, key=lambda k: self._bounce_pairs[k]["last"])
+                    self._bounce_pairs.pop(oldest, None)
+        return pair
+
+    def _bounce_reset_channel(self, channel_key: str) -> None:
+        """A human spoke here: the conversation moved on. All pairs reset."""
+        for key in [k for k in self._bounce_pairs if k[0] == channel_key]:
+            del self._bounce_pairs[key]
+        for mid in [m for m, v in self._bounce_pending.items() if v[0] == channel_key]:
+            del self._bounce_pending[mid]
+
+    def _bounce_gate(self, message: Any) -> str | None:
+        """Return "suppress", "goodbye", "count", or None (stay stock).
+
+        Humans are NEVER gated — a human message only resets the channel's
+        pairs. The gate itself never refreshes a pair's clock: "last" moves
+        only at pair creation and when a reply is actually charged
+        (_bounce_count_sent). That is what makes reset_after_seconds measure
+        the CONVERSATION (her replies to that bot) — a bot chattering at a
+        tripped pair, or at some third bot in the channel, cannot defer the
+        renewal that the config promises.
+        """
+        try:
+            if not (self._ambient_enabled() and self._bounce_enabled()):
+                return None
+            if message.author == self._client.user:
+                return None  # her own outbound events; not a conversation
+            channel_key = str(getattr(getattr(message, "channel", None), "id", "") or "")
+            if not channel_key:
+                return None
+            if not getattr(message.author, "bot", False):
+                self._bounce_reset_channel(channel_key)
+                return None
+            bot_id = str(getattr(message.author, "id", "") or "")
+            if not bot_id:
+                return None
+            pair = self._bounce_pair(channel_key, bot_id)
+            if pair["count"] >= pair["limit"]:
+                logger.info(
+                    "ambient.bot_bounce: suppressed bot %s in %s (%d/%d replies spent)",
+                    bot_id, channel_key, int(pair["count"]), int(pair["limit"]),
+                )
+                return "suppress"
+            return "goodbye" if pair["count"] == pair["limit"] - 1 else "count"
+        except Exception:
+            logger.debug("ambient.bot_bounce gate failed; falling back to stock", exc_info=True)
+            return None
+
+    def _bounce_note_dispatch(self, message: Any) -> None:
+        """Mark this dispatched bot message so the reply anchored to it is
+        charged to the right pair.
+
+        The agent's reply is produced on another task (possibly after text
+        batching), so a ContextVar cannot correlate dispatch with send. What
+        DOES survive the task hop is the reply anchor: base.py routes every
+        live Discord reply through send(reply_to=<inbound message id>). Keying
+        the marker on the message id — not the channel — means two bots
+        interleaving in one channel each get charged for exactly their own
+        reply (a channel-keyed marker was overwritten by whichever bot spoke
+        last, cross-charging pairs), and a reply that lands in an auto-created
+        thread still finds its marker even though its chat_id differs from
+        the channel the pair is keyed on.
+        """
+        try:
+            self._bounce_pending[str(message.id)] = (
+                str(message.channel.id), str(message.author.id), time.time(),
+            )
+            if len(self._bounce_pending) > 128:
+                # Replies that never materialize would otherwise pin their
+                # markers forever: purge stale, then cap hard.
+                cutoff = time.time() - max(600.0, self._bounce_reset_after())
+                for mid in [m for m, v in self._bounce_pending.items() if v[2] < cutoff]:
+                    self._bounce_pending.pop(mid, None)
+                while len(self._bounce_pending) > 128:
+                    oldest = min(self._bounce_pending, key=lambda m: self._bounce_pending[m][2])
+                    self._bounce_pending.pop(oldest, None)
+        except Exception:
+            pass
+
+    def _bounce_discard_pending(self, reply_to: Any) -> None:
+        try:
+            self._bounce_pending.pop(str(reply_to or ""), None)
+        except Exception:
+            pass
+
+    def _bounce_count_sent(self, reply_to: Any, result: Any) -> None:
+        """Charge one actually-sent reply to the bot message it answers."""
+        try:
+            key = str(reply_to or "")
+            pending = self._bounce_pending.get(key)
+            if pending is None:
+                return
+            if result is not None and not getattr(result, "success", True):
+                # The reply never landed. LEAVE the marker: _send_with_retry
+                # retries the same reply with the same reply_to, and a retry
+                # that succeeds must still be charged.
+                return
+            self._bounce_pending.pop(key, None)
+            channel_key, bot_id, dispatched_at = pending
+            if time.time() - dispatched_at > max(600.0, self._bounce_reset_after()):
+                return  # stale marker from a long-dead dispatch
+            pair = self._bounce_pairs.get((channel_key, bot_id))
+            if pair is None:
+                return  # reset in the meantime (human spoke, or timed out)
+            pair["count"] += 1
+            pair["last"] = time.time()
+            logger.info(
+                "ambient.bot_bounce: reply %d/%d to bot %s in %s",
+                int(pair["count"]), int(pair["limit"]), bot_id, channel_key,
+            )
+        except Exception:
+            logger.debug("ambient.bot_bounce count failed", exc_info=True)
+
+    def _bounce_pre_dispatch(self, message: Any) -> str | None:
+        """Run the gate and apply its verdict's pre-dispatch side effects.
+
+        Shared by the live path (_dispatch_inner) and the recovered path
+        (_dispatch_recovered_message) so backfill replay cannot slip past
+        the breaker.
+        """
+        verdict = self._bounce_gate(message)
+        if verdict == "suppress":
+            # Claim the id in the dedup cache. Missed-message backfill treats
+            # an unclaimed, never-answered message as "missed" and replays it
+            # via _dispatch_recovered_message — so an unclaimed suppression
+            # would manufacture backfill debt: every suppressed message comes
+            # back after a reconnect, costing the inference and the reply the
+            # breaker existed to prevent. Claimed = invisible to the scan.
             try:
-                keys = {str(message.channel.id)}
-                parent = self._get_parent_channel_id(message.channel)
-                if parent:
-                    keys.add(str(parent))
-                token = _no_thread_keys.set(keys)
+                self._dedup.is_duplicate(str(getattr(message, "id", "")))
             except Exception:
-                token = None
+                pass
+        elif verdict == "goodbye":
+            try:
+                who = getattr(message.author, "display_name", "the other bot")
+                hint = str(
+                    self._sub("bot_bounce").get("goodbye_hint") or _GOODBYE_HINT
+                ).replace("{who}", str(who))
+                message.content = f"{hint}\n\n{getattr(message, 'content', '')}"
+                logger.info(
+                    "ambient.bot_bounce: last allowed reply to %s — goodbye hint injected",
+                    who,
+                )
+            except Exception:
+                pass  # frozen message object; the breaker still trips next round
+        return verdict
+
+    def _ambient_no_thread_token(self, message: Any):
+        """ContextVar token scoping no-thread keys to one dispatch, or None."""
+        if not (self._ambient_enabled() and self._ambient_cfg().get("no_threads")):
+            return None
+        try:
+            keys = {str(message.channel.id)}
+            parent = self._get_parent_channel_id(message.channel)
+            if parent:
+                keys.add(str(parent))
+            return _no_thread_keys.set(keys)
+        except Exception:
+            return None
+
+    async def _dispatch_discord_message(self, message: Any) -> bool:
+        token = self._ambient_no_thread_token(message)
         try:
             return await self._dispatch_inner(message)
         finally:
             if token is not None:
                 _no_thread_keys.reset(token)
 
+    async def _dispatch_recovered_message(self, message: Any) -> bool:
+        """Missed-message backfill dispatches recovered messages through here
+        and NEVER through _dispatch_discord_message — without this override
+        both the bounce gate and no-thread scoping are bypassed on replay.
+        A tripped pair suppresses the replay at zero inference (and a
+        suppressed message does not count against the scan's max_dispatches);
+        everything else runs the stock recovery gates untouched.
+        """
+        token = self._ambient_no_thread_token(message)
+        try:
+            verdict = self._bounce_pre_dispatch(message)
+            if verdict == "suppress":
+                return False
+            handled = await super()._dispatch_recovered_message(message)
+            if handled and verdict in ("goodbye", "count"):
+                self._bounce_note_dispatch(message)
+            return handled
+        finally:
+            if token is not None:
+                _no_thread_keys.reset(token)
+
     async def _dispatch_inner(self, message: Any) -> bool:
+        # Bot bounce first: a tripped pair must cost NOTHING, so it returns
+        # before admission runs. Every un-tripped message falls through to the
+        # stock path with all auth/dedup/gate logic untouched.
+        verdict = self._bounce_pre_dispatch(message)
+        if verdict == "suppress":
+            return False
+
         # Stock path first: preserves the dedup claim and every auth gate.
         if await super()._dispatch_discord_message(message):
+            if verdict in ("goodbye", "count"):
+                self._bounce_note_dispatch(message)
             return True
 
         if not self._ambient_enabled():
@@ -415,9 +678,22 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.debug("ambient: could not start presence rotation", exc_info=True)
         return ok
 
-    # ---- silence --------------------------------------------------------
+    # ---- silence + bounce accounting -------------------------------------
     async def send(self, chat_id: str, content: str, *args: Any, **kwargs: Any):
-        """Swallow the sentinel so the agent may choose to stay quiet."""
+        """Swallow the sentinel so the agent may choose to stay quiet.
+
+        Also the bot-bounce counting point: a reply is charged to its pair
+        only when it actually goes out, and the charge is correlated by the
+        reply_to anchor (the inbound message id every live Discord reply
+        carries), NOT by chat_id — so interleaved bots in one channel are
+        each charged for their own reply, and unrelated sends to the channel
+        (cron delivery, notices) can never consume a marker. Upstream send()
+        chunks a long reply internally and returns ONE SendResult, and the
+        marker is popped on the first successful use, so a reply costs AT
+        MOST one count no matter how many chunks or retries it becomes
+        (batched events can still make it zero — the safe direction).
+        """
+        reply_to = kwargs.get("reply_to", args[0] if args else None)
         if self._ambient_enabled() and isinstance(content, str):
             marker = self._ambient_marker()
             stripped = content.strip()
@@ -425,13 +701,18 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 stripped.startswith(marker) and len(stripped) <= len(marker) + 8
             ):
                 logger.info("ambient: response suppressed by %s sentinel", marker)
+                # A swallowed reply was never sent: it must not count against
+                # the pair, nor sit around to be charged to a later send.
+                self._bounce_discard_pending(reply_to)
                 try:
                     from gateway.platforms.base import SendResult  # type: ignore
 
                     return SendResult(success=True, message_id=None)
                 except Exception:
                     return None
-        return await super().send(chat_id, content, *args, **kwargs)
+        result = await super().send(chat_id, content, *args, **kwargs)
+        self._bounce_count_sent(reply_to, result)
+        return result
 
 
 def register(ctx) -> None:
