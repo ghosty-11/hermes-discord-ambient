@@ -1,0 +1,34 @@
+name: discord-ambient
+label: Discord (ambient presence)
+kind: platform
+version: 1.0.0
+description: >
+  Subclasses the bundled Discord adapter to add opt-in "ambient presence":
+  a profile may occasionally join conversations it was not mentioned in
+  (hard rate-limited), and may decline to speak by answering with a
+  [SILENT] sentinel that the adapter swallows. Profiles that do not set
+  DISCORD_AMBIENT_ENABLED=true behave exactly like stock Discord.
+  Built for an always-on agent host, 2026-08-04.
+author: ghosty
+optional_env:
+  - name: DISCORD_AMBIENT_ENABLED
+    description: "Enable ambient presence for this profile (true/false)"
+    password: false
+  - name: DISCORD_AMBIENT_CHANNELS
+    description: "Comma-separated channel IDs where ambient joining is allowed (required; no wildcard)"
+    password: false
+  - name: DISCORD_AMBIENT_COOLDOWN_SECONDS
+    description: "Minimum seconds between unprompted messages (default 1800)"
+    password: false
+  - name: DISCORD_AMBIENT_MAX_PER_DAY
+    description: "Rolling 24h cap on unprompted messages (default 12)"
+    password: false
+  - name: DISCORD_AMBIENT_PROBABILITY
+    description: "Chance a qualifying message triggers a join, 0-1 (default 0.12)"
+    password: false
+  - name: DISCORD_AMBIENT_NAME_TRIGGERS
+    description: "Comma-separated plain-text names that always trigger consideration"
+    password: false
+  - name: DISCORD_AMBIENT_SILENT_MARKER
+    description: "Sentinel response that is swallowed instead of sent (default [SILENT])"
+    password: false
