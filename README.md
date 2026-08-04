@@ -28,7 +28,7 @@ serious work.
 
 | Behaviour | Cost | Notes |
 |---|---|---|
-| **Ambient joining** | 1 inference | A message the stock gate rejects for lacking a mention may be re-dispatched as if the channel were free-response. Rate-limited by cooldown, daily cap and probability. Plain-text name triggers (which Discord's @-detection misses entirely) always qualify. |
+| **Ambient joining** | 1 inference | A message the stock gate rejects for lacking a mention may be re-dispatched as if the channel were free-response. Random joins are rate-limited by cooldown, daily cap and probability. Plain-text name triggers (which Discord's @-detection misses entirely) **bypass both** — typing the bot's name is addressing it, and "not now, I spoke recently" reads as broken; only a short anti-spam floor applies. The budget is charged only when a join actually reaches the agent, since the re-dispatch can still be refused by an auth gate. |
 | **Silence** | — | The model may answer with a sentinel (`[SILENT]`) which the adapter swallows, so it can see a message and decide not to speak. |
 | **Reactions** | **zero** | Messages it doesn't answer may still get an emoji reaction, chosen by regex→emoji rules with a fallback pool. Costs no inference at all — the difference between a bot that feels present and one that feels absent between slow or expensive replies. People react far more often than they reply. |
 | **Return greetings** | 1 inference | Someone's first message after N days away is prioritised over the dice, with a hint telling the model they've been gone. Last-seen state persists across restarts. |
@@ -87,6 +87,7 @@ platforms:
         cooldown_seconds: 1800
         max_per_day: 10
         name_triggers: ["companion"]  # plain-text names Discord's @-detection misses
+        name_cooldown_seconds: 60  # anti-spam floor for name hits (NOT the long cooldown)
         silent_marker: "[SILENT]"
         no_threads: true           # never auto-create threads for this profile
         reactions:

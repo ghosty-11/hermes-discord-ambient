@@ -228,23 +228,35 @@ class AmbientDiscordAdapter(DiscordAdapter):
         except Exception:
             return 0.0
 
-    def _should_join_ambiently(self, message: Any) -> bool:
+    def _join_reason(self, message: Any) -> str | None:
+        """Return "named", "random", or None.
+
+        Name triggers deliberately BYPASS the ambient cooldown and the daily
+        cap: typing the bot's name is addressing it, and being told "not now,
+        I already spoke recently" reads as broken rather than as restraint.
+        Only a short anti-spam floor applies to them. The long cooldown exists
+        to stop the bot inserting itself into conversations uninvited, which is
+        a different thing entirely.
+        """
         cfg = self._ambient_cfg()
         try:
             if not self._basic_ambient_eligible(message):
-                return False
-            if not self._ambient_quota_ok():
-                return False
+                return None
             content = (getattr(message, "content", "") or "").lower()
             # A plain-text name reference is the case Discord's @-mention
-            # detection misses entirely — always worth considering.
+            # detection misses entirely.
             triggers = [str(t).lower() for t in (cfg.get("name_triggers") or [])]
             if triggers and any(t in content for t in triggers):
-                return True
-            return random.random() < float(cfg.get("probability", 0.12))
+                floor = float(cfg.get("name_cooldown_seconds", 60))
+                if time.time() - self._ambient_last < floor:
+                    return None
+                return "named"
+            if not self._ambient_quota_ok():
+                return None
+            return "random" if random.random() < float(cfg.get("probability", 0.12)) else None
         except Exception:
             logger.debug("ambient pre-filter failed; falling back to stock", exc_info=True)
-            return False
+            return None
 
     # ---- reactions (zero inference) --------------------------------------
     def _pick_reaction(self, message: Any) -> str | None:
@@ -306,13 +318,11 @@ class AmbientDiscordAdapter(DiscordAdapter):
         try:
             returning_days = self._returning_after_absence(message)
             eligible = self._basic_ambient_eligible(message)
-            join = False
-            if eligible and returning_days and self._ambient_quota_ok():
-                join = True  # a real return beats the dice
-            elif self._should_join_ambiently(message):
-                join = True
+            reason = self._join_reason(message)
+            if not reason and eligible and returning_days and self._ambient_quota_ok():
+                reason = "return"  # a real return beats the dice
 
-            if not join:
+            if not reason:
                 await self._maybe_react(message)  # seen, but not worth words
                 return False
 
@@ -334,15 +344,23 @@ class AmbientDiscordAdapter(DiscordAdapter):
             except Exception:
                 pass  # some message objects are frozen; the nudge is optional
 
-            now = time.time()
-            self._ambient_last = now
-            self._ambient_hits.append(now)
-
             token = _ambient_open.set(True)
             try:
-                return await super()._dispatch_discord_message(message)
+                handled = await super()._dispatch_discord_message(message)
             finally:
                 _ambient_open.reset(token)
+
+            # Charge the budget ONLY for a join that actually reached the agent.
+            # The re-dispatch re-runs every auth gate, so it can still be
+            # refused (unauthorized author, ignored channel). Charging up front
+            # let a refused message burn the cooldown and silence the bot for
+            # the next half hour — including for people saying its name.
+            if handled:
+                now = time.time()
+                self._ambient_last = now
+                if reason == "random":
+                    self._ambient_hits.append(now)
+            return handled
         except Exception:
             logger.warning("ambient dispatch failed; message left unanswered", exc_info=True)
             return False
