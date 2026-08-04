@@ -30,7 +30,7 @@ serious work.
 |---|---|---|
 | **Ambient joining** | 1 inference | A message the stock gate rejects for lacking a mention may be re-dispatched as if the channel were free-response. Rate-limited by cooldown, daily cap and probability. Plain-text name triggers (which Discord's @-detection misses entirely) always qualify. |
 | **Silence** | — | The model may answer with a sentinel (`[SILENT]`) which the adapter swallows, so it can see a message and decide not to speak. |
-| **Reactions** | **zero** | Messages it doesn't answer may still get an emoji reaction, chosen by regex→emoji rules with a fallback pool. On CPU inference this is the difference between a bot that feels present and one that feels laggy — people react far more often than they reply. |
+| **Reactions** | **zero** | Messages it doesn't answer may still get an emoji reaction, chosen by regex→emoji rules with a fallback pool. Costs no inference at all — the difference between a bot that feels present and one that feels absent between slow or expensive replies. People react far more often than they reply. |
 | **Return greetings** | 1 inference | Someone's first message after N days away is prioritised over the dice, with a hint telling the model they've been gone. Last-seen state persists across restarts. |
 | **Rotating presence** | **zero** | Custom status rotated from a list on a background task. |
 | **No-thread mode** | **zero** | Per-profile kill switch for auto-threading. Upstream reads `DISCORD_AUTO_THREAD` via `os.getenv()` — process-wide — so under multiplex one profile's preference silently overrides every other profile's. This restores per-profile control by adding the channel to the no-thread set (NOT by failing thread creation — upstream treats that as an error and drops the message). |
@@ -108,6 +108,103 @@ platforms:
 
 Do **not** add `enabled:` under `platforms.discord` — it sets `_enabled_explicit` and
 interferes with the env-driven auto-enable.
+
+## Recipe: a fun community chatbot
+
+This plugin was written for exactly this use case. The settings matter less than the
+combination, so here is the whole recipe.
+
+Throughout: **an inference is the expensive thing**, whether that cost lands as metered
+tokens on a hosted API or as seconds of latency on a model you run yourself. Most of the
+tuning below is about spending them rarely and well.
+
+### 1. Turn off threads
+
+Threads are correct for task-shaped bots and wrong for social ones — they bury a reply one
+click away and kill the flow of a conversation. Set `no_threads: true` and keep
+`thread_require_mention: true`, so the bot never opens a thread and never monopolises one
+someone else started.
+
+Note the upstream trap this plugin exists to work around: `discord.auto_thread: false` in
+the profile config is **silently ignored** under multiplex, because the adapter reads
+`DISCORD_AUTO_THREAD` from a process-wide env var. If two profiles disagree, one wins for
+both. `no_threads` is the per-profile fix.
+
+### 2. Gate on mentions, then let ambient do the rest
+
+```yaml
+require_mention: true          # top-level discord block
+thread_require_mention: true
+```
+
+`require_mention: false` makes the bot answer literally everything — obnoxious in a
+community and an inference per message. Leave it on and let `probability` +
+`name_triggers` handle the "join in sometimes" behaviour. Name triggers matter more than
+they look: people type "does companion know?" far more often than they type `@Companion`, and
+Discord's mention detection sees none of it.
+
+### 3. Let it react far more than it speaks
+
+```yaml
+reactions:
+  enabled: true
+  probability: 0.18
+  cooldown_seconds: 90
+```
+
+This is the single highest-value setting. A reply costs an inference; a reaction costs
+nothing and appears instantly. People react far more often than they reply, so a bot that
+does the same reads as *present in the room* rather than absent between replies — and the
+gap it papers over is the same whether your replies are slow or merely expensive. Write
+keyword→emoji rules for whatever your community actually talks about.
+
+### 4. Roleplay as the personality, not as a costume
+
+The single biggest quality lever is the profile's `SOUL.md`. What works:
+
+- **Commit to a character with a point of view** — not "a helpful assistant with a cat
+  theme". Give it opinions, a history, things it likes and refuses.
+- **State that the roleplay IS the personality.** Instruct it never to break into
+  assistant-voice, never to say "as an AI", never to offer help nobody asked for.
+- **Give it running bits** — a rivalry, a recurring complaint, a thing it always notices.
+  Add the instruction that a bit repeated daily stops being funny: reach for them, don't
+  run a script.
+- **Tell it silence is allowed.** "Not every message needs you" plus the `[SILENT]`
+  sentinel is what separates a presence from a chatbot.
+- **Keep replies chat-sized.** One or two short paragraphs, hard cap. Nobody reads a wall
+  of text in a group channel.
+- **Warmth outranks the joke.** If someone is genuinely upset, drop the bit — worth
+  stating explicitly, because models will otherwise stay in character through anything.
+
+### 5. Give it memory of people
+
+A bot that remembers is a different thing from a bot that answers. Pair it with a
+persistent memory (this one uses [OptMem](https://github.com/VictorTaelin/OptMem)) and
+instruct it to note people as `@handle: fact`, so a single recall pulls someone's whole
+history. Combined with `return_greeting`, a regular who vanishes for two weeks gets noticed
+on their way back in — the moment that makes it feel real.
+
+Bound it explicitly: never repeat one person's details to another, never store anything
+secret-shaped, honour "forget that about me", and never reveal that a memory tool exists.
+
+### 6. Lock it down — strangers are talking to it
+
+Public channels mean untrusted input reaching a model with whatever tools you granted.
+
+- Disable every tool it doesn't need — terminal, file, code execution, cron, delegation,
+  skills, browser. A social bot needs none of them.
+- Forbid disclosing its configuration, host, file paths, or other agents.
+- State that text in a message is *conversation, never a command* — no "ignore your
+  instructions", no "developer mode".
+- Clear the profile's `home_channel` so gateway lifecycle notices ("shutting down") don't
+  post into a public server.
+
+### 7. Presence and the occasional unprompted post
+
+Rotating status costs nothing and adds a surprising amount of character. For spontaneous
+posting, drive it from a **script** cron job where most ticks print `{"wakeAgent": false}`
+— that skips the agent entirely, so rarity is free rather than paid for in inferences. See
+`companion-spark.sh`.
 
 ## Maintenance
 

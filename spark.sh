@@ -3,7 +3,7 @@
 #
 # Runs on a cron tick, but MOST ticks decide to do nothing and print
 # {"wakeAgent": false} — which skips the agent entirely, so a skipped roll
-# costs zero inference on a single-slot host. Only when the roll passes do
+# costs zero inference — no tokens, no latency. Only when the roll passes do
 # we emit context, waking her to post one short thing.
 #
 # Rarity = tick frequency x ODDS. At 4 ticks/day and ODDS=6 that averages
