@@ -141,8 +141,15 @@ thread_require_mention: true
 `require_mention: false` makes the bot answer literally everything — obnoxious in a
 community and an inference per message. Leave it on and let `probability` +
 `name_triggers` handle the "join in sometimes" behaviour. Name triggers matter more than
-they look: people type "does companion know?" far more often than they type `@Companion`, and
+they look: people type "does luna know?" far more often than they type `@Luna`, and
 Discord's mention detection sees none of it.
+
+**Check who is actually allowed to talk to it.** If the profile carries
+`DISCORD_ALLOWED_USERS` — easy to inherit when a personal bot is repurposed into a
+community one — every other member is silently rejected and no amount of tuning will make
+it social. A community bot wants `DISCORD_ALLOW_ALL_USERS=true` and no allowlist. This is
+the first thing to check when a bot "won't respond to anyone but you", and it is invisible
+in the logs: rejected messages never appear as inbound at all.
 
 ### 3. Let it react far more than it speaks
 
@@ -152,6 +159,13 @@ reactions:
   probability: 0.18
   cooldown_seconds: 90
 ```
+
+Rate limits are for uninvited interjections **only**. Never let a cooldown suppress a
+direct address: if someone types the bot's name, that is addressing it, and "not now, I
+spoke recently" reads as broken. Name hits should bypass the cooldown and the daily cap,
+with a short anti-spam floor instead — and the budget should be charged only when a join
+actually reaches the agent, since a re-dispatch can still be refused by an auth gate.
+Charging up front lets a refused message burn the window and silence the bot.
 
 This is the single highest-value setting. A reply costs an inference; a reaction costs
 nothing and appears instantly. People react far more often than they reply, so a bot that
@@ -176,6 +190,19 @@ The single biggest quality lever is the profile's `SOUL.md`. What works:
   of text in a group channel.
 - **Warmth outranks the joke.** If someone is genuinely upset, drop the bit — worth
   stating explicitly, because models will otherwise stay in character through anything.
+- **Always answer when addressed; be silent only when uninvited.** These are different
+  rules and the model will conflate them. A bot that goes quiet on someone who @mentioned
+  it looks broken, not restrained — say so explicitly, and scope `[SILENT]` to
+  conversations it was never part of.
+- **Name the stage directions.** Ambient messages arrive prefixed with a bracketed note.
+  Unless you tell the model that bracket is its own impulse, it will eventually quote it
+  in the channel. One sentence prevents it.
+- **Say what it cannot do.** A tool-less bot will be asked to search, remind and fetch.
+  Without instruction it invents results or promises to follow up later, and both are
+  worse than a refusal in character.
+- **Bound bot-to-bot exchanges.** Let it talk to other agents — that is fun — but cap the
+  volley at ~3 turns, resetting when a human joins. Two bots can trade replies forever,
+  and every turn costs an inference on both sides.
 
 ### 5. Give it memory of people
 
@@ -205,7 +232,7 @@ Public channels mean untrusted input reaching a model with whatever tools you gr
 Rotating status costs nothing and adds a surprising amount of character. For spontaneous
 posting, drive it from a **script** cron job where most ticks print `{"wakeAgent": false}`
 — that skips the agent entirely, so rarity is free rather than paid for in inferences. See
-`companion-spark.sh`.
+`spark.sh`.
 
 ## Maintenance
 
@@ -227,7 +254,7 @@ against the bundled adapter before trusting the next `hermes update`.
 
 ## Extras
 
-`companion-spark.sh` — a rare unprompted conversation starter. Runs as a cron **script** job
+`spark.sh` — a rare unprompted conversation starter. Runs as a cron **script** job
 (not `--no-agent`), and most ticks print `{"wakeAgent": false}` so they cost zero
 inference; the rest emit context (optionally a person pulled from
 [OptMem](https://github.com/VictorTaelin/OptMem) memory) to wake the agent for one post.

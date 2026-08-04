@@ -1,33 +1,42 @@
 #!/usr/bin/env bash
-# Companion's rare unprompted spark.
+# Rare unprompted "say something" spark for a Hermes chat profile.
 #
 # Runs on a cron tick, but MOST ticks decide to do nothing and print
 # {"wakeAgent": false} — which skips the agent entirely, so a skipped roll
-# costs zero inference — no tokens, no latency. Only when the roll passes do
-# we emit context, waking her to post one short thing.
+# costs nothing at all: no tokens, no latency. Only when the roll passes do we
+# emit context, waking the agent to post one short thing.
 #
-# Rarity = tick frequency x ODDS. At 4 ticks/day and ODDS=6 that averages
-# ~1 spontaneous post every ~1.5 days.
+# Wire it as a cron SCRIPT job (NOT --no-agent), so stdout is injected into the
+# agent's prompt:
+#   hermes -p <profile> cron create "40 7,13,16 * * *" "<your posting prompt>" \
+#       --script spark.sh --name spark --deliver "discord:<channel_id>"
+#
+# Rarity = tick frequency x SPARK_ODDS. At 3 ticks/day and ODDS=6 that averages
+# roughly one spontaneous post every two days.
+#
+# Config (all optional, via the profile's .env or the job environment):
+#   SPARK_ODDS        1-in-N chance a tick actually fires        (default 6)
+#   MEMORY_DIR        OptMem memory dir; enables greeting a
+#                     remembered person by handle                (default: unset)
+#   MEMO_BIN          path to the optmem `memo` binary           (default ~/.optmem/memo)
 set -uo pipefail
-ODDS="${COMPANION_SPARK_ODDS:-6}"
-MEM=/var/lib/hermes/companion-memory/memory
-MEMO=/var/lib/hermes/.optmem/memo
+ODDS="${SPARK_ODDS:-6}"
+MEMO="${MEMO_BIN:-${HOME}/.optmem/memo}"
 
-if [ "$(( RANDOM % ODDS ))" -ne 0 ]; then
+if [ "${ODDS}" -lt 1 ] 2>/dev/null || [ "$(( RANDOM % ODDS ))" -ne 0 ]; then
     echo '{"wakeAgent": false}'
     exit 0
 fi
 
-# Pick someone she actually remembers, so the greeting has real history behind
-# it rather than being generic noise. Silently degrades to nobody.
+# Pick someone the agent actually remembers, so a greeting carries real history
+# instead of being generic noise. Degrades silently to nobody.
 PERSON=""
-if [ -r "${MEM}/LOG.txt" ]; then
-    PERSON="$(grep -oE '@[A-Za-z0-9_.]+' "${MEM}/LOG.txt" 2>/dev/null | sort -u | shuf -n1 2>/dev/null || true)"
-fi
-
 RECALL=""
-if [ -n "${PERSON}" ]; then
-    RECALL="$(MEMORY_DIR="${MEM}" "${MEMO}" recall "${PERSON}" 2>/dev/null | head -4 || true)"
+if [ -n "${MEMORY_DIR:-}" ] && [ -r "${MEMORY_DIR}/LOG.txt" ]; then
+    PERSON="$(grep -oE '@[A-Za-z0-9_.]+' "${MEMORY_DIR}/LOG.txt" 2>/dev/null | sort -u | shuf -n1 2>/dev/null || true)"
+    if [ -n "${PERSON}" ] && [ -x "${MEMO}" ]; then
+        RECALL="$(MEMORY_DIR="${MEMORY_DIR}" "${MEMO}" recall "${PERSON}" 2>/dev/null | head -4 || true)"
+    fi
 fi
 
 echo "[spark] The room has been quiet and you feel like saying something."

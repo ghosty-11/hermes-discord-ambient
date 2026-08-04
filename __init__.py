@@ -137,7 +137,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
     # ---- last-seen persistence (survives gateway restarts) ---------------
     def _ambient_seen_path(self) -> str:
         try:
-            home = os.getenv("HERMES_HOME") or "/var/lib/hermes/.hermes"
+            home = os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
             return os.path.join(home, "state", "ambient-last-seen.json")
         except Exception:
             return "/tmp/ambient-last-seen.json"
