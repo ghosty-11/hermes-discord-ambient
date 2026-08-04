@@ -33,7 +33,7 @@ serious work.
 | **Reactions** | **zero** | Messages it doesn't answer may still get an emoji reaction, chosen by regex→emoji rules with a fallback pool. On CPU inference this is the difference between a bot that feels present and one that feels laggy — people react far more often than they reply. |
 | **Return greetings** | 1 inference | Someone's first message after N days away is prioritised over the dice, with a hint telling the model they've been gone. Last-seen state persists across restarts. |
 | **Rotating presence** | **zero** | Custom status rotated from a list on a background task. |
-| **No-thread mode** | **zero** | Per-profile kill switch for auto-threading. Upstream reads `DISCORD_AUTO_THREAD` via `os.getenv()` — process-wide — so under multiplex one profile's preference silently overrides every other profile's. This restores per-profile control. |
+| **No-thread mode** | **zero** | Per-profile kill switch for auto-threading. Upstream reads `DISCORD_AUTO_THREAD` via `os.getenv()` — process-wide — so under multiplex one profile's preference silently overrides every other profile's. This restores per-profile control by adding the channel to the no-thread set (NOT by failing thread creation — upstream treats that as an error and drops the message). |
 
 ## Why this seam
 
@@ -119,7 +119,7 @@ DiscordAdapter._dispatch_discord_message()
 DiscordAdapter.connect(*, is_reconnect)
 DiscordAdapter.send()
 DiscordAdapter._add_reaction()
-DiscordAdapter._auto_create_thread()
+DiscordAdapter._get_no_thread_channels()
 self._dedup.discard()
 ```
 

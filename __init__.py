@@ -55,7 +55,7 @@ UPSTREAM COUPLING (what discord-adapter-watch.sh guards)
   * DiscordAdapter.connect(*, is_reconnect) -> bool
   * DiscordAdapter.send(...)  (delegated via *args/**kwargs)
   * DiscordAdapter._add_reaction(message, emoji) -> bool
-  * DiscordAdapter._auto_create_thread(message) -> Optional[thread]
+  * DiscordAdapter._get_no_thread_channels() -> set
   * self._dedup.discard(message_id) / self._client
 """
 
@@ -82,6 +82,11 @@ logger = logging.getLogger(__name__)
 # helper that shares _discord_free_response_channels() never sees it.
 _ambient_open: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "hermes_ambient_open", default=False
+)
+
+# Channel keys for which threading is suppressed, scoped to one dispatch task.
+_no_thread_keys: contextvars.ContextVar[set] = contextvars.ContextVar(
+    "hermes_ambient_no_thread", default=frozenset()
 )
 
 _DEFAULT_HINT = (
@@ -275,6 +280,23 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.debug("ambient reaction failed", exc_info=True)
 
     async def _dispatch_discord_message(self, message: Any) -> bool:
+        token = None
+        if self._ambient_enabled() and self._ambient_cfg().get("no_threads"):
+            try:
+                keys = {str(message.channel.id)}
+                parent = self._get_parent_channel_id(message.channel)
+                if parent:
+                    keys.add(str(parent))
+                token = _no_thread_keys.set(keys)
+            except Exception:
+                token = None
+        try:
+            return await self._dispatch_inner(message)
+        finally:
+            if token is not None:
+                _no_thread_keys.reset(token)
+
+    async def _dispatch_inner(self, message: Any) -> bool:
         # Stock path first: preserves the dedup claim and every auth gate.
         if await super()._dispatch_discord_message(message):
             return True
@@ -326,18 +348,20 @@ class AmbientDiscordAdapter(DiscordAdapter):
             return False
 
     # ---- per-profile no-thread mode --------------------------------------
-    async def _auto_create_thread(self, message: Any):
-        """Refuse auto-threading when this profile opts out.
+    def _get_no_thread_channels(self) -> set:
+        """Add this message's channel to the no-thread set when opted out.
 
-        Upstream decides threading from os.getenv("DISCORD_AUTO_THREAD"), which
-        is process-wide — so under multiplex one profile's preference silently
-        overrides everyone's. Returning None here makes the caller fall through
-        to posting in the channel, which is what per-profile config asked for.
+        Upstream decides threading from os.getenv("DISCORD_AUTO_THREAD") —
+        process-wide, so under multiplex one profile's preference silently
+        overrides everyone's. We cannot instead return None from
+        _auto_create_thread: upstream treats that as a thread-creation FAILURE
+        and deliberately refuses to fall back inline (it posts a visible error
+        and drops the message, see their #20243). So suppress threading one
+        step earlier, via skip_thread, which is the supported route.
         """
-        if self._ambient_enabled() and self._ambient_cfg().get("no_threads"):
-            logger.debug("ambient: auto-thread suppressed for this profile")
-            return None
-        return await super()._auto_create_thread(message)
+        base = super()._get_no_thread_channels()
+        extra = _no_thread_keys.get()
+        return (base | extra) if extra else base
 
     # ---- rotating presence (zero inference) ------------------------------
     async def _presence_loop(self) -> None:
