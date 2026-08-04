@@ -21,6 +21,11 @@ to that 10k-line file keep flowing — and adds four opt-in behaviours:
 4. PRESENCE + RETURN GREETINGS — rotating custom status (free), and priority
    attention for someone's first message after a long absence (the "she
    actually remembers me" moment).
+5. NO-THREAD MODE — a per-profile kill switch for Discord auto-threading.
+   Upstream reads `DISCORD_AUTO_THREAD` with os.getenv(), which is PROCESS-WIDE:
+   under multiplex every profile shares one process, so a profile that sets
+   `auto_thread: false` still gets threads if any other profile wants them.
+   This restores per-profile control by refusing thread creation outright.
 
 HOW (and why this exact seam)
 -----------------------------
@@ -50,6 +55,7 @@ UPSTREAM COUPLING (what discord-adapter-watch.sh guards)
   * DiscordAdapter.connect(*, is_reconnect) -> bool
   * DiscordAdapter.send(...)  (delegated via *args/**kwargs)
   * DiscordAdapter._add_reaction(message, emoji) -> bool
+  * DiscordAdapter._auto_create_thread(message) -> Optional[thread]
   * self._dedup.discard(message_id) / self._client
 """
 
@@ -318,6 +324,20 @@ class AmbientDiscordAdapter(DiscordAdapter):
         except Exception:
             logger.warning("ambient dispatch failed; message left unanswered", exc_info=True)
             return False
+
+    # ---- per-profile no-thread mode --------------------------------------
+    async def _auto_create_thread(self, message: Any):
+        """Refuse auto-threading when this profile opts out.
+
+        Upstream decides threading from os.getenv("DISCORD_AUTO_THREAD"), which
+        is process-wide — so under multiplex one profile's preference silently
+        overrides everyone's. Returning None here makes the caller fall through
+        to posting in the channel, which is what per-profile config asked for.
+        """
+        if self._ambient_enabled() and self._ambient_cfg().get("no_threads"):
+            logger.debug("ambient: auto-thread suppressed for this profile")
+            return None
+        return await super()._auto_create_thread(message)
 
     # ---- rotating presence (zero inference) ------------------------------
     async def _presence_loop(self) -> None:
