@@ -34,6 +34,7 @@ serious work.
 | **Return greetings** | 1 inference | Someone's first message after N days away is prioritised over the dice, with a hint telling the model they've been gone. Last-seen state persists across restarts. |
 | **Rotating presence** | **zero** | Custom status rotated from a list on a background task. |
 | **No-thread mode** | **zero** | Per-profile kill switch for auto-threading. Upstream reads `DISCORD_AUTO_THREAD` via `os.getenv()` — process-wide — so under multiplex one profile's preference silently overrides every other profile's. This restores per-profile control by adding the channel to the no-thread set (NOT by failing thread creation — upstream treats that as an error and drops the message). |
+| **Bot bounce** | **zero** while suppressing, 1 inference for the goodbye | Circuit breaker for bot-to-bot volleys under `DISCORD_ALLOW_BOTS`. Two bots whose replies auto-@mention each other volley forever — upstream documents the topology as unsupported, with no breaker. After 3–5 replies to a given bot in a channel (limit rolled per conversation, so the patience varies), the last allowed reply carries a goodbye hint and every later message from that bot is dropped **before** admission: no inference, no reply. A human speaking in the channel resets the pair, as does `reset_after_seconds` of quiet. Humans are never gated, and `[SILENT]` replies never count against the limit. |
 
 ## Why this seam
 
@@ -58,6 +59,46 @@ entry — hand-rolling it silently drops `setup_fn`, `apply_yaml_config_fn`,
 `standalone_sender_fn` (cron delivery!), `cron_deliver_env_var` and `max_message_length`.
 
 Everything fails closed: any exception falls back to stock behaviour.
+
+### Bot bounce: suppress before admission, count at send
+
+Four design choices in the breaker are worth spelling out.
+
+**Suppression happens before admission, not after.** A tripped pair returns from the
+dispatch override before the stock admission gate even runs — the whole point of a breaker
+on this hardware is that a runaway volley must cost *nothing*, not "an inference that ends
+in silence". Every un-tripped message falls through to the stock path with dedup, bot
+policy and user authorization untouched.
+
+**Counting happens at send time, not dispatch time.** A dispatch is only an intention: the
+agent may answer `[SILENT]`, error out, or fail the actual send, and none of those put words
+in the channel. Charging at dispatch would burn the bot's patience on replies never said —
+so dispatch merely records a pending marker ("the reply to THIS message belongs to bot X")
+and the `send()` override consumes it on the first successful send. A swallowed `[SILENT]`
+reply discards the marker instead, so it can't be mischarged to a later reply. The
+`reset_after_seconds` clock moves only when a reply is actually charged — a bot chattering
+into a channel cannot hold its own breaker open by talking.
+
+**Why a per-message marker and not a ContextVar** (the tool the rest of the plugin reaches
+for): the reply is not produced on the dispatch task. Upstream buffers split text and hands
+the event to a background agent task, so a task-scoped ContextVar set at dispatch is simply
+invisible by the time `send()` runs. What does survive the task hop is the reply anchor:
+every live Discord reply is sent with `reply_to=<the inbound message id>`. Keying the
+marker on that id — not on the channel — means two bots interleaving in one channel are
+each charged for exactly their own reply (a channel-keyed marker gets overwritten by
+whichever bot spoke last and cross-charges the pairs), unrelated sends to the channel can
+never consume a marker, and a reply that lands in an auto-created thread still finds its
+marker. Because upstream's `send()` chunks a long reply internally and returns one result,
+and the marker pops on first success, a reply costs *at most* one count no matter how many
+Discord messages or retries it becomes.
+
+**The breaker also covers missed-message backfill.** Upstream's reconnect recovery
+dispatches "missed" messages through a separate path that never touches the normal
+dispatch override — and a suppressed message looks exactly like a missed one (no reply, no
+ledger row). Left alone, every reconnect would replay the suppressed volley past the gate,
+one inference and one re-@mention at a time. So a suppressed message is claimed in the
+dedup cache at suppression time, and the recovered-message dispatcher is overridden to run
+the same gate (and the same no-thread scoping) before delegating to stock recovery.
 
 ## Install
 
@@ -101,6 +142,12 @@ platforms:
         return_greeting:
           enabled: true
           absence_days: 3
+        bot_bounce:
+          enabled: true
+          min_replies: 3             # limit rolled per conversation in [min, max]
+          max_replies: 5
+          reset_after_seconds: 1800  # a quiet half hour renews the pair
+          # goodbye_hint: "..."      # optional; {who} = the other bot's name
         presence:
           enabled: true
           interval_seconds: 5400
@@ -202,7 +249,9 @@ The single biggest quality lever is the profile's `SOUL.md`. What works:
   worse than a refusal in character.
 - **Bound bot-to-bot exchanges.** Let it talk to other agents — that is fun — but cap the
   volley at ~3 turns, resetting when a human joins. Two bots can trade replies forever,
-  and every turn costs an inference on both sides.
+  and every turn costs an inference on both sides. The `bot_bounce` breaker enforces this
+  mechanically; keep the SOUL.md instruction anyway so the goodbye reads as intended
+  rather than as a cut-off.
 
 ### 5. Give it memory of people
 
