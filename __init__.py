@@ -65,6 +65,17 @@ to that 10k-line file keep flowing — and adds six opt-in behaviours:
    gets about the model its sessions actually run on — upstream keeps
    fallback state on the per-session agent object, out of adapter reach —
    so it is parsed either way to drive only_when_local standby above.
+9. GROUP-ADDRESS GREETINGS — "good morning agents" / "hello everyone" is
+   addressed to the room, which the stock mention gate (and a bare name
+   trigger list) can't represent. Opt-in `group_address` matches
+   greeting+collective patterns and answers at its own probability and
+   cooldown, exempt from the daily cap (being spoken to is not intruding).
+10. SLASH-COMMAND POLICY — chat admission and slash auth share one gate
+   upstream, so an answer-everyone community profile also hands /model,
+   /reset, ... to everyone (and the per-profile allow-all env flag is not
+   reliably visible on the interaction path under multiplex — the operator
+   can end up rejected while strangers chat freely). `slash_commands`
+   restricts slash invocations to explicit channels/users, chat untouched.
 
 HOW (and why this exact seam)
 -----------------------------
@@ -101,6 +112,10 @@ UPSTREAM COUPLING (what discord-adapter-watch.sh guards)
         Discord) — bounce counting correlates dispatch->send on it
   * DiscordAdapter._add_reaction(message, emoji) -> bool
   * DiscordAdapter._get_no_thread_channels() -> set
+  * DiscordAdapter._check_slash_authorization(interaction, command_text)
+    -> bool and DiscordAdapter._reject_slash(interaction, command_text, *,
+    reason) -> False (slash-command policy rides these; every slash handler
+    upstream funnels through the former)
   * fallback-switch notice text: agent/chat_completion_helpers.py
     try_activate_fallback sets "🔄 Switched to fallback model: {old} via
     {old_provider} → {new} via {new_provider}"; run_agent.py
@@ -174,6 +189,20 @@ _DEFAULT_REACTIONS = ["👀", "😹", "✨", "🐈", "💅", "🔥"]
 # stripped content: distinctive enough that a real chat reply cannot
 # plausibly collide with it.
 _FALLBACK_NOTICE_PREFIX = "🔄 Switched to fallback model:"
+
+# Default patterns for group-addressed greetings ("good morning agents",
+# "hello everyone", "agents, assemble"). Matched with re.search against the
+# lowercased message content. Deliberately require BOTH a greeting word and a
+# collective address within a short span — a bare "agents" appears in normal
+# conversation far too often to be a trigger on its own.
+_GROUP_ADDRESS_PATTERNS = [
+    r"\b(morning|mornin|gm|gn|hello|hi|hey+|yo|evening|night|greetings|sup|hiya|heya)\b"
+    r"[^.!?\n]{0,30}"
+    r"\b(agents?|everyone|every1|all|bots|chat|guys|gang|frens|friends|folks)\b",
+    r"\b(agents?|everyone|every1|bots|chat|folks)\b"
+    r"[^.!?\n]{0,30}"
+    r"\b(morning|mornin|gm|gn|hello|hi|hey+|evening|night|assemble)\b",
+]
 
 
 class AmbientDiscordAdapter(DiscordAdapter):
@@ -340,6 +369,30 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 if time.time() - self._ambient_last < floor:
                     return None
                 return "named"
+            # Group-addressed greetings ("good morning agents") sit between a
+            # name trigger and the random dice: addressed to the room rather
+            # than to her, so answering is polite but not owed. Rolled at its
+            # own probability, floored by its own short cooldown, and exempt
+            # from the daily cap (like name triggers — being spoken to is not
+            # "inserting herself").
+            ga = self._sub("group_address")
+            if ga.get("enabled"):
+                pats = [str(p) for p in (ga.get("patterns") or _GROUP_ADDRESS_PATTERNS)]
+                hit = False
+                for p in pats:
+                    try:
+                        if re.search(p, content):
+                            hit = True
+                            break
+                    except re.error:
+                        continue
+                if hit:
+                    floor = float(ga.get("cooldown_seconds", 300))
+                    if time.time() - self._ambient_last >= floor and (
+                        random.random() < float(ga.get("probability", 0.6))
+                    ):
+                        return "named"
+                    return None
             if not self._ambient_quota_ok():
                 return None
             return "random" if random.random() < float(cfg.get("probability", 0.12)) else None
@@ -901,6 +954,65 @@ class AmbientDiscordAdapter(DiscordAdapter):
         except Exception:
             logger.warning("ambient dispatch failed; message left unanswered", exc_info=True)
             return False
+
+    # ---- per-profile slash-command policy ---------------------------------
+    async def _check_slash_authorization(self, interaction: Any, command_text: str) -> bool:
+        """Optional per-profile slash-command allowlist, independent of chat.
+
+        WHY: chat admission and slash authorization share one gate upstream —
+        a community profile that answers everyone (allow-all) therefore also
+        exposes /model, /reset, ... to everyone, and there is no per-guild or
+        per-surface command policy. Worse, on a multiplexed gateway the
+        per-profile allow-all env flag is not reliably visible on the slash
+        interaction path (it resolves env outside the per-turn profile scope
+        — same trap family as title generation), so a community profile can
+        end up rejecting even the operator. This gate replaces stock slash
+        auth with an explicit operator allowlist when configured.
+
+        Config (ambient_presence.slash_commands): `allowed_channels` and/or
+        `allowed_users` (string ids). If NEITHER is set, stock behaviour is
+        untouched. If set, a slash invocation must match every configured
+        list (channel in allowed_channels, user in allowed_users) — matching
+        invocations are authorized directly (bypassing the scope-broken stock
+        check), everything else gets the stock ephemeral rejection. Chat is
+        unaffected either way.
+        """
+        def _ids(v) -> set:
+            # Accept a YAML list or a comma-separated string — `hermes config
+            # set` can only write scalars, so the string form must work.
+            parts = v.split(",") if isinstance(v, str) else (v if isinstance(v, (list, tuple)) else [])
+            return {str(p).strip() for p in parts if str(p).strip()}
+
+        try:
+            sc = self._sub("slash_commands")
+            chans = _ids(sc.get("allowed_channels"))
+            users = _ids(sc.get("allowed_users"))
+        except Exception:
+            chans, users = set(), set()
+        if not chans and not users:
+            return await super()._check_slash_authorization(interaction, command_text)
+        try:
+            chan_id = str(
+                getattr(interaction, "channel_id", None)
+                or getattr(getattr(interaction, "channel", None), "id", "")
+                or ""
+            )
+            user_id = str(getattr(getattr(interaction, "user", None), "id", "") or "")
+            chan_ok = (not chans) or (chan_id in chans)
+            user_ok = (not users) or (bool(user_id) and user_id in users)
+            if chan_ok and user_ok:
+                logger.info(
+                    "ambient.slash_commands: authorized %r for user=%s in channel=%s",
+                    command_text, user_id, chan_id,
+                )
+                return True
+            return await self._reject_slash(
+                interaction, command_text,
+                reason="blocked by ambient_presence.slash_commands policy",
+            )
+        except Exception:
+            logger.debug("ambient.slash_commands gate failed; stock auth", exc_info=True)
+            return await super()._check_slash_authorization(interaction, command_text)
 
     # ---- per-profile no-thread mode --------------------------------------
     def _get_no_thread_channels(self) -> set:
