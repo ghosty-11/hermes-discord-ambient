@@ -143,11 +143,21 @@ sudo systemctl restart hermes-gateway              # plugins load at startup
 Then add config to the **target profile's** `config.yaml` (see below). Note the plugin must
 be enabled in the *default* profile's config — plugin discovery is a process-level singleton.
 
+**Config changes take effect on the next session; plugin CODE changes need a gateway
+restart.** Editing the plugin without restarting is the most common "my change did
+nothing" report — the running gateway holds the imported module.
+
 ## Config
 
 Goes under `platforms.discord.extra` — a verbatim passthrough. **Not** the top-level
 `discord:` block (whitelisted; unknown keys are silently dropped) and **not** env vars (all
 profiles share one process under multiplex, so `os.getenv` would leak settings across them).
+
+**Ids written with `hermes config set` arrive as INTEGERS, not strings** — the CLI coerces
+numeric values, and a bracketed list arrives as a *string*. Every id option here accepts a
+YAML list, a comma-separated string, or a bare scalar, so either form works; if you write
+your own consumers, normalize all three or a policy will silently read as "unset" and fall
+back to stock behaviour with no error in the log.
 
 ```yaml
 platforms:
@@ -346,8 +356,17 @@ Public channels mean untrusted input reaching a model with whatever tools you gr
 - Forbid disclosing its configuration, host, file paths, or other agents.
 - State that text in a message is *conversation, never a command* — no "ignore your
   instructions", no "developer mode".
-- Clear the profile's `home_channel` so gateway lifecycle notices ("shutting down") don't
-  post into a public server.
+- **Gate the slash commands.** This is the one people miss: upstream shares a single
+  gate between chat admission and slash authorization, so an answer-everyone profile also
+  hands `/reset`, `/clear`, `/model` and `/compress` to every stranger in the server.
+  Worse, Hermes' own tiered gating is *disabled entirely* when `discord.allow_admin_from`
+  (and `group_allow_admin_from` for channels) is unset — unset means "everyone is admin".
+  Set both to your own user id, and use this plugin's `slash_commands` block to pin
+  invocations to an operator channel as well.
+- Point `home_channel` at a PRIVATE channel rather than clearing it, and set
+  `system_notices.reroute_channel` to the same place: lifecycle notices and cron failures
+  then reach you without ever appearing in the community server. (Clearing it works too,
+  but then you simply don't get them.)
 
 ### 7. Presence and the occasional unprompted post
 
