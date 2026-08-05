@@ -50,6 +50,21 @@ to that 10k-line file keep flowing — and adds six opt-in behaviours:
    are skipped outright while busy — they are dice rolls, not obligations.
    Every failure in the busy probe answers "not busy": standby can only
    ever DELAY a reply, never mute one.
+   `only_when_local: true` scopes all of it to the times it actually helps:
+   a profile whose PRIMARY model is hosted only contends for the local slot
+   after falling back to the local model, so standby stays dormant until a
+   fallback-switch notice naming a local model (see 8) is observed, and
+   re-sleeps local_fallback_ttl_seconds later. Cloud turns are never held.
+8. FALLBACK-NOTICE SUPPRESSION — upstream surfaces a provider/model
+   fallback switch as a one-shot status send ("🔄 Switched to fallback
+   model: ...") delivered through plain adapter.send(). Right for an
+   operator channel, wrong for a public community room. With
+   `suppress_fallback_notice: true` the notice is swallowed for THIS
+   profile only (logged instead); other profiles keep stock behaviour.
+   Suppressed or not, the notice is also the only signal the adapter ever
+   gets about the model its sessions actually run on — upstream keeps
+   fallback state on the per-session agent object, out of adapter reach —
+   so it is parsed either way to drive only_when_local standby above.
 
 HOW (and why this exact seam)
 -----------------------------
@@ -86,6 +101,13 @@ UPSTREAM COUPLING (what discord-adapter-watch.sh guards)
         Discord) — bounce counting correlates dispatch->send on it
   * DiscordAdapter._add_reaction(message, emoji) -> bool
   * DiscordAdapter._get_no_thread_channels() -> set
+  * fallback-switch notice text: agent/chat_completion_helpers.py
+    try_activate_fallback sets "🔄 Switched to fallback model: {old} via
+    {old_provider} → {new} via {new_provider}"; run_agent.py
+    _emit_pending_fallback_notice emits it via status_callback and the
+    gateway delivers it through adapter.send. Suppression + local-fallback
+    detection match on the stable prefix — if upstream rewords it, both
+    degrade to stock (notice shown, standby stays dormant), never worse.
   * self._dedup.discard/contains/is_duplicate(message_id) / self._client
   * standby busy probe (all optional — absence degrades to "not busy"):
       - BasePlatformAdapter.gateway_runner (base.py declares it; run.py stamps
@@ -147,6 +169,12 @@ _GOODBYE_HINT = (
 
 _DEFAULT_REACTIONS = ["👀", "😹", "✨", "🐈", "💅", "🔥"]
 
+# Stable prefix of upstream's one-shot fallback-switch status notice (see
+# UPSTREAM COUPLING in the module docstring). Matched with startswith on the
+# stripped content: distinctive enough that a real chat reply cannot
+# plausibly collide with it.
+_FALLBACK_NOTICE_PREFIX = "🔄 Switched to fallback model:"
+
 
 class AmbientDiscordAdapter(DiscordAdapter):
     """Stock Discord adapter plus opt-in presence, reactions and memory hooks."""
@@ -171,6 +199,11 @@ class AmbientDiscordAdapter(DiscordAdapter):
         self._bounce_pending: dict[str, tuple[str, str, float]] = {}
         # Standby: (mtime-stamp, ids) cache of no-agent cron job ids.
         self._standby_noagent_cache: tuple | None = None
+        # When a fallback-switch notice last named a local model (0 = never).
+        # In-memory only: a restart forgets an open window, and the next
+        # fallback notice simply re-opens it — degrade is "no hold", not
+        # "held forever".
+        self._local_fallback_ts: float = 0.0
 
     # ---- config ---------------------------------------------------------
     def _ambient_cfg(self) -> dict:
@@ -554,6 +587,47 @@ class AmbientDiscordAdapter(DiscordAdapter):
     def _standby_enabled(self) -> bool:
         return bool(self._ambient_enabled() and self._sub("standby").get("enabled"))
 
+    def _standby_engaged(self) -> bool:
+        """Whether standby should act right now, given only_when_local.
+
+        Stock standby holds whenever the fleet is busy — correct when this
+        profile's PRIMARY model is the shared local one. A profile that
+        normally runs hosted only contends for the local slot after falling
+        back to it, so only_when_local keeps standby dormant until a
+        fallback-switch notice naming a local model has been observed
+        (_note_fallback_notice), and lets it lapse local_fallback_ttl_seconds
+        later. Fallback state is per-session upstream and sessions retry
+        their primary, so the TTL is a freshness heuristic: too short means
+        a few unheld local turns (stock behaviour), too long means bounded
+        extra delay while cloud is already back — both safe.
+        """
+        try:
+            sc = self._sub("standby")
+            if not sc.get("only_when_local"):
+                return True
+            ttl = float(sc.get("local_fallback_ttl_seconds", 1800))
+            return bool(self._local_fallback_ts) and (
+                time.time() - self._local_fallback_ts < ttl
+            )
+        except Exception:
+            return True  # misconfig degrades to stock standby, never a mute
+
+    def _note_fallback_notice(self, notice: str) -> None:
+        """Open (or refresh) the local-fallback standby window when the
+        switch target names a local model. Runs whether or not the notice is
+        then suppressed — observation and presentation are separate."""
+        try:
+            target = notice.split("→", 1)[1] if "→" in notice else notice
+            markers = self._sub("standby").get("local_markers") or ["gpt-oss", "ollama"]
+            if any(str(m).lower() in target.lower() for m in markers):
+                self._local_fallback_ts = time.time()
+                logger.info(
+                    "ambient: local-model fallback observed — only_when_local "
+                    "standby window open"
+                )
+        except Exception:
+            pass
+
     def _standby_noagent_ids(self) -> set:
         """Ids of cron jobs marked no_agent (plain scripts — they hold no
         inference slot). Cached on the jobs.json mtimes; an id we cannot
@@ -665,6 +739,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
         """
         try:
             if not self._standby_enabled():
+                return False
+            if not self._standby_engaged():
                 return False
             if not self._fleet_busy():
                 return False
@@ -892,6 +968,23 @@ class AmbientDiscordAdapter(DiscordAdapter):
         (batched events can still make it zero — the safe direction).
         """
         reply_to = kwargs.get("reply_to", args[0] if args else None)
+        if isinstance(content, str) and content.strip().startswith(_FALLBACK_NOTICE_PREFIX):
+            notice = content.strip()
+            # Track first (standby signal), decide visibility second.
+            self._note_fallback_notice(notice)
+            if self._ambient_enabled() and self._ambient_cfg().get(
+                "suppress_fallback_notice"
+            ):
+                logger.info(
+                    "ambient: fallback-switch notice suppressed for this "
+                    "profile: %s", notice[:160],
+                )
+                try:
+                    from gateway.platforms.base import SendResult  # type: ignore
+
+                    return SendResult(success=True, message_id=None)
+                except Exception:
+                    return None
         if self._ambient_enabled() and isinstance(content, str):
             marker = self._ambient_marker()
             stripped = content.strip()
