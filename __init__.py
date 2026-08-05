@@ -70,7 +70,15 @@ to that 10k-line file keep flowing — and adds ten opt-in behaviours:
    trigger list) can't represent. Opt-in `group_address` matches
    greeting+collective patterns and answers at its own probability and
    cooldown, exempt from the daily cap (being spoken to is not intruding).
-10. SLASH-COMMAND POLICY — chat admission and slash auth share one gate
+10. SPEAKER IDENTITY — upstream labels inbound messages with the author's
+   DISPLAY NAME (adapter.py:7837, hardcoded). Display names are per-guild,
+   user-editable and freely reused, so durable notes keyed on one merge two
+   people or lose someone the day they rename — and an agent told to "record
+   the user id" cannot comply, because the id never reaches the model. With
+   `speaker_identity: true` a compact `[speaker @handle id:123]` prefix is
+   prepended once to the dispatched text, giving the agent the stable
+   account handle and numeric id to key memories on.
+11. SLASH-COMMAND POLICY — chat admission and slash auth share one gate
    upstream, so an answer-everyone community profile also hands /model,
    /reset, ... to everyone (and the per-profile allow-all env flag is not
    reliably visible on the interaction path under multiplex — the operator
@@ -896,6 +904,10 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 _no_thread_keys.reset(token)
 
     async def _dispatch_inner(self, message: Any) -> bool:
+        # Stable speaker identity before anything reads the content, so both
+        # the stock pass and any ambient re-dispatch carry it.
+        self._apply_speaker_tag(message)
+
         # Bot bounce first: a tripped pair must cost NOTHING, so it returns
         # before admission runs. Every un-tripped message falls through to the
         # stock path with all auth/dedup/gate logic untouched.
@@ -979,6 +991,51 @@ class AmbientDiscordAdapter(DiscordAdapter):
         except Exception:
             logger.warning("ambient dispatch failed; message left unanswered", exc_info=True)
             return False
+
+    # ---- stable speaker identity -----------------------------------------
+    def _speaker_tag(self, message: Any) -> str | None:
+        """A compact `[speaker @name id:123]` prefix, or None when disabled.
+
+        WHY: upstream labels every inbound message with
+        `user_name=message.author.display_name` (adapter.py:7837, hardcoded, no
+        config). A display name is per-guild, user-editable and reused freely,
+        so an agent writing durable notes keyed on it will merge two people or
+        lose someone the day they rename. The account handle and the numeric id
+        are the stable identifiers, and neither reaches the model — so an agent
+        told to "record the user id" cannot comply, however firmly it is asked.
+
+        This surfaces both, once, at the front of the dispatched text. The
+        agent's memory guidance keys notes on them and is told never to echo
+        the tag back into chat.
+        """
+        try:
+            if not (self._ambient_enabled()
+                    and self._ambient_cfg().get("speaker_identity")):
+                return None
+            author = getattr(message, "author", None)
+            uid = str(getattr(author, "id", "") or "")
+            if not uid:
+                return None
+            # .name is the stable account handle; display_name is the mutable one.
+            handle = str(getattr(author, "name", "")
+                         or getattr(author, "display_name", "") or "").strip()
+            return f"[speaker @{handle} id:{uid}]" if handle else f"[speaker id:{uid}]"
+        except Exception:
+            logger.debug("ambient: speaker tag failed", exc_info=True)
+            return None
+
+    def _apply_speaker_tag(self, message: Any) -> None:
+        """Prepend the speaker tag once, in place. Never raises."""
+        tag = self._speaker_tag(message)
+        if not tag:
+            return
+        try:
+            content = getattr(message, "content", "") or ""
+            if content.startswith("[speaker "):
+                return  # already tagged (re-dispatch or backfill replay)
+            message.content = f"{tag}\n{content}"
+        except Exception:
+            pass  # frozen message object; identity is a nicety, not a gate
 
     # ---- system-notice rerouting ------------------------------------------
     def _system_notice_target(self, content: Any, chat_id: Any) -> str | None:
