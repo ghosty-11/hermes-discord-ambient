@@ -1233,6 +1233,128 @@ class AmbientDiscordAdapter(DiscordAdapter):
         return result
 
 
+# ---- GIF search (Klipy) ---------------------------------------------------
+# WHY A TOOL, NOT THE BUNDLED `gif-search` SKILL: that skill drives curl+jq at a
+# shell prompt, and a public persona profile has no terminal (nor should it).
+# Discord auto-embeds a plain GIF URL, so the agent only needs a URL back.
+# The bundled skill also targets Tenor, whose API Google discontinued
+# 2026-06-30; Klipy is the successor (near-identical shape, free tier).
+#
+# Config lives with the rest of the plugin's per-profile settings:
+#   platforms.discord.extra.ambient_presence.gif_search
+# and the credential is KLIPY_API_KEY in the PROFILE's .env (never config.yaml —
+# config.yaml is world-readable-ish and goes nowhere near a git remote).
+_gif_state: dict = {"last": 0.0, "hits": deque(maxlen=256)}
+
+
+def _gif_config() -> dict:
+    """Per-profile gif_search config; empty dict when unset."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        extra = ((cfg.get("platforms") or {}).get("discord") or {}).get("extra") or {}
+        block = (extra.get("ambient_presence") or {}).get("gif_search")
+        return block if isinstance(block, dict) else {}
+    except Exception:
+        return {}
+
+
+def _gif_key() -> str:
+    try:
+        from hermes_cli.config import get_env_value
+
+        return (get_env_value("KLIPY_API_KEY") or "").strip()
+    except Exception:
+        return (os.getenv("KLIPY_API_KEY") or "").strip()
+
+
+def _gif_enabled() -> bool:
+    """check_fn: hide the tool entirely unless this profile opted in AND has a key."""
+    return bool(_gif_config().get("enabled")) and bool(_gif_key())
+
+
+def _gif_handle(args: dict, **_: Any) -> str:
+    import json as _json
+    import random as _random
+    import urllib.parse as _urlparse
+    import urllib.request as _urlrequest
+
+    cfg = _gif_config()
+    key = _gif_key()
+    if not key:
+        return "gif_search: not configured."
+
+    query = " ".join(str(args.get("query") or "").split())[:80]
+    if not query:
+        return "gif_search: 'query' is required."
+
+    now = time.time()
+    if now - float(_gif_state["last"]) < float(cfg.get("min_interval_seconds", 60)):
+        return "No GIF this time — you just posted one. Reply in words."
+    hits = _gif_state["hits"]
+    cutoff = now - 86400
+    while hits and hits[0] < cutoff:
+        hits.popleft()
+    if len(hits) >= int(cfg.get("max_per_day", 20)):
+        return "No GIF this time — daily limit reached. Reply in words."
+
+    params = _urlparse.urlencode({
+        "q": query,
+        "per_page": int(cfg.get("pool", 8)),
+        # 'high' by default: a public room, and the agent cannot preview what it posts.
+        "content_filter": str(cfg.get("content_filter", "high")),
+        "format_filter": "gif",
+        "customer_id": str(args.get("customer_id") or "companion")[:64],
+    })
+    url = f"https://api.klipy.com/api/v1/{key}/gifs/search?{params}"
+    try:
+        req = _urlrequest.Request(url, headers={"User-Agent": "hermes-discord-ambient"})
+        with _urlrequest.urlopen(req, timeout=float(cfg.get("timeout_seconds", 12))) as r:
+            payload = _json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        logger.debug("gif_search: lookup failed", exc_info=True)
+        return "gif_search: lookup failed; just reply in words."
+
+    urls = []
+    for item in ((payload.get("data") or {}).get("data")) or []:
+        files = item.get("file") or {}
+        # md first — hd gifs are multi-MB and slow to embed on mobile.
+        for size in ("md", "sm", "hd"):
+            got = ((files.get(size) or {}).get("gif") or {}).get("url")
+            if got:
+                urls.append(got)
+                break
+    if not urls:
+        return f"gif_search: nothing found for {query!r}."
+
+    chosen = _random.choice(urls[: max(1, int(cfg.get("pick_from", 5)))])
+    _gif_state["last"] = now
+    hits.append(now)
+    logger.info("gif_search: %r -> %s", query, chosen[:60])
+    return chosen
+
+
+_GIF_SCHEMA = {
+    "name": "gif_search",
+    "description": (
+        "Find a reaction GIF. Returns a URL — put that URL in your reply and "
+        "Discord shows the GIF. Use it as punctuation, rarely, when a GIF says "
+        "it better than words. Never explain that you searched for it."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "What the GIF should show, e.g. 'happy cat' or 'eye roll'.",
+            }
+        },
+        "required": ["query"],
+    },
+}
+
+
 def register(ctx) -> None:
     """Install the stock Discord platform entry, then swap in our subclass.
 
@@ -1252,3 +1374,18 @@ def register(ctx) -> None:
         return
     entry.adapter_factory = lambda cfg: AmbientDiscordAdapter(cfg)
     logger.info("discord-ambient: AmbientDiscordAdapter installed for platform 'discord'")
+
+    # gif_search is gated by check_fn, so profiles without a Klipy key never see it.
+    try:
+        ctx.register_tool(
+            name="gif_search",
+            toolset="gif",
+            schema=_GIF_SCHEMA,
+            handler=_gif_handle,
+            check_fn=_gif_enabled,
+            description=_GIF_SCHEMA["description"],
+            emoji="🎬",
+        )
+        logger.info("discord-ambient: registered gif_search (Klipy)")
+    except Exception:
+        logger.exception("discord-ambient: could not register gif_search")

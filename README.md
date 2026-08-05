@@ -40,6 +40,7 @@ serious work.
 | **Group-address greetings** | 1 inference when it answers | "good morning agents" / "hello everyone" is addressed to the room — not a mention, not a name trigger, but ignoring it reads as absent. Opt-in `group_address` matches greeting+collective regex pairs (both words required, close together — a bare "agents" mid-sentence never triggers) and answers at its own probability (default 0.6) and short cooldown (default 300s), exempt from the daily cap: being spoken to is not inserting herself. |
 | **System-notice rerouting** | **zero** | Cron delivery failures (`⚠️ Cron 'x' failed: …`) and the cron wrapper header are posted to whatever channel the job delivers to — for a social profile, the community room, where the bot's own plumbing does not belong. `system_notices.reroute_channel` sends them to a private channel instead: rerouted, never dropped, so the operator still sees every failure. Pairs with `cron.wrap_response: false`, which removes the `Cronjob Response / job_id / "to stop this job"` framing from normal deliveries. |
 | **Speaker identity** | **zero** | Upstream labels every inbound message with the author's *display name* (hardcoded, no config). Display names are per-guild, user-editable and freely reused — an agent writing durable notes keyed on one will merge two people, or lose someone the day they rename. Worse, an agent instructed to "record the user id" **cannot comply**: the id never reaches the model. `speaker_identity: true` prepends a compact `[speaker @handle id:123]` to the dispatched text (once, also on re-dispatch and backfill), so memory notes can key on the stable handle and numeric id. Tell the agent never to echo the tag. |
+| **GIF search** | **zero** (one HTTP call) | Registers a `gif_search` tool returning an embeddable GIF URL from [Klipy](https://klipy.com/developers) — the successor to Tenor, whose API Google discontinued 2026-06-30. A tool rather than the bundled `gif-search` skill, because that skill drives curl+jq at a shell prompt and a public persona profile has no terminal (nor should it); Discord auto-embeds a bare URL, so a URL is all the agent needs. `content_filter: high` by default (the agent cannot preview what it posts), per-profile rate limits, and the tool is hidden entirely unless the profile sets `gif_search.enabled` **and** has `KLIPY_API_KEY` in its `.env`. |
 | **Slash-command policy** | **zero** | Upstream shares ONE gate between chat admission and slash authorization, so an answer-everyone community profile also hands `/model`, `/reset`, … to every stranger — and under a multiplexed gateway the per-profile allow-all env flag may not even resolve on the interaction path, leaving the operator rejected while everyone chats freely. `slash_commands.allowed_channels` / `allowed_users` restrict slash invocations to explicit ids (matching invocations authorize directly; everything else gets the stock ephemeral rejection + admin alert). Chat is untouched. |
 
 ## Why this seam
@@ -195,6 +196,11 @@ platforms:
           probability: 0.6         # she's addressed, but so is everyone — roll for it
           cooldown_seconds: 300    # own short floor; exempt from the daily cap
           # patterns: [...]        # optional regex overrides (lowercased content)
+        gif_search:                # needs KLIPY_API_KEY in the PROFILE's .env
+          enabled: true
+          min_interval_seconds: 90   # a GIF is punctuation, not a personality
+          max_per_day: 20
+          content_filter: high       # off | low | medium | high
         slash_commands:            # restrict /model, /reset, ... (chat unaffected)
           allowed_channels: ["<operator-channel-id>"]   # list, "a,b", or a bare id
           allowed_users: ["<operator-user-id>"]
