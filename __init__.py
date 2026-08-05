@@ -8,7 +8,7 @@ occasionally. Gateway hooks can't help (fire-and-forget observers; only
 pre_tool_call can veto) and `[SILENT]` suppression exists only in cron.
 
 This subclasses the bundled Discord adapter — never forks it, so upstream fixes
-to that 10k-line file keep flowing — and adds six opt-in behaviours:
+to that 10k-line file keep flowing — and adds ten opt-in behaviours:
 
 1. AMBIENT JOINING — a message the stock gate rejects for lacking a mention may
    be re-dispatched as if the channel were free-response. Hard rate-limited.
