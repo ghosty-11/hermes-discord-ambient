@@ -35,7 +35,8 @@ serious work.
 | **Rotating presence** | **zero** | Custom status rotated from a list on a background task. |
 | **No-thread mode** | **zero** | Per-profile kill switch for auto-threading. Upstream reads `DISCORD_AUTO_THREAD` via `os.getenv()` — process-wide — so under multiplex one profile's preference silently overrides every other profile's. This restores per-profile control by adding the channel to the no-thread set (NOT by failing thread creation — upstream treats that as an error and drops the message). |
 | **Bot bounce** | **zero** while suppressing, 1 inference for the goodbye | Circuit breaker for bot-to-bot volleys under `DISCORD_ALLOW_BOTS`. Two bots whose replies auto-@mention each other volley forever — upstream documents the topology as unsupported, with no breaker. After 3–5 replies to a given bot in a channel (limit rolled per conversation, so the patience varies), the last allowed reply carries a goodbye hint and every later message from that bot is dropped **before** admission: no inference, no reply. A human speaking in the channel resets the pair, as does `reset_after_seconds` of quiet. Humans are never gated, and `[SILENT]` replies never count against the limit. |
-| **Fleet standby** | **zero** while holding | For hosts where several profiles share ONE inference slot (local CPU model). A dispatch arriving while any other agent turn or agent-mode cron job is running is *held* — the message's own coroutine sleeps, polling — and released the moment the slot frees; at `max_wait_seconds` it dispatches anyway, so standby can only ever delay a reply, never eat one. Opportunistic dice-roll joins are skipped outright while busy; named triggers and return greetings still answer. Every failure in the busy probe answers "not busy". |
+| **Fleet standby** | **zero** while holding | For hosts where several profiles share ONE inference slot (local CPU model). A dispatch arriving while any other agent turn or agent-mode cron job is running is *held* — the message's own coroutine sleeps, polling — and released the moment the slot frees; at `max_wait_seconds` it dispatches anyway, so standby can only ever delay a reply, never eat one. Opportunistic dice-roll joins are skipped outright while busy; named triggers and return greetings still answer. Every failure in the busy probe answers "not busy". With `only_when_local: true`, a profile whose primary model is *hosted* engages standby only while it is actually running on a local fallback model (observed via the fallback-switch notice, for `local_fallback_ttl_seconds`) — cloud turns are never held, so the higher-priority local profile keeps the slot exactly when contention is real. |
+| **Fallback-notice suppression** | **zero** | Upstream announces a provider/model fallback switch with a one-shot status send ("🔄 Switched to fallback model: …"). Right for an operator channel, noise (and an internals leak) in a public community room. `suppress_fallback_notice: true` swallows it for this profile only — logged, never posted — while every other profile keeps the operator-facing notice. Suppressed or not, the notice is parsed as the local-fallback signal that drives `only_when_local` standby. |
 
 ## Why this seam
 
@@ -159,6 +160,9 @@ platforms:
         name_cooldown_seconds: 60  # anti-spam floor for name hits (NOT the long cooldown)
         silent_marker: "[SILENT]"
         no_threads: true           # never auto-create threads for this profile
+        suppress_fallback_notice: true  # swallow "🔄 Switched to fallback model: ..."
+                                   # for THIS profile only (logged instead);
+                                   # other profiles keep the operator-facing notice
         reactions:
           enabled: true
           probability: 0.18        # of messages it does NOT answer
@@ -183,6 +187,13 @@ platforms:
           stale_turn_seconds: 1800   # ignore wedged turn-registry entries older than this
           include_cron: true         # agent-mode cron jobs count as busy (no_agent ones don't)
           drop_ambient_when_busy: true  # skip dice-roll joins if still busy at deadline
+          only_when_local: true      # engage ONLY while this profile is on a local
+                                     # fallback model (observed via the fallback
+                                     # notice); cloud turns are never held
+          local_fallback_ttl_seconds: 1800  # how long an observed local fallback
+                                     # keeps the standby window open
+          local_markers: ["gpt-oss", "ollama"]  # substrings that mark the switch
+                                     # target as the shared local model
         presence:
           enabled: true
           interval_seconds: 5400
