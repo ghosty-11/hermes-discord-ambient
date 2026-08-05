@@ -190,6 +190,31 @@ _DEFAULT_REACTIONS = ["👀", "😹", "✨", "🐈", "💅", "🔥"]
 # plausibly collide with it.
 _FALLBACK_NOTICE_PREFIX = "🔄 Switched to fallback model:"
 
+# Operator-facing machinery that upstream posts into whatever channel a job
+# delivers to. In a community room these read as the bot leaking its own
+# plumbing, so they are rerouted to a private channel when one is configured.
+_SYSTEM_NOTICE_PREFIXES = ["⚠️ Cron '", "Cronjob Response:"]
+
+
+def _id_set(value) -> set:
+    """Normalize a config id list to a set of strings.
+
+    Accepts a YAML list, a comma-separated string, or a bare scalar — and the
+    scalar case is not hypothetical: `hermes config set` coerces a numeric
+    value, so a Discord snowflake written through the CLI arrives as an INT,
+    not a string. Treating that as "unset" silently disables whatever policy
+    depends on it (this bit the slash-command gate on 2026-08-05).
+    """
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        parts = value
+    elif isinstance(value, str):
+        parts = value.split(",")
+    else:
+        parts = [value]
+    return {str(p).strip() for p in parts if str(p).strip()}
+
 # Default patterns for group-addressed greetings ("good morning agents",
 # "hello everyone", "agents, assemble"). Matched with re.search against the
 # lowercased message content. Deliberately require BOTH a greeting word and a
@@ -955,6 +980,33 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.warning("ambient dispatch failed; message left unanswered", exc_info=True)
             return False
 
+    # ---- system-notice rerouting ------------------------------------------
+    def _system_notice_target(self, content: Any, chat_id: Any) -> str | None:
+        """Channel id to reroute an operator-facing notice to, or None.
+
+        Cron delivery failures ("⚠️ Cron 'x' failed: …") and the cron wrapper
+        header are posted to the job's delivery channel — for a social profile
+        that is the community room, where agent plumbing does not belong.
+        With `system_notices.reroute_channel` set they go to a private channel
+        instead. Returns None (stock behaviour) when unset, when the notice is
+        already going there, or on any error.
+        """
+        try:
+            if not self._ambient_enabled() or not isinstance(content, str):
+                return None
+            sn = self._sub("system_notices")
+            target = str(sn.get("reroute_channel") or "").strip()
+            if not target or str(chat_id or "") == target:
+                return None
+            prefixes = sn.get("patterns") or _SYSTEM_NOTICE_PREFIXES
+            stripped = content.strip()
+            if any(stripped.startswith(str(p)) for p in prefixes):
+                return target
+            return None
+        except Exception:
+            logger.debug("ambient: system-notice check failed", exc_info=True)
+            return None
+
     # ---- per-profile slash-command policy ---------------------------------
     async def _check_slash_authorization(self, interaction: Any, command_text: str) -> bool:
         """Optional per-profile slash-command allowlist, independent of chat.
@@ -977,16 +1029,10 @@ class AmbientDiscordAdapter(DiscordAdapter):
         check), everything else gets the stock ephemeral rejection. Chat is
         unaffected either way.
         """
-        def _ids(v) -> set:
-            # Accept a YAML list or a comma-separated string — `hermes config
-            # set` can only write scalars, so the string form must work.
-            parts = v.split(",") if isinstance(v, str) else (v if isinstance(v, (list, tuple)) else [])
-            return {str(p).strip() for p in parts if str(p).strip()}
-
         try:
             sc = self._sub("slash_commands")
-            chans = _ids(sc.get("allowed_channels"))
-            users = _ids(sc.get("allowed_users"))
+            chans = _id_set(sc.get("allowed_channels"))
+            users = _id_set(sc.get("allowed_users"))
         except Exception:
             chans, users = set(), set()
         if not chans and not users:
@@ -1080,6 +1126,18 @@ class AmbientDiscordAdapter(DiscordAdapter):
         (batched events can still make it zero — the safe direction).
         """
         reply_to = kwargs.get("reply_to", args[0] if args else None)
+        target = self._system_notice_target(content, chat_id)
+        if target:
+            # Reroute, don't drop: the operator still wants cron failures, just
+            # not in the community room. reply_to is deliberately dropped — the
+            # anchor message lives in the channel we are routing away from.
+            logger.info(
+                "ambient: system notice rerouted to %s: %s",
+                target, str(content).strip()[:120],
+            )
+            return await super().send(
+                target, content, metadata=kwargs.get("metadata"),
+            )
         if isinstance(content, str) and content.strip().startswith(_FALLBACK_NOTICE_PREFIX):
             notice = content.strip()
             # Track first (standby signal), decide visibility second.
