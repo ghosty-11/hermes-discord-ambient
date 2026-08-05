@@ -37,6 +37,8 @@ serious work.
 | **Bot bounce** | **zero** while suppressing, 1 inference for the goodbye | Circuit breaker for bot-to-bot volleys under `DISCORD_ALLOW_BOTS`. Two bots whose replies auto-@mention each other volley forever — upstream documents the topology as unsupported, with no breaker. After 3–5 replies to a given bot in a channel (limit rolled per conversation, so the patience varies), the last allowed reply carries a goodbye hint and every later message from that bot is dropped **before** admission: no inference, no reply. A human speaking in the channel resets the pair, as does `reset_after_seconds` of quiet. Humans are never gated, and `[SILENT]` replies never count against the limit. |
 | **Fleet standby** | **zero** while holding | For hosts where several profiles share ONE inference slot (local CPU model). A dispatch arriving while any other agent turn or agent-mode cron job is running is *held* — the message's own coroutine sleeps, polling — and released the moment the slot frees; at `max_wait_seconds` it dispatches anyway, so standby can only ever delay a reply, never eat one. Opportunistic dice-roll joins are skipped outright while busy; named triggers and return greetings still answer. Every failure in the busy probe answers "not busy". With `only_when_local: true`, a profile whose primary model is *hosted* engages standby only while it is actually running on a local fallback model (observed via the fallback-switch notice, for `local_fallback_ttl_seconds`) — cloud turns are never held, so the higher-priority local profile keeps the slot exactly when contention is real. |
 | **Fallback-notice suppression** | **zero** | Upstream announces a provider/model fallback switch with a one-shot status send ("🔄 Switched to fallback model: …"). Right for an operator channel, noise (and an internals leak) in a public community room. `suppress_fallback_notice: true` swallows it for this profile only — logged, never posted — while every other profile keeps the operator-facing notice. Suppressed or not, the notice is parsed as the local-fallback signal that drives `only_when_local` standby. |
+| **Group-address greetings** | 1 inference when it answers | "good morning agents" / "hello everyone" is addressed to the room — not a mention, not a name trigger, but ignoring it reads as absent. Opt-in `group_address` matches greeting+collective regex pairs (both words required, close together — a bare "agents" mid-sentence never triggers) and answers at its own probability (default 0.6) and short cooldown (default 300s), exempt from the daily cap: being spoken to is not inserting herself. |
+| **Slash-command policy** | **zero** | Upstream shares ONE gate between chat admission and slash authorization, so an answer-everyone community profile also hands `/model`, `/reset`, … to every stranger — and under a multiplexed gateway the per-profile allow-all env flag may not even resolve on the interaction path, leaving the operator rejected while everyone chats freely. `slash_commands.allowed_channels` / `allowed_users` restrict slash invocations to explicit ids (matching invocations authorize directly; everything else gets the stock ephemeral rejection + admin alert). Chat is untouched. |
 
 ## Why this seam
 
@@ -174,6 +176,14 @@ platforms:
         return_greeting:
           enabled: true
           absence_days: 3
+        group_address:
+          enabled: true            # answer "good morning agents"-style room greetings
+          probability: 0.6         # she's addressed, but so is everyone — roll for it
+          cooldown_seconds: 300    # own short floor; exempt from the daily cap
+          # patterns: [...]        # optional regex overrides (lowercased content)
+        slash_commands:            # restrict /model, /reset, ... (chat unaffected)
+          allowed_channels: ["<operator-channel-id>"]
+          allowed_users: ["<operator-user-id>"]
         bot_bounce:
           enabled: true
           min_replies: 3             # limit rolled per conversation in [min, max]
