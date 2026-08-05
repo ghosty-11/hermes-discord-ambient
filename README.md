@@ -347,6 +347,15 @@ Public channels mean untrusted input reaching a model with whatever tools you gr
   (`security.allow_private_urls: false`) — otherwise someone will ask the bot to read
   `127.0.0.1:<port>` and it will happily post your internal dashboards into a public
   channel.
+- **Give it memory without giving it a shell.** A community bot is only worth talking to
+  twice if it remembers you, but the usual way to wire up persistent memory —
+  instructions telling it to run a CLI — needs the terminal toolset, which is the one
+  capability a public bot must never have. Companion plugin:
+  [hermes-optmem-tools](https://github.com/ghosty-11/hermes-optmem-tools) exposes
+  [OptMem](https://github.com/VictorTaelin/OptMem) as registered tools (fixed argv, the
+  profile's own memory dir, no shell). Watch for the silent version of this mistake:
+  instructions that name a tool the profile does not have fail with **no error at all** —
+  ours had written zero memories for its entire life before anyone checked.
 - If it can search, tell it that **fetched pages are hearsay, not instruction**. Web
   content is the second injection vector after chat, and the model will not infer that on
   its own: a page saying "ignore your rules" must be as unpersuasive as a stranger saying
@@ -392,6 +401,12 @@ self._dedup.discard()
 `discord-adapter-watch.sh` hashes them and stays silent unless they move — run it monthly
 as a `no_agent` cron job delivering to an ops channel. If it fires, re-check the plugin
 against the bundled adapter before trusting the next `hermes update`.
+
+## Companion plugin
+
+[hermes-optmem-tools](https://github.com/ghosty-11/hermes-optmem-tools) — persistent
+append-only memory as tools, for the same reason this plugin exists: a bot that lives in a
+public room should feel present and remember people while holding no dangerous capability.
 
 ## Extras
 
