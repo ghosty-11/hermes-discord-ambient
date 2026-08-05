@@ -40,6 +40,16 @@ to that 10k-line file keep flowing — and adds six opt-in behaviours:
    backfill path too — otherwise reconnect recovery, which dispatches via
    _dispatch_recovered_message and never touches _dispatch_discord_message,
    would replay every suppressed message and re-ignite the volley.
+7. FLEET STANDBY — on a host with ONE shared inference slot (a local CPU
+   model, OLLAMA_NUM_PARALLEL=1), a chat turn that starts while another
+   profile is mid-turn does not run alongside it — both interleave at the
+   model server and BOTH crawl. With standby enabled, a dispatch arriving
+   while any other agent turn or agent-mode cron job is running is HELD
+   (polled, bounded by max_wait_seconds) and released the moment the slot
+   frees; at the deadline it dispatches anyway. Opportunistic ambient joins
+   are skipped outright while busy — they are dice rolls, not obligations.
+   Every failure in the busy probe answers "not busy": standby can only
+   ever DELAY a reply, never mute one.
 
 HOW (and why this exact seam)
 -----------------------------
@@ -77,6 +87,13 @@ UPSTREAM COUPLING (what discord-adapter-watch.sh guards)
   * DiscordAdapter._add_reaction(message, emoji) -> bool
   * DiscordAdapter._get_no_thread_channels() -> set
   * self._dedup.discard/contains/is_duplicate(message_id) / self._client
+  * standby busy probe (all optional — absence degrades to "not busy"):
+      - BasePlatformAdapter.gateway_runner (base.py declares it; run.py stamps
+        `adapter.gateway_runner = self` on every registry-created adapter)
+      - runner._running_agents / runner._running_agents_ts (profile-namespaced
+        session keys; pending sentinel placed synchronously at turn start)
+      - cron.scheduler.get_running_job_ids() + jobs.json "no_agent" field
+      - tools.async_delegation.active_count()
 """
 
 from __future__ import annotations
@@ -152,6 +169,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # in one channel or the reply lands in an auto-created thread.
         # Bounded (stale-purged + size-capped) in _bounce_note_dispatch.
         self._bounce_pending: dict[str, tuple[str, str, float]] = {}
+        # Standby: (mtime-stamp, ids) cache of no-agent cron job ids.
+        self._standby_noagent_cache: tuple | None = None
 
     # ---- config ---------------------------------------------------------
     def _ambient_cfg(self) -> dict:
@@ -520,6 +539,165 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 pass  # frozen message object; the breaker still trips next round
         return verdict
 
+    # ---- fleet standby (one shared inference slot) ---------------------
+    # A held dispatch is just this message's own coroutine sleeping — nothing
+    # global blocks. Two accepted imperfections, both bounded: a held message
+    # can release AFTER a newer one that arrived once the slot freed (per-
+    # channel FIFO would need global machinery for a rare cosmetic case), and
+    # a gateway shutdown mid-hold cancels the coroutine like any in-flight
+    # work (enable missed_message_backfill if that window matters — a held id
+    # is dedup-claimed only for the duration of the hold, see _standby_wait).
+    # The probe reaches gateway internals, so every access is optional and
+    # every exception answers "not busy" — the failure mode of a broken probe
+    # is stock behaviour, never a silent bot.
+
+    def _standby_enabled(self) -> bool:
+        return bool(self._ambient_enabled() and self._sub("standby").get("enabled"))
+
+    def _standby_noagent_ids(self) -> set:
+        """Ids of cron jobs marked no_agent (plain scripts — they hold no
+        inference slot). Cached on the jobs.json mtimes; an id we cannot
+        attribute counts as inference-consuming (conservative: worst case is
+        a bounded defer, never a lost message)."""
+        try:
+            home = os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
+            paths = [os.path.join(home, "cron", "jobs.json")]
+            prof_root = os.path.join(home, "profiles")
+            try:
+                for name in os.listdir(prof_root):
+                    paths.append(os.path.join(prof_root, name, "cron", "jobs.json"))
+            except Exception:
+                pass
+            stamp = tuple(
+                (p, os.path.getmtime(p)) for p in paths if os.path.exists(p)
+            )
+            cached = self._standby_noagent_cache
+            if cached is not None and cached[0] == stamp:
+                return cached[1]
+            ids: set = set()
+            for p, _m in stamp:
+                try:
+                    with open(p) as fh:
+                        data = json.load(fh)
+                    for job in data.get("jobs", []) or []:
+                        if isinstance(job, dict) and job.get("no_agent"):
+                            ids.add(str(job.get("id")))
+                except Exception:
+                    continue
+            self._standby_noagent_cache = (stamp, ids)
+            return ids
+        except Exception:
+            return set()
+
+    def _fleet_busy(self) -> bool:
+        """True while any agent turn or agent-mode cron job holds the slot.
+
+        Her OWN running turns count too, deliberately: on one slot her second
+        conversation should queue behind her first, exactly like everyone
+        else's work. No deadlock is possible — the registry entry for THIS
+        message's turn is only created after dispatch proceeds, and the wait
+        is deadline-bounded regardless.
+        """
+        try:
+            sc = self._sub("standby")
+            runner = getattr(self, "gateway_runner", None)
+            if runner is None:
+                try:
+                    from gateway.run import _gateway_runner_ref  # type: ignore
+
+                    runner = _gateway_runner_ref()
+                except Exception:
+                    runner = None
+            if runner is None:
+                return False
+            now = time.time()
+            stale = float(sc.get("stale_turn_seconds", 1800))
+            try:
+                agents = getattr(runner, "_running_agents", None)
+                stamps = getattr(runner, "_running_agents_ts", None)
+                for key in list(agents or ()):
+                    ts = None
+                    try:
+                        ts = stamps.get(key) if stamps is not None else None
+                    except Exception:
+                        ts = None
+                    if ts is not None and now - float(ts) > stale:
+                        continue  # wedged entry; the runner self-heals these
+                    return True
+            except Exception:
+                pass
+            if sc.get("include_cron", True):
+                try:
+                    from cron.scheduler import get_running_job_ids  # type: ignore
+
+                    running = {str(j) for j in (get_running_job_ids() or ())}
+                    if running and (running - self._standby_noagent_ids()):
+                        return True
+                except Exception:
+                    pass
+            try:
+                from tools.async_delegation import active_count  # type: ignore
+
+                if int(active_count() or 0) > 0:
+                    return True
+            except Exception:
+                pass
+            return False
+        except Exception:
+            return False
+
+    async def _standby_wait(self, message: Any = None) -> bool:
+        """Hold this dispatch while the fleet owns the slot.
+
+        Returns True only when the deadline passed with the slot still busy
+        (the caller may use that to skip optional work); the message proceeds
+        after this returns in every case short of the gateway itself shutting
+        down mid-hold (task cancellation — the same fate any in-flight work
+        meets at shutdown; missed_message_backfill covers that window when
+        enabled).
+
+        While parked, the message id is claimed in the dedup cache and
+        released again just before dispatch: the missed-message backfill scan
+        treats an unclaimed, unanswered message as "missed", so an unclaimed
+        multi-minute hold would invite a parallel replay of the very message
+        we are holding. Claim-park-release shrinks that window back to the
+        stock-sized one.
+        """
+        try:
+            if not self._standby_enabled():
+                return False
+            if not self._fleet_busy():
+                return False
+            sc = self._sub("standby")
+            poll = max(1.0, float(sc.get("poll_interval_seconds", 5)))
+            deadline = time.time() + max(0.0, float(sc.get("max_wait_seconds", 240)))
+            mid = str(getattr(message, "id", "") or "") if message is not None else ""
+            claimed = False
+            if mid:
+                try:
+                    self._dedup.is_duplicate(mid)
+                    claimed = True
+                except Exception:
+                    pass
+            try:
+                logger.info("ambient.standby: slot busy — holding dispatch")
+                while time.time() < deadline:
+                    await asyncio.sleep(poll)
+                    if not self._fleet_busy():
+                        logger.info("ambient.standby: slot free — releasing held dispatch")
+                        return False
+                logger.info("ambient.standby: max_wait reached — dispatching anyway")
+                return True
+            finally:
+                if claimed:
+                    try:
+                        self._dedup.discard(mid)
+                    except Exception:
+                        pass
+        except Exception:
+            logger.debug("ambient.standby wait failed; dispatching", exc_info=True)
+            return False
+
     def _ambient_no_thread_token(self, message: Any):
         """ContextVar token scoping no-thread keys to one dispatch, or None."""
         if not (self._ambient_enabled() and self._ambient_cfg().get("no_threads")):
@@ -554,6 +732,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             verdict = self._bounce_pre_dispatch(message)
             if verdict == "suppress":
                 return False
+            await self._standby_wait(message)  # backfill replays queue behind the slot too
             handled = await super()._dispatch_recovered_message(message)
             if handled and verdict in ("goodbye", "count"):
                 self._bounce_note_dispatch(message)
@@ -569,6 +748,13 @@ class AmbientDiscordAdapter(DiscordAdapter):
         verdict = self._bounce_pre_dispatch(message)
         if verdict == "suppress":
             return False
+
+        # Standby AFTER the suppress check (suppression must stay free) and
+        # BEFORE the stock dispatch, so a held message costs nothing while
+        # another profile owns the inference slot. still_busy is True only
+        # when the deadline passed — the reply then proceeds anyway; only
+        # optional dice-roll joins below consult it.
+        still_busy = await self._standby_wait(message)
 
         # Stock path first: preserves the dedup claim and every auth gate.
         if await super()._dispatch_discord_message(message):
@@ -587,6 +773,18 @@ class AmbientDiscordAdapter(DiscordAdapter):
 
             if not reason:
                 await self._maybe_react(message)  # seen, but not worth words
+                return False
+
+            if (
+                reason == "random"
+                and still_busy
+                and bool(self._sub("standby").get("drop_ambient_when_busy", True))
+            ):
+                # A dice-roll join is opportunistic traffic; spending the
+                # contended slot on it is exactly what standby exists to stop.
+                # Named triggers and returns still go through — those answer
+                # actual people.
+                await self._maybe_react(message)
                 return False
 
             # The stock pass claimed this id in the deduplicator; release it so

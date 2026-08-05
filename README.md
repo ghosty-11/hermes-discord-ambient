@@ -35,6 +35,7 @@ serious work.
 | **Rotating presence** | **zero** | Custom status rotated from a list on a background task. |
 | **No-thread mode** | **zero** | Per-profile kill switch for auto-threading. Upstream reads `DISCORD_AUTO_THREAD` via `os.getenv()` — process-wide — so under multiplex one profile's preference silently overrides every other profile's. This restores per-profile control by adding the channel to the no-thread set (NOT by failing thread creation — upstream treats that as an error and drops the message). |
 | **Bot bounce** | **zero** while suppressing, 1 inference for the goodbye | Circuit breaker for bot-to-bot volleys under `DISCORD_ALLOW_BOTS`. Two bots whose replies auto-@mention each other volley forever — upstream documents the topology as unsupported, with no breaker. After 3–5 replies to a given bot in a channel (limit rolled per conversation, so the patience varies), the last allowed reply carries a goodbye hint and every later message from that bot is dropped **before** admission: no inference, no reply. A human speaking in the channel resets the pair, as does `reset_after_seconds` of quiet. Humans are never gated, and `[SILENT]` replies never count against the limit. |
+| **Fleet standby** | **zero** while holding | For hosts where several profiles share ONE inference slot (local CPU model). A dispatch arriving while any other agent turn or agent-mode cron job is running is *held* — the message's own coroutine sleeps, polling — and released the moment the slot frees; at `max_wait_seconds` it dispatches anyway, so standby can only ever delay a reply, never eat one. Opportunistic dice-roll joins are skipped outright while busy; named triggers and return greetings still answer. Every failure in the busy probe answers "not busy". |
 
 ## Why this seam
 
@@ -100,6 +101,33 @@ one inference and one re-@mention at a time. So a suppressed message is claimed 
 dedup cache at suppression time, and the recovered-message dispatcher is overridden to run
 the same gate (and the same no-thread scoping) before delegating to stock recovery.
 
+### Fleet standby: hold at dispatch, probe the runner
+
+On a one-slot host, "run both turns" means "run both turns slowly" — the model server
+serializes them request-by-request and the human watching Discord sees minutes of nothing.
+Hermes has no per-profile pause or priority (the documented `/platform pause` only touches
+the reconnect retry queue), so standby lives in the same pre-admission seam as the bounce
+breaker: the dispatch coroutine simply waits, bounded, before entering the stock path.
+
+The busy probe reads three things, all optional, all failing toward "not busy": the gateway
+runner's live turn registry (`gateway_runner` is stamped on every adapter; entries appear
+synchronously at turn start within the gateway — the gate is best-effort, and two messages
+arriving in the same instant can both slip through, which matches the delay-never-mute
+contract), the cron scheduler's
+running-job set minus jobs whose `no_agent` flag marks them as plain scripts (a backup
+script holds no slot; the id→flag map is cached on the jobs.json mtimes), and the async
+delegation counter. The profile's own running turns count as busy on purpose: on one slot,
+its second conversation should queue behind its first exactly like everyone else's work.
+A wedged registry entry is aged out by `stale_turn_seconds`, and the hold itself is capped
+by `max_wait_seconds` — the two bounds mean a stuck-on busy signal degrades to "replies
+arrive a few minutes late", never to a mute bot. A held id is dedup-claimed for the
+duration of the hold (and released just before dispatch), so the missed-message backfill
+scan cannot replay a message that is merely parked. Known small prints, both accepted: a
+held message can be answered after a newer one that arrived once the slot freed; holds
+that bunch several bot messages together can make the bounce breaker jump straight from
+counting to suppression, skipping the goodbye; and a gateway shutdown mid-hold drops the
+held message the same way it drops any in-flight turn (backfill recovers it if enabled).
+
 ## Install
 
 ```bash
@@ -148,6 +176,13 @@ platforms:
           max_replies: 5
           reset_after_seconds: 1800  # a quiet half hour renews the pair
           # goodbye_hint: "..."      # optional; {who} = the other bot's name
+        standby:
+          enabled: true              # hold dispatches while the shared slot is busy
+          poll_interval_seconds: 5
+          max_wait_seconds: 240      # then dispatch anyway — delay, never mute
+          stale_turn_seconds: 1800   # ignore wedged turn-registry entries older than this
+          include_cron: true         # agent-mode cron jobs count as busy (no_agent ones don't)
+          drop_ambient_when_busy: true  # skip dice-roll joins if still busy at deadline
         presence:
           enabled: true
           interval_seconds: 5400

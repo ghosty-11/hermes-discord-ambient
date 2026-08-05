@@ -34,8 +34,20 @@ sig_recovered="$(awk '/^    async def _dispatch_recovered_message/{f=1; print; n
 # Reply routing identity (reply goes to the message's effective channel).
 sig_chatid="$(grep -c "chat_id=str(effective_channel.id)" "${A}")"
 sig_dedup="$(grep -c "_dedup\.\(contains\|is_duplicate\)" "${A}")"
+# Standby busy-probe couplings (all optional in the plugin — it degrades to
+# "not busy" if they vanish — but a silent vanish means standby silently stops
+# deferring, so the drift still deserves a ping).
+R="${HERMES_RUN:-${HERMES_HOME}/hermes-agent/gateway/run.py}"
+C="${HERMES_CRON:-${HERMES_HOME}/hermes-agent/cron/scheduler.py}"
+# NB: grep -c prints its count even when it exits 1 (zero matches) — never
+# chain `|| echo 0` onto it or a legitimate 0 captures as "0\n0" and corrupts
+# the state line.
+if [ -r "${R}" ]; then sig_runnerstamp="$(grep -c "adapter.gateway_runner = self" "${R}")"; else sig_runnerstamp=0; fi
+sig_runnerdecl="$(grep -c "gateway_runner" "${B}")"
+if [ -r "${R}" ]; then sig_turnts="$(grep -c "_running_agents_ts" "${R}")"; else sig_turnts=0; fi
+if [ -r "${C}" ]; then sig_cronids="$(grep -A6 "def get_running_job_ids" "${C}" | sha256sum | cut -c1-16)"; else sig_cronids=none; fi
 ver="$(cd "${HERMES_HOME}/hermes-agent" 2>/dev/null && git describe --tags --always 2>/dev/null || echo unknown)"
-now="admission=${sig_admission} send=${sig_send} anchor=${sig_anchor} recovered=${sig_recovered} chatid_sites=${sig_chatid} dedup_calls=${sig_dedup}"
+now="admission=${sig_admission} send=${sig_send} anchor=${sig_anchor} recovered=${sig_recovered} chatid_sites=${sig_chatid} dedup_calls=${sig_dedup} runner_stamp=${sig_runnerstamp} runner_decl=${sig_runnerdecl} turn_ts=${sig_turnts} cronids=${sig_cronids}"
 
 prev=""
 [ -f "${STATE}" ] && prev="$(head -1 "${STATE}")"
