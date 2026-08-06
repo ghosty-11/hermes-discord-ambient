@@ -201,6 +201,9 @@ platforms:
         # hint: "..."             # optional; overrides the ambient-join hint
                                    # text sent with a re-dispatched message.
                                    # {marker} = the [SILENT] sentinel.
+        image_gen_gate:            # per-user authorisation for a METERED tool
+          enabled: true
+          allowed_users: ["<operator-user-id>"]   # list, "a,b", or a bare id
         gif_search:                # needs KLIPY_API_KEY in the PROFILE's .env
           enabled: true
           min_interval_seconds: 90   # a GIF is punctuation, not a personality
@@ -645,3 +648,30 @@ message costs no money — only free-tier quota and a little latency. And the pr
 generated in the **same completion** as the post-tool turn, so the model would emit
 something regardless; the waste is tens of tokens, not an extra call. The hint is still
 worth having, because it is nearly free and it makes the whole mechanism quieter.
+
+## `image_gen_gate` — per-user authorisation for a metered tool (v1.14.0)
+
+Image generation costs money per call. On a public surface that is an invitation to spend
+someone else's balance, and **Hermes has no per-user tool authorisation** — so without this
+the only choices are "everyone in the room can generate" or "nobody can".
+
+The gate registers a `pre_tool_call` hook that refuses `image_generate` unless the speaker
+is on the allow list. Blocking at `pre_tool_call` matters: the call never reaches the
+provider, so a refusal costs nothing. Suppressing the *image* afterwards would have paid
+for it first.
+
+**How the speaker is known.** `pre_tool_call` receives only `tool_name` and `args`. The
+adapter records the sender's stable id in a ContextVar at dispatch (the same id
+`speaker_identity` surfaces), and ContextVars are copied into tasks created from that
+context, so it survives into the agent turn.
+
+**Fails closed.** If the speaker cannot be determined, the call is refused. A false deny
+costs the operator one re-ask; a false allow costs money and cannot be taken back.
+
+Ids are normalised from a YAML list, a comma-separated string, or a bare scalar, because
+`hermes config set` coerces a numeric value to an int and a bracketed list to a string —
+all three shapes occur in practice, and mishandling them would make the policy silently
+read as "nobody is allowed".
+
+A profile without `image_gen_gate.enabled` is unaffected, so the operator's own agent keeps
+unrestricted access.

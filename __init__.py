@@ -382,6 +382,15 @@ _ambient_open: contextvars.ContextVar[bool] = contextvars.ContextVar(
 )
 
 # Channel keys for which threading is suppressed, scoped to one dispatch task.
+# Who sent the message currently being handled. Set at dispatch, read inside the
+# agent turn by the image-generation gate. ContextVars are copied into tasks
+# created from the current context, which is how it survives into the turn.
+# Absence means "unknown", and the gate treats unknown as DENY — a false deny
+# costs the operator a re-ask, a false allow costs metered spend to strangers.
+_current_speaker_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "ambient_current_speaker_id", default=""
+)
+
 _no_thread_keys: contextvars.ContextVar[set] = contextvars.ContextVar(
     "hermes_ambient_no_thread", default=frozenset()
 )
@@ -1326,6 +1335,12 @@ class AmbientDiscordAdapter(DiscordAdapter):
             # .name is the stable account handle; display_name is the mutable one.
             handle = str(getattr(author, "name", "")
                          or getattr(author, "display_name", "") or "").strip()
+            # Record the speaker for the duration of this dispatch so tool-level
+            # gates can authorise on a stable id rather than a display name.
+            try:
+                _current_speaker_id.set(uid)
+            except Exception:
+                pass
             return f"[speaker @{handle} id:{uid}]" if handle else f"[speaker id:{uid}]"
         except Exception:
             logger.debug("ambient: speaker tag failed", exc_info=True)
@@ -2028,6 +2043,78 @@ _GIF_SCHEMA = {
 }
 
 
+# ── image-generation gate ───────────────────────────────────────────────────
+_GATED_TOOLS = {"image_generate"}
+
+
+def _image_gate_cfg() -> dict:
+    """Read this profile's gate config. Profile-correct: proven by the TTS tool
+    resolving Edge for Companion and Piper for Assistant on the same gateway."""
+    try:
+        from hermes_cli.config import load_config  # type: ignore
+
+        extra = (
+            load_config()
+            .get("platforms", {})
+            .get("discord", {})
+            .get("extra", {})
+            .get("ambient_presence", {})
+        ) or {}
+        cfg = extra.get("image_gen_gate")
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def _normalize_ids(value: Any) -> set:
+    """Accept a YAML list, a comma-separated string, or a bare id.
+
+    `hermes config set` coerces a numeric value to an int and a bracketed list
+    to a string, so all three shapes reach us in practice. Normalising here is
+    what stops a policy silently reading as 'nobody is allowed'.
+    """
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        return {str(v).strip() for v in value if str(v).strip()}
+    return {p.strip() for p in str(value).split(",") if p.strip()}
+
+
+def _on_pre_tool_call(tool_name: str = "", args: Any = None, **_: Any):
+    """Refuse image generation for anyone but the allowed users.
+
+    WHY A TOOL GATE, not a prompt rule: image generation is METERED, and a
+    public room is full of people who would enjoy spending someone else's
+    balance. Hermes has no per-user tool authorisation, so without this the
+    only options are 'everyone on the surface can generate' or 'nobody can'.
+
+    Fails CLOSED. If the speaker cannot be determined the call is refused: a
+    false deny costs the operator one re-ask, a false allow costs money and
+    cannot be taken back.
+    """
+    if tool_name not in _GATED_TOOLS:
+        return None
+    cfg = _image_gate_cfg()
+    if not cfg.get("enabled"):
+        return None                      # ungated profile (e.g. the operator's own)
+
+    allowed = _normalize_ids(cfg.get("allowed_users"))
+    speaker = (_current_speaker_id.get() or "").strip()
+
+    if speaker and speaker in allowed:
+        return None
+
+    reason = "speaker unknown" if not speaker else f"speaker id:{speaker} not allowed"
+    logger.info("ambient.image_gate: refused %s (%s)", tool_name, reason)
+    return {
+        "decision": "block",
+        "reason": (
+            "Image generation is not available to this user. Say so plainly and "
+            "briefly, offer nothing else, and do not retry."
+        ),
+    }
+
+
 def register(ctx) -> None:
     """Install the stock Discord platform entry, then swap in our subclass.
 
@@ -2039,6 +2126,14 @@ def register(ctx) -> None:
     under two names.
     """
     _bundled.register(ctx)
+
+    # Per-user authorisation for metered tools. Registered once; the callback
+    # resolves the gate per profile, so an ungated profile is unaffected.
+    try:
+        ctx.register_hook("pre_tool_call", _on_pre_tool_call)
+        logger.info("ambient: image-generation gate registered")
+    except Exception as exc:
+        logger.warning("ambient: could not register image gate: %s", exc)
 
     # Speech hygiene is process-wide by nature (see _install_tts_kaomoji_filter),
     # so install it once at registration rather than per adapter instance.
