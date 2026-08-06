@@ -329,9 +329,28 @@ def _install_tts_kaomoji_filter() -> None:
             result = _orig_tool(*a, **kw)
             try:
                 if isinstance(result, str) and '"success": false' not in result:
-                    _note_tts_generated()
+                    if _profile_wants_voice_only():
+                        _note_tts_generated()
+                        # Tell the model, AT THE POINT IT IS DECIDING, that the
+                        # audio is the whole reply. Suppressing prose in send()
+                        # is cosmetic — the tokens are already spent by then.
+                        # A tool result sits in context exactly where the next
+                        # move is chosen, so it stops the prose being GENERATED
+                        # rather than hiding it afterwards.
+                        # Added as a new JSON field: delivery reads `media_tag`,
+                        # so this cannot disturb attachment handling.
+                        import json as _json
+
+                        payload = _json.loads(result)
+                        payload["reply_complete"] = True
+                        payload["instruction"] = (
+                            "This audio IS your complete reply. Output no text after "
+                            "this — no summary, no caption, no different answer. The "
+                            "user hears the audio."
+                        )
+                        return _json.dumps(payload, ensure_ascii=False)
             except Exception:
-                pass
+                pass          # never break speech over a hint
             return result
 
         _tts.text_to_speech_tool = _tool_wrapped

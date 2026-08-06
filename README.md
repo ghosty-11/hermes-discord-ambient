@@ -613,3 +613,35 @@ free-tier model is wildly variable:
 Shrinking the window — the intuitive way to reduce accidental drops — would instead bring
 the duplicate text straight back. Once arming is profile-scoped, a wider window costs
 nothing.
+
+## Stopping the text being generated, not just hidden (v1.13.0)
+
+`voice_only_replies` suppresses prose in `send()` — but by then the tokens are already
+spent. Suppression is cosmetic: it fixes what the user sees, not what was paid for.
+
+So for profiles with `voice_only_replies` on, the `tts` tool's JSON result gains two
+fields:
+
+```json
+{"success": true, "media_tag": "MEDIA:/…/tts_x.mp3",
+ "reply_complete": true,
+ "instruction": "This audio IS your complete reply. Output no text after this …"}
+```
+
+A tool result sits in context at exactly the point the model chooses its next move, which
+is a far stronger place to say this than a system-prompt rule the model read thousands of
+tokens ago. Added as **new fields** — delivery reads `media_tag`, so attachment handling is
+untouched.
+
+`voice_only_replies` stays on as the backstop for when the model ignores it, which a
+free-tier model sometimes will. The two are complementary: the hint should make suppression
+rare, and every suppression is logged, so *how often it fires is the measure of whether the
+hint is working*.
+
+### On cost
+
+Worth being accurate about the size of the problem. On a free-lane profile a dropped
+message costs no money — only free-tier quota and a little latency. And the prose is
+generated in the **same completion** as the post-tool turn, so the model would emit
+something regardless; the waste is tens of tokens, not an extra call. The hint is still
+worth having, because it is nearly free and it makes the whole mechanism quieter.
