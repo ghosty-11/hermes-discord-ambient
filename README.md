@@ -588,14 +588,28 @@ however, happens ~14 seconds earlier, and that is early enough to act on.
 So `voice_only_replies` now keys off "speech was generated for this turn", recorded by
 wrapping `text_to_speech_tool`.
 
-**Scope, and its limit.** The tool has no reliable profile context — the same process-global
-resolution that misfiles audio into another profile's cache directory is the only signal
-available at TTS time — so the flag is process-wide. Three things keep that safe:
+**Scope (v1.12.1).** The flag lives in module state, but it is **armed only by profiles
+that have `voice_only_replies` on**. Config resolution is profile-correct inside the TTS
+tool — proven by the tool picking Edge for Companion and Piper for Assistant on the same gateway
+— so `_profile_wants_voice_only()` can check at arming time. A profile without the setting
+never arms it and therefore can never cause another profile's message to be dropped.
 
-1. only profiles with `voice_only_replies` ever **consult** it;
-2. it is **consume-once**, so at most one text send is ever affected;
-3. a 30-second window, and every suppression is logged.
+Together with **consume-once** (at most one text send is ever affected) and logging on
+every suppression, cross-profile interference is closed rather than merely made unlikely.
 
-Residual risk: another profile generates speech and this one sends unrelated text inside
-the window — one message dropped, logged, never silence. A per-profile audio cache dir
-upstream would remove it entirely.
+**Window: 45s**, and picked from measurement, not taste. Across five real turns the gap
+between the TTS call and the text send was 2.7s / 5.6s / 12.8s / 15.4s / 35.4s — dominated
+by how long the model takes to finish generating *after* calling the tool, which on a
+free-tier model is wildly variable:
+
+| window | catches |
+|---|---|
+| 10s | 2/5 |
+| 15s | 3/5 |
+| 20s | 4/5 |
+| 30s | 4/5 |
+| **45s** | **5/5** |
+
+Shrinking the window — the intuitive way to reduce accidental drops — would instead bring
+the duplicate text straight back. Once arming is profile-scoped, a wider window costs
+nothing.
