@@ -213,11 +213,15 @@ platforms:
           pool: 8                    # results requested from Klipy per search
           pick_from: 5               # choose randomly among the top N of those
           timeout_seconds: 12        # Klipy HTTP timeout
+        voice_only_replies: false  # when a voice reply goes out, drop the text
+                                   # twin the runner sends straight after it
         text_hygiene:              # scrub replies on the way out
           strip_control_tokens: true  # default true — leaked harmony envelopes
           strip_speaker_echo: true    # default true — the bot echoing its own tag
           no_em_dash: false           # rewrite "—" to " - " outside code fences
           isolate_media_urls: true    # default true — GIF gets its own message
+          suppress_stt_echo: false    # drop the gateway's 🎙️ "<transcript>" echo
+                                      # for THIS profile (see below)
         slash_commands:            # restrict /model, /reset, ... (chat unaffected)
           allowed_channels: ["<operator-channel-id>"]   # list, "a,b", or a bare id
           allowed_users: ["<operator-user-id>"]
@@ -476,3 +480,55 @@ Working on Hermes Agent 0.20.0. Written against that version's adapter internals
 touches private methods by necessity, which is what the watcher is for.
 
 MIT.
+
+## Voice hygiene (v1.11.0)
+
+Three problems that only show up once an agent can speak, all per-profile except
+where noted.
+
+### `suppress_stt_echo` — the setting Hermes cannot give you per profile
+
+When a voice message arrives, the gateway posts `🎙️ "<transcript>"` so you can check
+STT quality. That is useful on an operator surface and noise on a public one.
+
+Upstream has `stt.echo_transcripts`, but it is **not per-profile in practice**:
+`_should_echo_stt_transcripts()` reads the `GatewayRunner`'s config, which is resolved
+process-wide from the root `config.yaml`. Setting it on a profile does nothing; setting it
+at the root silences every profile. Under a multiplexed gateway there is no supported way
+to have it on for one agent and off for another.
+
+This plugin intercepts the echo in `send()` and drops it for profiles that ask, which is
+the only place the decision can be made per profile.
+
+### `voice_only_replies` — no duplicate text after speech
+
+`_send_voice_reply()` sends the audio and then the text reply. For an operator agent that
+is a feature — the text is a transcript. For a personality bot it is the same sentence
+twice.
+
+With this on, one text send is suppressed per voice send, inside a 20-second window, and
+the mark is **consumed** — so a genuine follow-up message a moment later still gets
+through. The failure direction is deliberately "a text twin leaks", never "the agent goes
+mute".
+
+### `text_hygiene.strip_kaomoji` — kaomoji are not emoji
+
+Hermes strips emoji before TTS (`_EMOJI_RE`), but that targets pictograph codepoints.
+Kaomoji like `(=^･ω･^=)` are ordinary punctuation and letters, so they pass straight
+through and get read aloud as several seconds of punctuation soup.
+
+This wraps `tools.tts_tool._strip_markdown_for_tts` with a kaomoji pre-pass, so they are
+removed from the **speech script only** — they stay in the posted text, where they are
+half the personality.
+
+**This one is process-wide**, not per-profile, and honestly so: `_send_voice_reply`
+imports that function inside its body, so patching the module attribute affects every
+profile. Nobody wants kaomoji read aloud, so a global is the truthful shape rather than a
+config key that pretends otherwise.
+
+Detection is a candidate regex **plus an explicit predicate**, not one clever pattern. The
+first attempt used `re.VERBOSE` with a multi-line character class — in which whitespace is
+*not* ignored — so it silently included a literal space and deleted `(no errors)` from a
+status report. Ordinary parentheses must survive; when in doubt the filter keeps the text,
+because a missed kaomoji is a second of odd audio while a false positive silently deletes
+real words from what the agent says out loud.

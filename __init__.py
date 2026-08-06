@@ -159,6 +159,96 @@ from plugins.platforms.discord import adapter as _bundled  # type: ignore
 
 logger = logging.getLogger(__name__)
 
+# ── Voice-side hygiene ──────────────────────────────────────────────────────
+# Kaomoji are ordinary punctuation and letters, so Hermes' own _EMOJI_RE (which
+# targets pictograph codepoints) never touches them and TTS reads them aloud as
+# punctuation soup: "(=^･ω･^=)" becomes several seconds of noise. Strip them
+# from the SPEECH script only — they stay in the posted text, where they are
+# half the personality.
+# A kaomoji is a SHORT bracketed span containing at least one character that
+# plain prose never uses. Deliberately two steps — a candidate regex plus an
+# explicit predicate — rather than one clever pattern: the first version used
+# re.VERBOSE with a multi-line character class, which silently included a
+# literal space and ate "(no errors)". Ordinary parentheses must survive.
+_BRACKETED_RE = re.compile(r"[(（\[][^)）\]\n]{0,24}[)）\]]")
+
+# Characters that appear in kaomoji and effectively never in plain prose.
+_KAOMOJI_HINT_RE = re.compile(
+    "["
+    "\u3040-\u30ff"      # hiragana / katakana (ω, ･, ﾉ, 彡, ﾟ)
+    "\u2190-\u21ff"      # arrows
+    "\u2600-\u27bf"      # misc symbols / dingbats
+    "\uff00-\uffef"      # fullwidth & halfwidth forms
+    "\u0300-\u036f"      # combining marks (•̀, ᴗ-)
+    "\u1d00-\u1d7f"      # phonetic extensions (ᴗ)
+    "\u2500-\u25ff"      # box drawing / geometric
+    "^*=~|<>/\\\\"      # ASCII faces: (^_^) (=^･^=) \\(^o^)/
+    "]"
+)
+
+
+_TTS_PATCHED = False
+
+
+def _strip_kaomoji(text: str) -> str:
+    """Remove kaomoji from a speech script. Never touches posted text.
+
+    Conservative by design: when in doubt, KEEP the text. A missed kaomoji is a
+    second of odd audio; a false positive silently deletes real words from what
+    the agent says out loud, which is far worse and much harder to notice.
+    """
+    if not text:
+        return text
+
+    def _drop(m: "re.Match[str]") -> str:
+        inner = m.group(0)[1:-1]
+        if not inner.strip():
+            return m.group(0)                      # "()" — leave it alone
+        if _KAOMOJI_HINT_RE.search(inner):
+            return " "
+        return m.group(0)
+
+    cleaned = _BRACKETED_RE.sub(_drop, text)
+    return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+
+
+def _install_tts_kaomoji_filter() -> None:
+    """Wrap Hermes' TTS text preparation with a kaomoji pre-pass.
+
+    PROCESS-WIDE, unlike everything else in this plugin, and deliberately so:
+    ``_send_voice_reply`` imports ``_strip_markdown_for_tts`` inside the
+    function body, so patching the module attribute takes effect for every
+    profile in the multiplexed gateway. Nobody wants kaomoji read aloud, so a
+    global is honest here rather than pretending it is per-profile.
+
+    Wraps rather than replaces, so whatever upstream normalisation does still
+    runs and keeps running after an update.
+    """
+    global _TTS_PATCHED
+    if _TTS_PATCHED:
+        return
+    try:
+        import tools.tts_tool as _tts  # type: ignore
+
+        _orig = _tts._strip_markdown_for_tts
+
+        def _wrapped(text, *a, **kw):
+            try:
+                text = _strip_kaomoji(text)
+            except Exception:
+                pass          # a hygiene pass must never break speech
+            return _orig(text, *a, **kw)
+
+        _tts._strip_markdown_for_tts = _wrapped
+        _TTS_PATCHED = True
+        logger.info("ambient: TTS kaomoji filter installed (process-wide)")
+    except Exception as exc:
+        logger.warning("ambient: could not install TTS kaomoji filter: %s", exc)
+
+
+# The gateway echoes inbound speech as: 🎙️ "<transcript>"
+_STT_ECHO_RE = re.compile(r'^\s*\U0001F399\uFE0F?\s*"')
+
 # True only inside one ambient re-dispatch. ContextVars are per-task, so a
 # concurrent stock message on another task is unaffected — and the backfill
 # helper that shares _discord_free_response_channels() never sees it.
@@ -1280,6 +1370,47 @@ class AmbientDiscordAdapter(DiscordAdapter):
             out.append(part)
         return "".join(out)
 
+    # ── voice-only bookkeeping ──────────────────────────────────────────
+    _VOICE_TWIN_WINDOW_S = 20.0
+
+    def _voice_only_enabled(self) -> bool:
+        return bool(self._ambient_cfg().get("voice_only_replies", False))
+
+    def _voice_just_sent(self, chat_id: Any) -> bool:
+        """True if a voice message went to this chat inside the twin window.
+
+        Consumes the mark: exactly ONE text send is suppressed per voice send,
+        so a genuine follow-up message a moment later still gets through. The
+        failure direction is 'text leaks', never 'the agent goes mute'.
+        """
+        marks = getattr(self, "_voice_sent_at", None)
+        if not marks:
+            return False
+        ts = marks.pop(str(chat_id), None)
+        if ts is None:
+            return False
+        return (time.monotonic() - ts) <= self._VOICE_TWIN_WINDOW_S
+
+    def _suppressed_result(self):
+        """The 'sent nothing, report success' result the base adapter expects."""
+        try:
+            from gateway.platforms.base import SendResult  # type: ignore
+
+            return SendResult(success=True, message_id=None)
+        except Exception:
+            return None
+
+    async def send_voice(self, *args: Any, **kwargs: Any):
+        """Mark that speech went out, so send() can drop the text twin."""
+        result = await super().send_voice(*args, **kwargs)
+        if self._voice_only_enabled():
+            chat_id = kwargs.get("chat_id", args[0] if args else None)
+            if chat_id is not None:
+                if not hasattr(self, "_voice_sent_at"):
+                    self._voice_sent_at = {}
+                self._voice_sent_at[str(chat_id)] = time.monotonic()
+        return result
+
     def _scrub_outbound(self, content: str) -> str | None:
         """Clean a reply before it goes out.
 
@@ -1416,6 +1547,29 @@ class AmbientDiscordAdapter(DiscordAdapter):
         (batched events can still make it zero — the safe direction).
         """
         reply_to = kwargs.get("reply_to", args[0] if args else None)
+
+        # Inbound-speech echo: the gateway posts 🎙️ "<transcript>" so a user can
+        # verify STT quality. Useful on an operator surface, noise on a public
+        # one — and NOT configurable per profile upstream, because
+        # _should_echo_stt_transcripts() reads the process-wide GatewayRunner
+        # config, so the root value wins for every profile. This is the only
+        # place it can be decided per profile.
+        if self._hygiene_cfg().get("suppress_stt_echo", False) and isinstance(content, str):
+            if _STT_ECHO_RE.match(content):
+                logger.info("ambient: suppressed STT transcript echo: %s", content.strip()[:80])
+                return self._suppressed_result()
+
+        # Voice-only: when a voice message just went out for this chat, drop the
+        # duplicate text reply that the runner sends straight after it. Bounded
+        # by a short window so an ordinary later message is never swallowed.
+        if self._voice_only_enabled() and self._voice_just_sent(chat_id):
+            logger.info(
+                "ambient: voice-only — suppressed the text twin of a voice reply: %s",
+                str(content).strip()[:80],
+            )
+            self._bounce_discard_pending(reply_to)
+            return self._suppressed_result()
+
         target = self._system_notice_target(content, chat_id)
         if target:
             # Reroute, don't drop: the operator still wants cron failures, just
@@ -1710,6 +1864,11 @@ def register(ctx) -> None:
     under two names.
     """
     _bundled.register(ctx)
+
+    # Speech hygiene is process-wide by nature (see _install_tts_kaomoji_filter),
+    # so install it once at registration rather than per adapter instance.
+    _install_tts_kaomoji_filter()
+
     from gateway.platform_registry import platform_registry  # type: ignore
 
     entry = platform_registry.get("discord")
