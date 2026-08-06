@@ -1424,13 +1424,20 @@ class AmbientDiscordAdapter(DiscordAdapter):
 
     async def send_voice(self, *args: Any, **kwargs: Any):
         """Mark that speech went out, so send() can drop the text twin."""
+        chat_id = kwargs.get("chat_id", args[0] if args else None)
+        # Logged unconditionally: whether this override runs at all, and in what
+        # ORDER relative to the text send, is the thing that has been guessed
+        # wrong twice. One real run of this beats any amount of reading.
+        logger.info(
+            "ambient.voice: send_voice chat=%s voice_only=%s",
+            chat_id, self._voice_only_enabled(),
+        )
         result = await super().send_voice(*args, **kwargs)
-        if self._voice_only_enabled():
-            chat_id = kwargs.get("chat_id", args[0] if args else None)
-            if chat_id is not None:
-                if not hasattr(self, "_voice_sent_at"):
-                    self._voice_sent_at = {}
-                self._voice_sent_at[str(chat_id)] = time.monotonic()
+        if self._voice_only_enabled() and chat_id is not None:
+            if not hasattr(self, "_voice_sent_at"):
+                self._voice_sent_at = {}
+            self._voice_sent_at[str(chat_id)] = time.monotonic()
+            logger.info("ambient.voice: marked chat=%s for text-twin suppression", chat_id)
         return result
 
     def _scrub_outbound(self, content: str) -> str | None:
@@ -1615,6 +1622,12 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # Voice-only, runner path: a voice message just went out for this chat,
         # so drop the duplicate text reply sent straight after it. Bounded by a
         # short window so an ordinary later message is never swallowed.
+        if self._voice_only_enabled():
+            _marks = getattr(self, "_voice_sent_at", {}) or {}
+            logger.info(
+                "ambient.voice: text send chat=%s marks=%s",
+                chat_id, list(_marks.keys()),
+            )
         if self._voice_only_enabled() and self._voice_just_sent(chat_id):
             logger.info(
                 "ambient: voice-only — suppressed the text twin of a voice reply: %s",
