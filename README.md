@@ -569,3 +569,33 @@ Worth stating because the first version of this release only handled one:
 `send_voice()` and only `_strip_markdown_for_tts`, so an agent that was *asked* to speak
 still posted a duplicate text reply and still had its kaomoji read aloud. v1.11.1 covers
 the tool path too.
+
+### The ordering, measured rather than assumed (v1.12.0)
+
+Instrumenting the real thing settled what two rounds of reading the source did not:
+
+```
+02:02:30      TTS audio saved                      <- speech generated
+02:02:44.443  ambient.voice: text send  marks=[]   <- TEXT GOES OUT FIRST
+02:02:44.749  Delivering 1 non-image MEDIA attachment
+02:02:44.749  ambient.voice: send_voice voice_only=True
+```
+
+The text precedes the audio by ~300 ms, so **any mark set when audio is delivered is
+always too late** — which is why v1.11.x never suppressed anything. The TTS *call*,
+however, happens ~14 seconds earlier, and that is early enough to act on.
+
+So `voice_only_replies` now keys off "speech was generated for this turn", recorded by
+wrapping `text_to_speech_tool`.
+
+**Scope, and its limit.** The tool has no reliable profile context — the same process-global
+resolution that misfiles audio into another profile's cache directory is the only signal
+available at TTS time — so the flag is process-wide. Three things keep that safe:
+
+1. only profiles with `voice_only_replies` ever **consult** it;
+2. it is **consume-once**, so at most one text send is ever affected;
+3. a 30-second window, and every suppression is logged.
+
+Residual risk: another profile generates speech and this one sends unrelated text inside
+the window — one message dropped, logged, never silence. A per-profile audio cache dir
+upstream would remove it entirely.

@@ -189,6 +189,42 @@ _KAOMOJI_HINT_RE = re.compile(
 
 _TTS_PATCHED = False
 
+# ── "speech happened" signal ────────────────────────────────────────────────
+# Measured 2026-08-07: the reply TEXT goes out ~300ms BEFORE the audio, and the
+# TTS file is written ~14s before that. So a mark set when audio is delivered
+# is always too late — but the TTS call itself is early enough to act on.
+#
+# SCOPE, and its limit, stated plainly: the tool has no reliable profile context
+# (the same process-global resolution that misfiles audio into another profile's
+# cache dir is the only signal available at TTS time), so this flag is
+# process-wide. Three things keep it safe:
+#   1. only profiles with voice_only_replies ever CONSULT it — today just Companion;
+#   2. it is consume-once, so at most one text send is ever affected;
+#   3. a short window, and every suppression is logged.
+# Residual risk: another profile generates speech and Companion sends unrelated
+# text inside the window — one message dropped, logged, never silence.
+_TTS_SIGNAL_WINDOW_S = 30.0
+_last_tts_at: float = 0.0
+_last_tts_claimed: bool = True
+
+
+def _note_tts_generated() -> None:
+    global _last_tts_at, _last_tts_claimed
+    _last_tts_at = time.monotonic()
+    _last_tts_claimed = False
+
+
+def _claim_recent_tts() -> bool:
+    """True at most once per TTS call, and only inside the window."""
+    global _last_tts_claimed
+    if _last_tts_claimed:
+        return False
+    if (time.monotonic() - _last_tts_at) > _TTS_SIGNAL_WINDOW_S:
+        return False
+    _last_tts_claimed = True
+    return True
+
+
 
 def _strip_kaomoji(text: str) -> str:
     """Remove kaomoji from a speech script. Never touches posted text.
@@ -251,8 +287,25 @@ def _install_tts_kaomoji_filter() -> None:
             return _orig(text, *a, **kw)
 
         _norm.prepare_spoken_text = _wrapped
+
+        # Same install point, second concern: record WHEN speech was produced,
+        # so send() can drop the text that the pipeline emits just before it.
+        import tools.tts_tool as _tts  # type: ignore
+
+        _orig_tool = _tts.text_to_speech_tool
+
+        def _tool_wrapped(*a, **kw):
+            result = _orig_tool(*a, **kw)
+            try:
+                if isinstance(result, str) and '"success": false' not in result:
+                    _note_tts_generated()
+            except Exception:
+                pass
+            return result
+
+        _tts.text_to_speech_tool = _tool_wrapped
         _TTS_PATCHED = True
-        logger.info("ambient: TTS kaomoji filter installed (process-wide)")
+        logger.info("ambient: TTS kaomoji filter + speech signal installed (process-wide)")
     except Exception as exc:
         logger.warning("ambient: could not install TTS kaomoji filter: %s", exc)
 
@@ -1622,12 +1675,18 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # Voice-only, runner path: a voice message just went out for this chat,
         # so drop the duplicate text reply sent straight after it. Bounded by a
         # short window so an ordinary later message is never swallowed.
-        if self._voice_only_enabled():
-            _marks = getattr(self, "_voice_sent_at", {}) or {}
+        # Voice-only, the path that actually works: speech for this turn was
+        # already GENERATED before this text was sent (measured: ~14s before), so
+        # the signal exists by now even though the audio has not been delivered
+        # yet. Consume-once, so only the first text after a TTS call is dropped.
+        if self._voice_only_enabled() and isinstance(content, str) and _claim_recent_tts():
             logger.info(
-                "ambient.voice: text send chat=%s marks=%s",
-                chat_id, list(_marks.keys()),
+                "ambient: voice-only — dropped text emitted alongside speech: %s",
+                content.strip()[:100],
             )
+            self._bounce_discard_pending(reply_to)
+            return self._suppressed_result()
+
         if self._voice_only_enabled() and self._voice_just_sent(chat_id):
             logger.info(
                 "ambient: voice-only — suppressed the text twin of a voice reply: %s",
