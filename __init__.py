@@ -203,13 +203,44 @@ _TTS_PATCHED = False
 #   3. a short window, and every suppression is logged.
 # Residual risk: another profile generates speech and Companion sends unrelated
 # text inside the window — one message dropped, logged, never silence.
-_TTS_SIGNAL_WINDOW_S = 30.0
+# Measured over five real turns (2026-08-07): the gap between the TTS call and
+# the text send is 2.7s / 5.6s / 12.8s / 15.4s / 35.4s — dominated by how long
+# the model takes to FINISH generating after calling the tool, which on a
+# free-tier model is wildly variable. A 30s window caught only 4 of 5; the
+# instinct to shrink it would have brought the duplicate text straight back.
+_TTS_SIGNAL_WINDOW_S = 45.0
 _last_tts_at: float = 0.0
 _last_tts_claimed: bool = True
 
 
+def _profile_wants_voice_only() -> bool:
+    """Does the profile that is generating this speech want voice-only replies?
+
+    This is what keeps a process-wide signal from crossing profiles. It works
+    because config resolution IS profile-correct inside the TTS tool — proven by
+    the tool itself picking Edge for Companion and Piper for Assistant on the same
+    gateway. So a profile without voice_only_replies never arms the signal, and
+    can never cause another profile's message to be dropped.
+    """
+    try:
+        from hermes_cli.config import load_config  # type: ignore
+
+        extra = (
+            load_config()
+            .get("platforms", {})
+            .get("discord", {})
+            .get("extra", {})
+            .get("ambient_presence", {})
+        ) or {}
+        return bool(extra.get("voice_only_replies", False))
+    except Exception:
+        return False          # fail toward "do not suppress"
+
+
 def _note_tts_generated() -> None:
     global _last_tts_at, _last_tts_claimed
+    if not _profile_wants_voice_only():
+        return
     _last_tts_at = time.monotonic()
     _last_tts_claimed = False
 
