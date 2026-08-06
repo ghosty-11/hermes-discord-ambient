@@ -213,24 +213,35 @@ def _strip_kaomoji(text: str) -> str:
 
 
 def _install_tts_kaomoji_filter() -> None:
-    """Wrap Hermes' TTS text preparation with a kaomoji pre-pass.
+    """Wrap Hermes' spoken-text preparation with a kaomoji pre-pass.
+
+    Patches ``tools.tts_text_normalize.prepare_spoken_text``, which is the COMMON
+    chokepoint — every route to speech goes through it:
+
+      * ``tts_tool.text_to_speech_tool``      (the model calling the tts tool)
+      * ``tts_tool._strip_markdown_for_tts``  (the runner's auto voice reply)
+      * ``gateway/platforms/base.py``         (the adapter path)
+
+    An earlier version patched ``_strip_markdown_for_tts`` instead and only fixed
+    the runner path, so a model that called the tool directly still had its
+    kaomoji read aloud. All three import the function INSIDE the function body,
+    so patching the module attribute reaches every caller.
 
     PROCESS-WIDE, unlike everything else in this plugin, and deliberately so:
-    ``_send_voice_reply`` imports ``_strip_markdown_for_tts`` inside the
-    function body, so patching the module attribute takes effect for every
-    profile in the multiplexed gateway. Nobody wants kaomoji read aloud, so a
-    global is honest here rather than pretending it is per-profile.
+    the import shape makes per-profile scoping impossible, and nobody wants
+    kaomoji read aloud, so a global is the honest shape rather than a config key
+    that pretends otherwise.
 
-    Wraps rather than replaces, so whatever upstream normalisation does still
-    runs and keeps running after an update.
+    Wraps rather than replaces, so upstream normalisation keeps running and keeps
+    working after an update.
     """
     global _TTS_PATCHED
     if _TTS_PATCHED:
         return
     try:
-        import tools.tts_tool as _tts  # type: ignore
+        import tools.tts_text_normalize as _norm  # type: ignore
 
-        _orig = _tts._strip_markdown_for_tts
+        _orig = _norm.prepare_spoken_text
 
         def _wrapped(text, *a, **kw):
             try:
@@ -239,12 +250,23 @@ def _install_tts_kaomoji_filter() -> None:
                 pass          # a hygiene pass must never break speech
             return _orig(text, *a, **kw)
 
-        _tts._strip_markdown_for_tts = _wrapped
+        _norm.prepare_spoken_text = _wrapped
         _TTS_PATCHED = True
         logger.info("ambient: TTS kaomoji filter installed (process-wide)")
     except Exception as exc:
         logger.warning("ambient: could not install TTS kaomoji filter: %s", exc)
 
+
+# A model narrating its own tool result: "[Media: AUDIO:/var/lib/.../tts_x.mp3]".
+# Only the BRACKETED rendering is stripped — a bare "MEDIA:<path>" is the real
+# directive the send pipeline consumes to deliver the audio, and removing that
+# would silence the agent instead of tidying it. Host paths must never reach
+# chat regardless: they leak the HERMES_HOME layout, which is why the base
+# adapter has _log_safe_path for its own logging.
+_MEDIA_NARRATION_RE = re.compile(
+    r"\[\s*(?:media|audio|image|video|file)\s*:\s*[^\]]*\]",
+    re.IGNORECASE,
+)
 
 # The gateway echoes inbound speech as: 🎙️ "<transcript>"
 _STT_ECHO_RE = re.compile(r'^\s*\U0001F399\uFE0F?\s*"')
@@ -1469,6 +1491,18 @@ class AmbientDiscordAdapter(DiscordAdapter):
             )
             text = cleaned
 
+        # A leaked media narration is always a bug: it is the model describing a
+        # tool result instead of letting the platform deliver it, and it puts a
+        # host filesystem path into a public channel. Default ON.
+        if cfg.get("strip_media_narration", True):
+            cleaned, n = _MEDIA_NARRATION_RE.subn(" ", text)
+            if n:
+                logger.info(
+                    "ambient: stripped %d leaked media narration(s) from a reply", n
+                )
+                text = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+                setattr(self, "_last_scrub_had_media_narration", True)
+
         # Dash rewriting is a style choice, so it stays opt-in.
         if cfg.get("no_em_dash", False):
             text = self._rewrite_dashes(text)
@@ -1559,9 +1593,28 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 logger.info("ambient: suppressed STT transcript echo: %s", content.strip()[:80])
                 return self._suppressed_result()
 
-        # Voice-only: when a voice message just went out for this chat, drop the
-        # duplicate text reply that the runner sends straight after it. Bounded
-        # by a short window so an ordinary later message is never swallowed.
+        # Voice-only, tool-call path: the model called the tts tool itself, so
+        # send_voice() was never involved — the audio rode out as a MEDIA
+        # directive and the model narrated it in prose. If the reply carries a
+        # media narration AND nothing but the spoken words around it, the audio
+        # IS the reply; posting the same sentence as text is the duplication we
+        # are trying to remove.
+        if (
+            self._voice_only_enabled()
+            and isinstance(content, str)
+            and _MEDIA_NARRATION_RE.search(content)
+            and "MEDIA:" not in _MEDIA_NARRATION_RE.sub("", content)
+        ):
+            logger.info(
+                "ambient: voice-only — suppressed the narrated text twin: %s",
+                _MEDIA_NARRATION_RE.sub("", content).strip()[:80],
+            )
+            self._bounce_discard_pending(reply_to)
+            return self._suppressed_result()
+
+        # Voice-only, runner path: a voice message just went out for this chat,
+        # so drop the duplicate text reply sent straight after it. Bounded by a
+        # short window so an ordinary later message is never swallowed.
         if self._voice_only_enabled() and self._voice_just_sent(chat_id):
             logger.info(
                 "ambient: voice-only — suppressed the text twin of a voice reply: %s",
