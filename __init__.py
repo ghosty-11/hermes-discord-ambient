@@ -203,6 +203,98 @@ _FALLBACK_NOTICE_PREFIX = "🔄 Switched to fallback model:"
 # plumbing, so they are rerouted to a private channel when one is configured.
 _SYSTEM_NOTICE_PREFIXES = ["⚠️ Cron '", "Cronjob Response:"]
 
+# ---- outbound text hygiene ------------------------------------------------
+# CONTROL-TOKEN LEAKAGE. Models trained on OpenAI's "harmony" chat format
+# (gpt-oss and its many free-tier rebadges) express a tool call as
+# `<|channel|>commentary to=functions.name<|constrain|>json<|message|>{...}`.
+# When the serving endpoint does not parse that format back into a structured
+# tool call, the raw control text falls through as ordinary assistant content
+# and the bot posts its own plumbing to the channel. Observed 2026-08-06:
+# Companion answered a GIF request with the literal string
+# `to=functions.tool_call?commentary?…?…???`.
+#
+# This is never intentional output, so stripping is always safe. What is NOT
+# safe is posting the remainder when nothing survives: a message of stray
+# punctuation reads as the bot glitching. Those are suppressed instead.
+# Harmony is an envelope, not loose tokens, so it is parsed as one:
+#   <|start|>ROLE<|channel|>CHANNEL<|constrain|>FMT<|message|>PAYLOAD<|end|>
+# Stripping token-by-token is not enough — it leaves the channel name and the
+# tool-argument JSON behind as visible text. Only the payload of a `final`
+# channel is real output; `commentary`/`analysis` payloads are a tool call or
+# private reasoning and must never reach the room.
+_HARMONY_TOKEN_RE = re.compile(r"<\|[a-z_]{1,24}\|>", re.IGNORECASE)
+_HARMONY_MSG_RE = re.compile(r"^(?P<head>.*)<\|message\|>(?P<body>.*)$", re.S | re.I)
+_REASONING_CHANNEL_RE = re.compile(r"\b(?:commentary|analysis)\b", re.IGNORECASE)
+# A recipient marker is decisive on its own: `to=functions.x` is how harmony
+# addresses a tool, and no genuine chat reply contains it. This catches the
+# degenerate form that has no angle-bracket tokens left to parse at all
+# (observed: `to=functions.tool_call?commentary?…?…???`).
+_TOOL_RECIPIENT_RE = re.compile(r"(?<![\w.])to\s*=\s*functions?\.", re.IGNORECASE)
+# A scrubbed message is worth posting only if some real language survived.
+_HAS_WORD_RE = re.compile(r"\w{2,}")
+
+# EM DASH. Every model reaches for it and it reads as machine-written, which
+# is precisely the tell an in-character persona bot should not have. Rewritten
+# rather than deleted so the clause boundary the model intended survives.
+# Spaced en dash is punctuation too; an UNspaced en dash is a numeric range
+# (1–5) and is deliberately left alone.
+_EM_DASH_RE = re.compile(r"\s*[—―]\s*")
+_SPACED_EN_DASH_RE = re.compile(r"\s+–\s+")
+# Fenced code is exempt from the dash rewrite: inside a fence a dash may be
+# data. Split on the fence delimiter and rewrite only the odd (outside) parts.
+_CODE_FENCE_RE = re.compile(r"(```)")
+
+# MEDIA URL ISOLATION. Discord's client hides the raw URL and renders only the
+# media when a message's ENTIRE content is one media link — which is why a GIF
+# from the built-in picker looks clean: the picker posts the URL and nothing
+# else. One character of surrounding text and the client falls back to showing
+# the link as text with the embed underneath. Models never post a bare URL;
+# they wrap it in chatter, so a GIF reply reads as link + text + embed.
+# Matching is done per whitespace-separated token, not with one regex over the
+# whole message: a greedy URL pattern silently swallows trailing punctuation
+# and the neighbouring word.
+# SPEAKER-TAG ECHO. This plugin prefixes every INBOUND message with
+# `[speaker @handle id:123]` so the agent can key memories on stable identity.
+# Models routinely infer the wrong thing from that: "messages start with a
+# speaker tag, I am writing a message, therefore mine starts with one too", and
+# emit their own reply prefixed with a tag naming themselves. Observed
+# 2026-08-06: Companion opened a reply with `[speaker @companion id:123]` — the id
+# copied verbatim from the *example* in her own AGENTS.md.
+#
+# Her instructions say never to echo it, in two separate files. She did anyway,
+# because a strong structural pattern beats a prose prohibition on a small
+# model. The tag is ours, injected by us, so stripping it on the way out is
+# ours too: prompt guidance is necessary but demonstrably not sufficient.
+_SPEAKER_ECHO_RE = re.compile(r"\[speaker\b[^\]\n]{0,120}\]", re.IGNORECASE)
+
+_URL_TOKEN_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
+_MEDIA_EXT_RE = re.compile(r"\.(?:gif|gifv|mp4|webm|png|jpe?g|webp)$", re.IGNORECASE)
+# Hosts whose *page* URLs Discord resolves to a media embed even though the
+# path carries no file extension.
+_MEDIA_HOST_RE = re.compile(
+    r"^https?://(?:[\w-]+\.)*(?:tenor\.com/view/|giphy\.com/gifs/|klipy\.com/)",
+    re.IGNORECASE,
+)
+
+
+def _media_url(token: str) -> str | None:
+    """Return the media URL in this token, or None.
+
+    Sentence punctuation trailing a URL is trimmed before matching — models
+    write "here you go https://x/y.gif." and the period is prose, not path.
+    The trimmed form is what gets posted; the period is dropped with the rest
+    of the surrounding text, which is the point of isolating the URL.
+    """
+    token = token.rstrip(".,!?;:")
+    if not _URL_TOKEN_RE.match(token):
+        return None
+    if _MEDIA_HOST_RE.match(token):
+        return token
+    # Strip query/fragment before testing the extension: a CDN URL may end in
+    # `.gif?w=480`, which still serves a GIF.
+    path = token.split("#", 1)[0].split("?", 1)[0]
+    return token if _MEDIA_EXT_RE.search(path) else None
+
 
 def _id_set(value) -> set:
     """Normalize a config id list to a set of strings.
@@ -1167,6 +1259,147 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.debug("ambient: could not start presence rotation", exc_info=True)
         return ok
 
+    # ---- outbound text hygiene -------------------------------------------
+    def _hygiene_cfg(self) -> dict:
+        return self._sub("text_hygiene")
+
+    def _rewrite_dashes(self, text: str) -> str:
+        """Replace em dashes with a spaced hyphen, outside fenced code."""
+        out = []
+        # Odd indices are the ``` delimiters themselves; parts between a pair
+        # of them are inside a fence. Track parity across the split.
+        inside = False
+        for part in _CODE_FENCE_RE.split(text):
+            if part == "```":
+                inside = not inside
+                out.append(part)
+                continue
+            if not inside:
+                part = _EM_DASH_RE.sub(" - ", part)
+                part = _SPACED_EN_DASH_RE.sub(" - ", part)
+            out.append(part)
+        return "".join(out)
+
+    def _scrub_outbound(self, content: str) -> str | None:
+        """Clean a reply before it goes out.
+
+        Returns the cleaned text, or None when the message was nothing but
+        leaked control tokens and should be suppressed entirely rather than
+        posted as punctuation soup.
+        """
+        cfg = self._hygiene_cfg()
+        text = content
+
+        # Control tokens default ON: their presence is always a bug.
+        if cfg.get("strip_control_tokens", True):
+            drop = None
+            if _TOOL_RECIPIENT_RE.search(text):
+                drop = "leaked tool call (harmony recipient marker)"
+            elif _HARMONY_TOKEN_RE.search(text):
+                m = _HARMONY_MSG_RE.match(text)
+                if m and _REASONING_CHANNEL_RE.search(m.group("head")):
+                    drop = "harmony reasoning/commentary channel"
+                else:
+                    # Keep the payload of the last <|message|>; with no
+                    # envelope to parse, fall back to token removal.
+                    body = m.group("body") if m else text
+                    body = _HARMONY_TOKEN_RE.sub(" ", body)
+                    body = re.sub(r"[ \t]{2,}", " ", body).strip()
+                    if _HAS_WORD_RE.search(body):
+                        logger.warning(
+                            "ambient: stripped a leaked harmony envelope from a "
+                            "reply: %r", text[:200],
+                        )
+                        text = body
+                    else:
+                        drop = "nothing but control tokens"
+            if drop:
+                logger.warning(
+                    "ambient: suppressed a reply — %s: %r", drop, text[:200],
+                )
+                return None
+
+        # Speaker-tag echo. Defaults ON and is only reachable when we inject the
+        # tag in the first place, so there is nothing to strip for profiles that
+        # do not use speaker_identity.
+        if cfg.get("strip_speaker_echo", True) and _SPEAKER_ECHO_RE.search(text):
+            cleaned = _SPEAKER_ECHO_RE.sub("", text)
+            cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+            cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+            if not _HAS_WORD_RE.search(cleaned):
+                logger.warning(
+                    "ambient: suppressed a reply that was only an echoed "
+                    "speaker tag: %r", text[:160],
+                )
+                return None
+            logger.warning(
+                "ambient: stripped an echoed speaker tag from a reply: %r",
+                text[:160],
+            )
+            text = cleaned
+
+        # Dash rewriting is a style choice, so it stays opt-in.
+        if cfg.get("no_em_dash", False):
+            text = self._rewrite_dashes(text)
+
+        return text
+
+    def _split_media_urls(self, content: str) -> tuple[str, list[str]]:
+        """Separate media URLs from the prose around them.
+
+        Returns (remaining_text, media_urls). Both empty-safe: a message with
+        no media URL, or one that is ALREADY nothing but a media URL, comes
+        back with an empty url list so the caller sends it untouched.
+        """
+        tokens = content.split()
+        if not tokens:
+            return content, []
+        media = [u for u in (_media_url(t) for t in tokens) if u]
+        if not media:
+            return content, []
+        if len(tokens) == 1 and len(media) == 1 and tokens[0] == media[0]:
+            return content, []  # already a bare URL — Discord renders it clean
+        # Rebuild the prose line-by-line so deliberate paragraph breaks survive;
+        # only the URL tokens are removed.
+        lines = []
+        for line in content.splitlines():
+            kept = " ".join(t for t in line.split() if not _media_url(t))
+            lines.append(kept)
+        rest = "\n".join(lines)
+        rest = re.sub(r"\n{3,}", "\n\n", rest).strip()
+        return rest, media
+
+    def _attach_pending_gif(self, content: str, media: list) -> list:
+        """Append a fetched-but-unposted GIF URL to the outgoing media list.
+
+        Cleared unconditionally once inspected, so a URL can only ever be
+        attached to the single reply that follows its lookup. The time window
+        is a second guard for the case where a turn dies before sending at all
+        and the next unrelated message would otherwise inherit the GIF.
+        """
+        pending = _gif_state.get("pending")
+        if not pending:
+            return media
+        url, ts = pending
+        _gif_state["pending"] = None
+        cfg = _gif_config()
+        if not cfg.get("attach_if_omitted", True):
+            return media
+        if time.time() - float(ts) > float(cfg.get("attach_window_seconds", 180)):
+            logger.info("gif_search: pending GIF expired unposted (%s)", url[:60])
+            return media
+        if url in content or url in media:
+            # Belt and braces. The tool no longer hands the model a URL, so
+            # this should not happen — if it does, the model dug one out of
+            # conversation history and posting it again would duplicate.
+            logger.warning(
+                "gif_search: reply already contained a GIF url, not attaching "
+                "a second: %s", url[:60],
+            )
+            return media
+        logger.info("gif_search: attaching GIF to reply: %s", url[:60])
+        return list(media) + [url]
+
     # ---- silence + bounce accounting -------------------------------------
     async def send(self, chat_id: str, content: str, *args: Any, **kwargs: Any):
         """Swallow the sentinel so the agent may choose to stay quiet.
@@ -1228,6 +1461,46 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     return SendResult(success=True, message_id=None)
                 except Exception:
                     return None
+        # Scrub last, so the sentinel/notice comparisons above still match on
+        # the model's verbatim text. A fully-suppressed reply is accounted for
+        # exactly like a [SILENT] one: it never went out, so it must not be
+        # charged to the bot-bounce pair.
+        if isinstance(content, str):
+            scrubbed = self._scrub_outbound(content)
+            if scrubbed is None:
+                self._bounce_discard_pending(reply_to)
+                try:
+                    from gateway.platforms.base import SendResult  # type: ignore
+
+                    return SendResult(success=True, message_id=None)
+                except Exception:
+                    return None
+            content = scrubbed
+
+            # Media isolation, after scrubbing so a suppressed reply never
+            # reaches it. The prose keeps the reply anchor and any metadata;
+            # each media URL follows as its own bare message, which is the only
+            # form Discord renders as pure media. Bounce accounting is charged
+            # ONCE, on the first send — the pair had one reply, not two.
+            if self._hygiene_cfg().get("isolate_media_urls", True):
+                rest, media = self._split_media_urls(content)
+                media = self._attach_pending_gif(content, media)
+                if media:
+                    first = None
+                    if rest:
+                        first = await super().send(chat_id, rest, *args, **kwargs)
+                    for url in media:
+                        sent = await super().send(chat_id, url)
+                        if first is None:
+                            first = sent
+                    logger.info(
+                        "ambient: isolated %d media url(s) into their own "
+                        "message(s) so Discord renders them without the link",
+                        len(media),
+                    )
+                    self._bounce_count_sent(reply_to, first)
+                    return first
+
         result = await super().send(chat_id, content, *args, **kwargs)
         self._bounce_count_sent(reply_to, result)
         return result
@@ -1244,7 +1517,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
 #   platforms.discord.extra.ambient_presence.gif_search
 # and the credential is KLIPY_API_KEY in the PROFILE's .env (never config.yaml —
 # config.yaml is world-readable-ish and goes nowhere near a git remote).
-_gif_state: dict = {"last": 0.0, "hits": deque(maxlen=256)}
+# "pending" holds (url, fetched_at) between the tool returning a URL and the
+# adapter sending the reply, so a model that forgets to paste it still posts it.
+_gif_state: dict = {"last": 0.0, "hits": deque(maxlen=256), "pending": None}
 
 
 def _gif_config() -> dict:
@@ -1289,14 +1564,33 @@ def _gif_handle(args: dict, **_: Any) -> str:
     if not query:
         return "gif_search: 'query' is required."
 
+    # Both refusals below are returned to the MODEL, which then answers in words,
+    # so the operator sees a normal reply and cannot tell which limit fired. They
+    # are also the same length, so the tool_executor's "(0.00s, 55 chars)" line
+    # does not disambiguate them either. Log which one, with the numbers: working
+    # this out from timestamps alone cost a diagnosis on 2026-08-06.
     now = time.time()
-    if now - float(_gif_state["last"]) < float(cfg.get("min_interval_seconds", 60)):
+    _interval = float(cfg.get("min_interval_seconds", 60))
+    _since = now - float(_gif_state["last"])
+    if _since < _interval:
+        logger.info(
+            "gif_search: refused %r — cooldown, %.0fs since last of %.0fs",
+            query, _since, _interval,
+        )
         return "No GIF this time — you just posted one. Reply in words."
     hits = _gif_state["hits"]
     cutoff = now - 86400
     while hits and hits[0] < cutoff:
         hits.popleft()
-    if len(hits) >= int(cfg.get("max_per_day", 20)):
+    _cap = int(cfg.get("max_per_day", 20))
+    if len(hits) >= _cap:
+        # NB: `hits` is in-memory only, so a gateway restart resets the daily
+        # count to zero. On a host that restarts often this cap is far softer
+        # than it looks — do not read a quiet day as the cap having bitten.
+        logger.info(
+            "gif_search: refused %r — daily cap, %d/%d in the rolling 24h "
+            "(counter resets on gateway restart)", query, len(hits), _cap,
+        )
         return "No GIF this time — daily limit reached. Reply in words."
 
     params = _urlparse.urlencode({
@@ -1304,7 +1598,12 @@ def _gif_handle(args: dict, **_: Any) -> str:
         "per_page": int(cfg.get("pool", 8)),
         # 'high' by default: a public room, and the agent cannot preview what it posts.
         "content_filter": str(cfg.get("content_filter", "high")),
-        "format_filter": "gif",
+        # NO format_filter. It reads like a search facet ("only items that have
+        # a gif") but it actually strips the response down to that ONE rendition
+        # — with format_filter=gif every item comes back as {'gif': ...} alone
+        # and the webp/mp4/webm we want are simply absent. Verified against the
+        # live API 2026-08-06: dropping it returns the same 8 items, each with
+        # all of gif/webp/jpg/mp4/webm. Do not "tidy" this back in.
         "customer_id": str(args.get("customer_id") or "companion")[:64],
     })
     url = f"https://api.klipy.com/api/v1/{key}/gifs/search?{params}"
@@ -1316,31 +1615,76 @@ def _gif_handle(args: dict, **_: Any) -> str:
         logger.debug("gif_search: lookup failed", exc_info=True)
         return "gif_search: lookup failed; just reply in words."
 
+    # FORMAT: default webp, not gif. GIF is limited to a 256-colour palette, so
+    # gradients and dark scenes band into visible blocky patches — the black
+    # blocks you see on an anime GIF are palette quantisation plus dithering,
+    # not a broken download. Klipy serves every item as gif/webp/mp4/webm/jpg;
+    # animated WebP is 24-bit, roughly a third the bytes, and still embeds as an
+    # IMAGE (autoplays and loops inline, no player chrome). mp4/webm are smaller
+    # again but Discord renders them as a video embed, which reads less like a
+    # reaction GIF — offered as config for anyone who prefers it.
+    fmt = str(cfg.get("format", "webp")).strip().lower()
+    if fmt not in ("webp", "gif", "mp4", "webm"):
+        fmt = "webp"
+    # Fall back through formats so a rare item lacking the preferred one still
+    # yields a URL instead of being silently dropped from the pool.
+    fmt_chain = [fmt] + [f for f in ("webp", "gif", "mp4", "webm") if f != fmt]
+    size_pref = cfg.get("sizes") or ("md", "sm", "hd")
+    if isinstance(size_pref, str):
+        size_pref = [s.strip() for s in size_pref.split(",") if s.strip()]
+
     urls = []
     for item in ((payload.get("data") or {}).get("data")) or []:
         files = item.get("file") or {}
-        # md first — hd gifs are multi-MB and slow to embed on mobile.
-        for size in ("md", "sm", "hd"):
-            got = ((files.get(size) or {}).get("gif") or {}).get("url")
+        got = None
+        # Size is the outer loop: a md webp beats an hd gif for our purposes.
+        for size in size_pref:
+            for candidate in fmt_chain:
+                got = ((files.get(size) or {}).get(candidate) or {}).get("url")
+                if got:
+                    break
             if got:
-                urls.append(got)
                 break
+        if got:
+            urls.append(got)
     if not urls:
         return f"gif_search: nothing found for {query!r}."
 
     chosen = _random.choice(urls[: max(1, int(cfg.get("pick_from", 5)))])
     _gif_state["last"] = now
     hits.append(now)
+    # Hand the URL to send() as well as to the model. A tool whose whole
+    # contract is "echo this exact string back" is unreliable on a small model:
+    # ours fetched a GIF and then wrote "Here's a fluffy one for you!" with no
+    # URL in the message at all, twice in a row (2026-08-06). The description
+    # says "put that URL in your reply" in plain words; it did not help. So the
+    # adapter attaches it if the reply omits it — delivery is ours, not the
+    # model's. Consumed (or expired) in send(); [SILENT] returns earlier, so a
+    # reply the agent chose to swallow never drags a GIF out with it.
+    _gif_state["pending"] = (chosen, now)
     logger.info("gif_search: %r -> %s", query, chosen[:60])
-    return chosen
+    # The URL is deliberately NOT returned to the model. There must be exactly
+    # ONE thing that posts a GIF, and it is send(). Handing the model a URL
+    # created two independent posters and both failure modes showed up in one
+    # night: the model wrote a reply with no URL at all (GIF never appeared),
+    # and then the model wrapped it as `![alt](url)` — which the GATEWAY strips
+    # before the adapter ever sees it (`extract_media()` in gateway/run.py;
+    # visible in the log as `response ready: 826 chars` followed by
+    # `Sending response (728 chars)`) and delivers separately, while the
+    # adapter, seeing no URL in the text, attached it too. Two GIFs.
+    # With no URL in the tool result there is nothing to paste, nothing for
+    # extract_media to strip, and one poster.
+    return "GIF attached to your reply. Write your words normally, no URL."
 
 
 _GIF_SCHEMA = {
     "name": "gif_search",
     "description": (
-        "Find a reaction GIF. Returns a URL — put that URL in your reply and "
-        "Discord shows the GIF. Use it as punctuation, rarely, when a GIF says "
-        "it better than words. Never explain that you searched for it."
+        "Attach a reaction GIF to the reply you are about to send. The GIF is "
+        "posted for you automatically — do NOT write a URL, a link, or "
+        "![markdown](...) in your reply, and do not describe the GIF. Just "
+        "write your words normally. Use it as punctuation, rarely, when a GIF "
+        "says it better than words. Never explain that you searched for it."
     ),
     "parameters": {
         "type": "object",

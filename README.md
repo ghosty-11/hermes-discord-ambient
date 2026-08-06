@@ -39,8 +39,10 @@ serious work.
 | **Fallback-notice suppression** | **zero** | Upstream announces a provider/model fallback switch with a one-shot status send ("🔄 Switched to fallback model: …"). Right for an operator channel, noise (and an internals leak) in a public community room. `suppress_fallback_notice: true` swallows it for this profile only — logged, never posted — while every other profile keeps the operator-facing notice. Suppressed or not, the notice is parsed as the local-fallback signal that drives `only_when_local` standby. |
 | **Group-address greetings** | 1 inference when it answers | "good morning agents" / "hello everyone" is addressed to the room — not a mention, not a name trigger, but ignoring it reads as absent. Opt-in `group_address` matches greeting+collective regex pairs (both words required, close together — a bare "agents" mid-sentence never triggers) and answers at its own probability (default 0.6) and short cooldown (default 300s), exempt from the daily cap: being spoken to is not inserting herself. |
 | **System-notice rerouting** | **zero** | Cron delivery failures (`⚠️ Cron 'x' failed: …`) and the cron wrapper header are posted to whatever channel the job delivers to — for a social profile, the community room, where the bot's own plumbing does not belong. `system_notices.reroute_channel` sends them to a private channel instead: rerouted, never dropped, so the operator still sees every failure. Pairs with `cron.wrap_response: false`, which removes the `Cronjob Response / job_id / "to stop this job"` framing from normal deliveries. |
-| **Speaker identity** | **zero** | Upstream labels every inbound message with the author's *display name* (hardcoded, no config). Display names are per-guild, user-editable and freely reused — an agent writing durable notes keyed on one will merge two people, or lose someone the day they rename. Worse, an agent instructed to "record the user id" **cannot comply**: the id never reaches the model. `speaker_identity: true` prepends a compact `[speaker @handle id:123]` to the dispatched text (once, also on re-dispatch and backfill), so memory notes can key on the stable handle and numeric id. Tell the agent never to echo the tag. |
-| **GIF search** | **zero** (one HTTP call) | Registers a `gif_search` tool returning an embeddable GIF URL from [Klipy](https://klipy.com/developers) — the successor to Tenor, whose API Google discontinued 2026-06-30. A tool rather than the bundled `gif-search` skill, because that skill drives curl+jq at a shell prompt and a public persona profile has no terminal (nor should it); Discord auto-embeds a bare URL, so a URL is all the agent needs. `content_filter: high` by default (the agent cannot preview what it posts), per-profile rate limits, and the tool is hidden entirely unless the profile sets `gif_search.enabled` **and** has `KLIPY_API_KEY` in its `.env`. |
+| **Speaker identity** | **zero** | Upstream labels every inbound message with the author's *display name* (hardcoded, no config). Display names are per-guild, user-editable and freely reused — an agent writing durable notes keyed on one will merge two people, or lose someone the day they rename. Worse, an agent instructed to "record the user id" **cannot comply**: the id never reaches the model. `speaker_identity: true` prepends a compact `[speaker @handle id:123]` to the dispatched text (once, also on re-dispatch and backfill), so memory notes can key on the stable handle and numeric id. **Telling the agent never to echo the tag is not enough** — models infer "messages start with a speaker tag, I am writing a message, so mine starts with one too" and open a reply with a tag naming *themselves*. Ours did it with the id copied verbatim out of the example in its own instructions, despite two separate files forbidding it: a strong structural pattern beats a prose prohibition on a small model. The tag is injected by this plugin, so `strip_speaker_echo` (default true) removes it on the way out. Keep the prompt guidance too — belt and braces — but do not rely on it. |
+| **GIF search** | **zero** (one HTTP call) | Registers a `gif_search` tool returning an embeddable GIF URL from [Klipy](https://klipy.com/developers) — the successor to Tenor, whose API Google discontinued 2026-06-30. A tool rather than the bundled `gif-search` skill, because that skill drives curl+jq at a shell prompt and a public persona profile has no terminal (nor should it); Discord auto-embeds a bare URL, so a URL is all the agent needs. `content_filter: high` by default (the agent cannot preview what it posts), per-profile rate limits, and the tool is hidden entirely unless the profile sets `gif_search.enabled` **and** has `KLIPY_API_KEY` in its `.env`. Serves **animated WebP, not GIF**, by default: GIF is capped at a 256-colour palette, so gradients and dark scenes band into visible black blocks — WebP is 24-bit, roughly a third the bytes, and still embeds as an *image* (autoplays and loops inline, no player chrome), while `mp4`/`webm` are smaller still but render as a video embed. One trap worth knowing: the API's `format_filter` parameter reads like a search facet but actually strips the response to that single rendition, so requesting `format_filter=gif` makes every other format vanish from the payload. Omit it. |
+| **Media URL isolation** | **zero** | Discord hides the raw URL and renders only the media when a message's *entire* content is one media link — that is the whole reason a GIF from the built-in picker looks clean, and it is not something the API can be asked for. Models never post a bare URL; they wrap it in chatter, so a GIF reply arrives as visible link + text + embed underneath. `isolate_media_urls` (default true) sends the prose first, keeping the reply anchor, then each media URL as its own bare message. Matching is per whitespace token rather than one regex over the message, because a greedy URL pattern swallows trailing punctuation and the next word; trailing sentence punctuation is trimmed, query strings are ignored when testing the extension, and a message that is *already* a bare URL is left untouched. Bot-bounce is charged once for the pair, not once per message. |
+| **Outbound text hygiene** | **zero** | Three scrubs on the way out (the third, speaker-tag echo, is described in the Speaker identity row above). **Control-token leakage** (always on): models trained on OpenAI's *harmony* format — gpt-oss and its many free-tier rebadges — express a tool call as `<|channel|>commentary to=functions.name<|message|>{…}`. When the serving endpoint fails to parse that back into a structured call, the raw control text falls through as ordinary content and the bot posts its own plumbing to the room. The envelope is parsed, not string-stripped (token-by-token removal leaves the channel name and the argument JSON visible): a `final` payload survives, a `commentary`/`analysis` payload or anything carrying a `to=functions.` recipient is suppressed outright and logged. **Em dashes** (opt-in, `no_em_dash`): every model reaches for them and they read as machine-written, which is exactly the tell an in-character persona should not have — rewritten to a spaced hyphen so the intended clause boundary survives, skipping fenced code, and leaving unspaced en dashes alone because those are numeric ranges. |
 | **Slash-command policy** | **zero** | Upstream shares ONE gate between chat admission and slash authorization, so an answer-everyone community profile also hands `/model`, `/reset`, … to every stranger — and under a multiplexed gateway the per-profile allow-all env flag may not even resolve on the interaction path, leaving the operator rejected while everyone chats freely. `slash_commands.allowed_channels` / `allowed_users` restrict slash invocations to explicit ids (matching invocations authorize directly; everything else gets the stock ephemeral rejection + admin alert). Chat is untouched. |
 
 ## Why this seam
@@ -196,11 +198,26 @@ platforms:
           probability: 0.6         # she's addressed, but so is everyone — roll for it
           cooldown_seconds: 300    # own short floor; exempt from the daily cap
           # patterns: [...]        # optional regex overrides (lowercased content)
+        # hint: "..."             # optional; overrides the ambient-join hint
+                                   # text sent with a re-dispatched message.
+                                   # {marker} = the [SILENT] sentinel.
         gif_search:                # needs KLIPY_API_KEY in the PROFILE's .env
           enabled: true
           min_interval_seconds: 90   # a GIF is punctuation, not a personality
           max_per_day: 20
           content_filter: high       # off | low | medium | high
+          format: webp               # webp (default) | gif | mp4 | webm
+          sizes: [md, sm, hd]        # first rendition that exists wins
+          attach_if_omitted: true    # default true — adapter posts the GIF itself
+          attach_window_seconds: 180 # how long a fetched GIF stays attachable
+          pool: 8                    # results requested from Klipy per search
+          pick_from: 5               # choose randomly among the top N of those
+          timeout_seconds: 12        # Klipy HTTP timeout
+        text_hygiene:              # scrub replies on the way out
+          strip_control_tokens: true  # default true — leaked harmony envelopes
+          strip_speaker_echo: true    # default true — the bot echoing its own tag
+          no_em_dash: false           # rewrite "—" to " - " outside code fences
+          isolate_media_urls: true    # default true — GIF gets its own message
         slash_commands:            # restrict /model, /reset, ... (chat unaffected)
           allowed_channels: ["<operator-channel-id>"]   # list, "a,b", or a bare id
           allowed_users: ["<operator-user-id>"]
@@ -410,6 +427,35 @@ self._dedup.discard()
 `discord-adapter-watch.sh` hashes them and stays silent unless they move — run it monthly
 as a `no_agent` cron job delivering to an ops channel. If it fires, re-check the plugin
 against the bundled adapter before trusting the next `hermes update`.
+
+### Turn tool deferral OFF for a small-model profile
+
+Hermes defers rarely-used tool schemas behind a `tool_search` bridge and embeds a catalog
+listing so capabilities stay discoverable. On a big model that is a clean token saving. On
+a small or free-tier model it is a trap, because it turns every tool use into **two** hops:
+discover, then call. Small models routinely manage the first and fumble the second — and
+the way they fumble is by emitting the call as prose:
+
+```
+tool_search activated (tier 1): 3 core/visible tools kept, 5 deferred (~452 tokens)
+API call #1: tool_search("gif_search")        -> schema returned, fine
+API call #2: out=15                            -> "to=functions.tool_call?commentary?…?…???"
+```
+
+That is a real transcript: a persona bot asked for a GIF, found its own `gif_search` tool,
+then posted the harmony syntax for calling it instead of calling it. The hygiene scrub
+above keeps that out of the channel, but the fix is upstream of the symptom — with only
+eight tools, deferral was saving ~450 tokens and costing the ability to use any of them:
+
+```yaml
+tools:
+  tool_search:
+    enabled: off      # auto | on | off
+```
+
+Rule of thumb: leave `auto` for a capable model with dozens of tools; set `off` whenever
+the whole toolset would fit in context anyway. Check which way it went in the log — the
+`tool_search activated` line names the count it deferred.
 
 ## Companion plugin
 
