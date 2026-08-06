@@ -511,13 +511,36 @@ the mark is **consumed** — so a genuine follow-up message a moment later still
 through. The failure direction is deliberately "a text twin leaks", never "the agent goes
 mute".
 
+### `text_hygiene.strip_media_narration` — the model narrating its own tool result
+
+A model that calls the `tts` tool gets back `MEDIA:<path>` and may write that into its
+reply as prose:
+
+```
+[Media: AUDIO:/var/lib/hermes/.hermes/cache/audio/tts_20260807_014127.mp3]
+
+I'm doing wonderful, darling! ...
+```
+
+Two problems: it is noise, and it puts a **host filesystem path into a public channel**,
+leaking the HERMES_HOME layout — the base adapter has `_log_safe_path` precisely because
+that matters.
+
+Default **on**. Only the *bracketed narration* is stripped; a bare `MEDIA:<path>` is the
+real directive the send pipeline consumes to deliver audio, and removing that would
+silence the agent rather than tidy it.
+
+With `voice_only_replies` also on, a reply that is nothing but a narration plus the spoken
+words is suppressed entirely — the audio already IS the reply.
+
 ### `text_hygiene.strip_kaomoji` — kaomoji are not emoji
 
 Hermes strips emoji before TTS (`_EMOJI_RE`), but that targets pictograph codepoints.
 Kaomoji like `(=^･ω･^=)` are ordinary punctuation and letters, so they pass straight
 through and get read aloud as several seconds of punctuation soup.
 
-This wraps `tools.tts_tool._strip_markdown_for_tts` with a kaomoji pre-pass, so they are
+This wraps `tools.tts_text_normalize.prepare_spoken_text` — the **common chokepoint**, used
+by the tts tool, the runner's auto voice reply, and the adapter path alike — so kaomoji are
 removed from the **speech script only** — they stay in the posted text, where they are
 half the personality.
 
@@ -532,3 +555,17 @@ first attempt used `re.VERBOSE` with a multi-line character class — in which w
 status report. Ordinary parentheses must survive; when in doubt the filter keeps the text,
 because a missed kaomoji is a second of odd audio while a false positive silently deletes
 real words from what the agent says out loud.
+
+### Two paths to speech, and why both need handling
+
+Worth stating because the first version of this release only handled one:
+
+| Path | Trigger | Audio delivered by |
+|---|---|---|
+| **Runner** | user sends a voice message; gateway auto-replies in voice | `adapter.send_voice()` |
+| **Tool** | model calls the `tts` tool because it was asked to speak | a `MEDIA:` directive inside `send()` |
+
+`voice_only_replies` and the kaomoji filter each have to cover both. v1.11.0 hooked only
+`send_voice()` and only `_strip_markdown_for_tts`, so an agent that was *asked* to speak
+still posted a duplicate text reply and still had its kaomoji read aloud. v1.11.1 covers
+the tool path too.
