@@ -672,14 +672,50 @@ class AmbientDiscordAdapter(DiscordAdapter):
             return {"*"}  # satisfies BOTH mention gates for this one dispatch
         return super()._discord_free_response_channels()
 
-    def _ambient_quota_ok(self) -> bool:
+    def _speaker_boost(self, message: Any) -> dict:
+        """Per-speaker ambient overrides, or {}.
+
+        Ambient presence is deliberately tuned for a room full of strangers: a
+        low dice-roll and a long cooldown, so she is a presence rather than a
+        chatterbox. But the person who runs the bot is not a stranger, and
+        applying stranger-tuning to them means the one human most likely to
+        want a reply gets the same 15% as everyone else.
+
+        Keyed on the numeric id for the same reason the speaker tag is: handles
+        are user-editable, and a rename would silently transfer someone else's
+        boost. Config shape:
+
+            speaker_boost:
+              "553...":
+                probability: 0.6
+                cooldown_seconds: 120
+                exempt_daily_cap: true
+        """
+        try:
+            table = self._ambient_cfg().get("speaker_boost")
+            if not isinstance(table, dict):
+                return {}
+            uid = str(getattr(getattr(message, "author", None), "id", "") or "")
+            hit = table.get(uid) if uid else None
+            return hit if isinstance(hit, dict) else {}
+        except Exception:
+            return {}
+
+    def _ambient_quota_ok(self, boost: dict | None = None) -> bool:
         cfg = self._ambient_cfg()
+        boost = boost or {}
         now = time.time()
-        if now - self._ambient_last < float(cfg.get("cooldown_seconds", 1800)):
+        # A boosted speaker may carry a shorter floor. Without this the boost is
+        # mostly decorative: the daily cooldown gates the roll, so raising only
+        # the probability changes almost nothing.
+        cooldown = float(boost.get("cooldown_seconds", cfg.get("cooldown_seconds", 1800)))
+        if now - self._ambient_last < cooldown:
             return False
         cutoff = now - 86400
         while self._ambient_hits and self._ambient_hits[0] < cutoff:
             self._ambient_hits.popleft()
+        if boost.get("exempt_daily_cap"):
+            return True
         return len(self._ambient_hits) < int(cfg.get("max_per_day", 12))
 
     def _channel_allowed(self, message: Any) -> bool:
@@ -780,9 +816,11 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     ):
                         return "named"
                     return None
-            if not self._ambient_quota_ok():
+            boost = self._speaker_boost(message)
+            if not self._ambient_quota_ok(boost):
                 return None
-            return "random" if random.random() < float(cfg.get("probability", 0.12)) else None
+            chance = float(boost.get("probability", cfg.get("probability", 0.12)))
+            return "random" if random.random() < chance else None
         except Exception:
             logger.debug("ambient pre-filter failed; falling back to stock", exc_info=True)
             return None
