@@ -2310,6 +2310,91 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, **_: Any):
     }
 
 
+# ---- compaction focus ------------------------------------------------------
+#
+# When a context window fills, the compaction summary is written into the most
+# privileged position of the NEXT window — the top of what the agent reads.
+# What that summary chose to keep shapes everything after it.
+#
+# Hermes' summariser template is built for coding work: Goal, Progress,
+# Decisions, Resolved/Pending Questions, Files, Remaining Work, with a
+# constraints field that literally says "coding style". For a social agent that
+# preserves the plumbing and discards the only thing that mattered — who these
+# people are, what they shared, the rapport, the running jokes. The `compression`
+# config has around fourteen knobs and no prompt keys, so there is no supported
+# way to say "for this profile, keep the people, not the tool calls".
+#
+# The lever that DOES exist is `focus_topic`, which the summariser appends at the
+# very end of its prompt so it takes precedence, with the instruction that the
+# focus should receive roughly 60-70% of the summary token budget. It is already
+# wired to `_derive_auto_focus_topic`, which infers one from the most recent user
+# turns. Recency is a sensible default and the wrong one here: what a companion
+# needs to carry across a boundary is not "what was just said" but "who these
+# people are" — which is durable, and which recency-based focus discards exactly
+# when the window is longest and the relationship most established.
+#
+# Set `ambient_presence.compaction_focus` to a sentence describing what this
+# profile should protect. Unset leaves stock behaviour untouched.
+#
+# A PATCH rather than middleware because the compressor holds its own client and
+# never goes through the llm_request path. It is process-wide, so the focus is
+# resolved PER CALL from the active profile's config — one gateway serves several
+# profiles and they must not inherit each other's focus.
+_FOCUS_PATCH_FLAG = "_standing_focus_patched"
+
+
+def _compaction_focus_for_active_profile() -> str | None:
+    """This profile's standing compaction focus, or None for stock behaviour."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        extra = (((cfg.get("platforms") or {}).get("discord") or {}).get("extra") or {})
+        amb = extra.get("ambient_presence")
+        if isinstance(amb, dict):
+            val = str(amb.get("compaction_focus") or "").strip()
+            if val:
+                return val
+        # Fall back to the generic key, so a host running a separate non-social
+        # focus plugin configures one place rather than two.
+        comp = cfg.get("compression")
+        if isinstance(comp, dict):
+            val = str(comp.get("standing_focus") or "").strip()
+            if val:
+                return val
+    except Exception:
+        logger.debug("ambient: compaction focus lookup failed", exc_info=True)
+    return None
+
+
+def _install_compaction_focus() -> None:
+    try:
+        from agent import context_compressor as cc
+    except Exception:
+        return
+    target = getattr(cc.ContextCompressor, "_derive_auto_focus_topic", None)
+    if target is None:
+        # Upstream renamed it. Do nothing rather than guess — a wrong patch here
+        # silently reshapes every summary this agent produces.
+        logger.warning("ambient: _derive_auto_focus_topic missing; compaction focus not installed")
+        return
+    if getattr(cc.ContextCompressor, _FOCUS_PATCH_FLAG, False):
+        return
+    original = target.__func__ if hasattr(target, "__func__") else target
+
+    def _patched(cls, messages):
+        try:
+            focus = _compaction_focus_for_active_profile()
+            if focus:
+                return focus
+        except Exception:
+            logger.debug("ambient: compaction focus fell back to stock", exc_info=True)
+        return original(cls, messages)
+
+    cc.ContextCompressor._derive_auto_focus_topic = classmethod(_patched)
+    setattr(cc.ContextCompressor, _FOCUS_PATCH_FLAG, True)
+    logger.info("ambient: compaction focus installed (per-profile, resolved per call)")
+
+
 def register(ctx) -> None:
     """Install the stock Discord platform entry, then swap in our subclass.
 
@@ -2320,6 +2405,8 @@ def register(ctx) -> None:
     deferred bundled loader, preventing the adapter module being imported twice
     under two names.
     """
+    _install_compaction_focus()
+
     _bundled.register(ctx)
 
     # Per-user authorisation for metered tools. Registered once; the callback
