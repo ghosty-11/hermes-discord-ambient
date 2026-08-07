@@ -611,6 +611,11 @@ class AmbientDiscordAdapter(DiscordAdapter):
         self._bounce_pending: dict[str, tuple[str, str, float]] = {}
         # Standby: (mtime-stamp, ids) cache of no-agent cron job ids.
         self._standby_noagent_cache: tuple | None = None
+        # chat_id -> (when she last spoke, inbound messages since). A message
+        # arriving just after she spoke is usually a reply to her, even when it
+        # carries no mention and no name — Discord's reply affordance is
+        # optional and most people do not use it.
+        self._spoke: dict[str, tuple[float, int]] = {}
         # speaker id -> (fetched_at, rendered block or None). Bounded by the
         # channel's distinct speakers; a stale entry costs one slightly-old
         # fact, so a short TTL beats invalidation plumbing.
@@ -671,6 +676,54 @@ class AmbientDiscordAdapter(DiscordAdapter):
         if _ambient_open.get():
             return {"*"}  # satisfies BOTH mention gates for this one dispatch
         return super()._discord_free_response_channels()
+
+    def _conversation_window(self, message: Any) -> dict | None:
+        """Overrides for a message that lands in her conversational wake.
+
+        WHY: being addressed does not require being named. Someone answers what
+        she just said and neither @-mentions her nor uses the reply affordance,
+        so every stock signal misses it — and the dice-roll that decides is tuned
+        for a room of strangers, not for the person mid-conversation with her.
+        The result is an agent that ignores the reply to its own question.
+
+        The window is deliberately BOTH bounded ways. Message count alone would
+        keep it open across a quiet night; elapsed time alone would keep it open
+        through fifty messages of someone else's conversation. Being the second
+        message after she spoke, four hours later, is not a reply to her.
+        """
+        cfg = self._ambient_cfg().get("conversation_window")
+        if not isinstance(cfg, dict) or not cfg.get("enabled"):
+            return None
+        try:
+            key = str(getattr(message, "channel", None) and
+                      getattr(message.channel, "id", "") or "")
+            spoke = self._spoke.get(key)
+            if not spoke:
+                return None
+            when, since = spoke
+            if since > int(cfg.get("messages", 3)):
+                return None
+            if time.time() - when > float(cfg.get("seconds", 300)):
+                return None
+            return {
+                "probability": float(cfg.get("probability", 0.8)),
+                "cooldown_seconds": float(cfg.get("cooldown_seconds", 30)),
+                "exempt_daily_cap": bool(cfg.get("exempt_daily_cap", True)),
+            }
+        except Exception:
+            logger.debug("ambient: conversation window check failed", exc_info=True)
+            return None
+
+    def _note_inbound_for_window(self, message: Any) -> None:
+        """Count one inbound message against the open window, if any."""
+        try:
+            key = str(getattr(message, "channel", None) and
+                      getattr(message.channel, "id", "") or "")
+            spoke = self._spoke.get(key)
+            if spoke:
+                self._spoke[key] = (spoke[0], spoke[1] + 1)
+        except Exception:
+            pass
 
     def _speaker_boost(self, message: Any) -> dict:
         """Per-speaker ambient overrides, or {}.
@@ -816,7 +869,10 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     ):
                         return "named"
                     return None
-            boost = self._speaker_boost(message)
+            # A reply to her outranks the generic per-speaker tuning: this is
+            # someone continuing a conversation she started, not a stranger
+            # talking in the room.
+            boost = self._conversation_window(message) or self._speaker_boost(message)
             if not self._ambient_quota_ok(boost):
                 return None
             chance = float(boost.get("probability", cfg.get("probability", 0.12)))
@@ -1299,6 +1355,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # Stable speaker identity before anything reads the content, so both
         # the stock pass and any ambient re-dispatch carry it.
         self._apply_speaker_tag(message)
+        self._note_inbound_for_window(message)
 
         # Bot bounce first: a tripped pair must cost NOTHING, so it returns
         # before admission runs. Every un-tripped message falls through to the
@@ -1890,6 +1947,15 @@ class AmbientDiscordAdapter(DiscordAdapter):
         MOST one count no matter how many chunks or retries it becomes
         (batched events can still make it zero — the safe direction).
         """
+        # Open the conversational window: whatever arrives next in this channel
+        # is probably a reply to this. Recorded even for a swallowed sentinel —
+        # deciding to stay quiet is still a turn she took, and the next message
+        # is just as likely to be aimed at her.
+        try:
+            self._spoke[str(chat_id)] = (time.time(), 0)
+        except Exception:
+            pass
+
         reply_to = kwargs.get("reply_to", args[0] if args else None)
 
         # Inbound-speech echo: the gateway posts 🎙️ "<transcript>" so a user can
