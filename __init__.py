@@ -453,6 +453,17 @@ _SYSTEM_NOTICE_DROP = [
     "⏳ Still working",
     "🔄 Reconnecting",
     "⚠️ Session timed out",
+    # Busy-input acks (gateway/run.py ~9110-9132). A terminal operator who hits
+    # Enter mid-run needs to know their keystroke landed; a room does not — from
+    # the outside these read as the bot narrating its own scheduler. Observed
+    # 2026-08-07: a social profile posted "⚡ Interrupting current task" into a
+    # community room.
+    # ALL of the busy variants are listed, not just the one seen, because moving
+    # the gateway to queue mode only swaps which one gets emitted.
+    "⚡ Interrupting current task",
+    "⏳ Queued for the next turn",
+    "⏳ Subagent working",
+    "⏳ Compressing context",
 ]
 
 # ---- outbound text hygiene ------------------------------------------------
