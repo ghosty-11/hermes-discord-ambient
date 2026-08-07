@@ -371,6 +371,18 @@ _MEDIA_NARRATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A model that generated an image often ALSO writes markdown image syntax for it —
+# observed 2026-08-07 after an image_generate call: "![Luna Portrait]()". The platform
+# already delivers the picture as an attachment, so this renders as a broken image or
+# bare punctuation next to the real thing. Same class as the media-narration leak: the
+# model describing its own tool result instead of letting delivery handle it.
+#
+# Only EMPTY or local-path targets are stripped. A markdown image pointing at a real
+# http(s) URL is a deliberate link and must survive — Klipy GIFs rely on that.
+_EMPTY_MD_IMAGE_RE = re.compile(
+    r"!\[[^\]]*\]\(\s*(?:|file://[^)]*|/[^)]*)\)"
+)
+
 # The gateway echoes inbound speech as: 🎙️ "<transcript>"
 _STT_ECHO_RE = re.compile(r'^\s*\U0001F399\uFE0F?\s*"')
 
@@ -1620,6 +1632,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # tool result instead of letting the platform deliver it, and it puts a
         # host filesystem path into a public channel. Default ON.
         if cfg.get("strip_media_narration", True):
+            text, n_img = _EMPTY_MD_IMAGE_RE.subn(" ", text)
+            if n_img:
+                logger.info("ambient: stripped %d empty markdown image(s) from a reply", n_img)
             cleaned, n = _MEDIA_NARRATION_RE.subn(" ", text)
             if n:
                 logger.info(
