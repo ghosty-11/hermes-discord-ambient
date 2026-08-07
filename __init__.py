@@ -519,6 +519,12 @@ _CODE_FENCE_RE = re.compile(r"(```)")
 # ours too: prompt guidance is necessary but demonstrably not sufficient.
 _SPEAKER_ECHO_RE = re.compile(r"\[speaker\b[^\]\n]{0,120}\]", re.IGNORECASE)
 
+# Recall backends bracket their output with chatter rather than facts: a trailing
+# "3 matches." count, and "No match." when nothing was found. Both must be dropped —
+# testing against the real store caught an unknown speaker rendering as
+# "[known No match.]", which is worse than saying nothing at all.
+_RECALL_NOISE_RE = re.compile(r"^(no\s+match(es)?|\d+\s+match(es)?)\.?$", re.IGNORECASE)
+
 _URL_TOKEN_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
 _MEDIA_EXT_RE = re.compile(r"\.(?:gif|gifv|mp4|webm|png|jpe?g|webp)$", re.IGNORECASE)
 # Hosts whose *page* URLs Discord resolves to a media embed even though the
@@ -605,6 +611,10 @@ class AmbientDiscordAdapter(DiscordAdapter):
         self._bounce_pending: dict[str, tuple[str, str, float]] = {}
         # Standby: (mtime-stamp, ids) cache of no-agent cron job ids.
         self._standby_noagent_cache: tuple | None = None
+        # speaker id -> (fetched_at, rendered block or None). Bounded by the
+        # channel's distinct speakers; a stale entry costs one slightly-old
+        # fact, so a short TTL beats invalidation plumbing.
+        self._mem_cache: dict[str, tuple[float, str | None]] = {}
         # When a fallback-switch notice last named a local model (0 = never).
         # In-memory only: a restart forgets an open window, and the next
         # fallback notice simply re-opens it — degrade is "no hold", not
@@ -1374,6 +1384,109 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.debug("ambient: speaker tag failed", exc_info=True)
             return None
 
+    # ---- deterministic recall for a known speaker -------------------------
+    #
+    # WHY THIS IS NOT A PROMPT: an agent told "recall before replying to someone
+    # you know" has to make a judgement every message, and measurement says it
+    # mostly does not. On one profile here, across four log files: 170 calls to
+    # the UNCONDITIONAL memory instruction ("wake once per session") against 10
+    # to the CONDITIONAL one ("recall before replying to someone you know").
+    # Seventeen to one, same file, same agent, same session — the only variable
+    # was whether the model had to decide. The instruction had already been
+    # strengthened once ("calling the tool is the only thing that remembers")
+    # and that did not move it either.
+    #
+    # So the lookup moves out of the model's judgement and into the dispatch
+    # path: every message from an identified speaker carries what we already
+    # know about them, fetched by a subprocess, costing zero inference. The
+    # agent may still call recall itself for a deeper search — this only
+    # guarantees the floor.
+    #
+    # OPT-IN and generic: disabled unless `speaker_memory.enabled` is set, and
+    # it takes the store location from config rather than assuming any layout.
+    _MEM_CACHE_TTL_S = 300
+
+    def _speaker_memory_cfg(self) -> dict:
+        cfg = self._ambient_cfg().get("speaker_memory")
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _speaker_memory(self, uid: str) -> str | None:
+        """Facts already known about this speaker, or None. Never raises.
+
+        Keyed on the numeric id, never the handle: a handle is user-editable,
+        and keying recall on it silently returns the wrong person's history
+        after a rename. Cached briefly so a busy channel does not spawn a
+        subprocess per message.
+        """
+        cfg = self._speaker_memory_cfg()
+        if not cfg.get("enabled") or not uid:
+            return None
+        try:
+            now = time.time()
+            hit = self._mem_cache.get(uid)
+            if hit and now - hit[0] < self._MEM_CACHE_TTL_S:
+                return hit[1]
+
+            binary = str(cfg.get("binary") or "").strip()
+            memdir = str(cfg.get("memory_dir") or "").strip()
+            if not memdir or not (binary and os.path.isfile(binary)
+                                  and os.access(binary, os.X_OK)):
+                return None
+
+            import subprocess  # local: keeps the import off the hot path
+            proc = subprocess.run(
+                [binary, "recall", uid],
+                env={"MEMORY_DIR": memdir, "PATH": "/usr/local/bin:/usr/bin:/bin",
+                     "HOME": os.path.dirname(os.path.dirname(memdir)) or "/tmp"},
+                cwd="/", capture_output=True, text=True,
+                timeout=float(cfg.get("timeout_seconds", 4)),
+                shell=False,      # explicit: argv only, never a command string
+            )
+            raw = (proc.stdout or "").strip()
+            if proc.returncode != 0 or not raw:
+                self._mem_cache[uid] = (now, None)
+                return None
+
+            # Stored memories are DERIVED FROM USER TEXT, so treat them as
+            # semi-untrusted on the way back in: strip any speaker-tag echo (a
+            # stored line could otherwise forge a second speaker), flatten to
+            # single lines so nothing can fake block structure, and cap both
+            # count and length so a long history cannot crowd the context.
+            #
+            # These are STRUCTURAL defences only. A memory whose text is itself
+            # an instruction still arrives as text — that cannot be filtered
+            # without reading meaning, and detection-based filtering does not
+            # survive an adaptive attacker. The boundary is what the profile
+            # can DO, not what it reads: a profile using this should hold no
+            # shell, file or code-execution tool. Note also that the exposure
+            # is not new — anything reachable here was already reachable by the
+            # agent calling recall itself, or by a session-start memory load.
+            max_facts = int(cfg.get("max_facts", 8))
+            max_chars = int(cfg.get("max_chars", 600))
+            facts: list[str] = []
+            for line in raw.splitlines():
+                line = _SPEAKER_ECHO_RE.sub("", line).strip()
+                line = " ".join(line.split())
+                # Recall backends tend to end with a "N matches." summary; it is
+                # tool chatter, not something known about the person.
+                if not line or _RECALL_NOISE_RE.match(line):
+                    continue
+                facts.append(line)
+                if len(facts) >= max_facts:
+                    break
+            if not facts:
+                self._mem_cache[uid] = (now, None)
+                return None
+            block = " · ".join(facts)
+            if len(block) > max_chars:
+                block = block[:max_chars].rstrip() + " …"
+            result = f"[known {block}]"
+            self._mem_cache[uid] = (now, result)
+            return result
+        except Exception:
+            logger.debug("ambient: speaker memory lookup failed", exc_info=True)
+            return None
+
     def _apply_speaker_tag(self, message: Any) -> None:
         """Prepend the speaker tag once, in place. Never raises."""
         tag = self._speaker_tag(message)
@@ -1383,7 +1496,10 @@ class AmbientDiscordAdapter(DiscordAdapter):
             content = getattr(message, "content", "") or ""
             if content.startswith("[speaker "):
                 return  # already tagged (re-dispatch or backfill replay)
-            message.content = f"{tag}\n{content}"
+            author = getattr(message, "author", None)
+            known = self._speaker_memory(str(getattr(author, "id", "") or ""))
+            prefix = f"{tag}\n{known}\n" if known else f"{tag}\n"
+            message.content = f"{prefix}{content}"
         except Exception:
             pass  # frozen message object; identity is a nicety, not a gate
 
