@@ -439,6 +439,22 @@ _FALLBACK_NOTICE_PREFIX = "🔄 Switched to fallback model:"
 # plumbing, so they are rerouted to a private channel when one is configured.
 _SYSTEM_NOTICE_PREFIXES = ["⚠️ Cron '", "Cronjob Response:"]
 
+# Notices that are pure gateway plumbing: they tell the OPERATOR about session
+# mechanics and mean nothing to a room full of strangers. Rerouting is wrong for
+# these — there is no other channel where "no activity for 15 min" is useful —
+# so they are dropped and logged instead.
+#
+# The inactivity warning (gateway/run.py: "⚠️ No activity for N min ... use
+# /reset") is the one that prompted this: Companion posted it into the community
+# room 2026-08-07. It is emitted through adapter.send(), which is why the plugin
+# can catch it at all.
+_SYSTEM_NOTICE_DROP = [
+    "⚠️ No activity for",
+    "⏳ Still working",
+    "🔄 Reconnecting",
+    "⚠️ Session timed out",
+]
+
 # ---- outbound text hygiene ------------------------------------------------
 # CONTROL-TOKEN LEAKAGE. Models trained on OpenAI's "harmony" chat format
 # (gpt-oss and its many free-tier rebadges) express a tool call as
@@ -1774,6 +1790,16 @@ class AmbientDiscordAdapter(DiscordAdapter):
             )
             self._bounce_discard_pending(reply_to)
             return self._suppressed_result()
+
+        # Drop pure plumbing notices outright. Logged, never posted — there is no
+        # channel where "no activity for 15 min" is useful to anyone but the log.
+        if self._ambient_enabled() and isinstance(content, str):
+            drops = self._sub("system_notices").get("drop_patterns")
+            patterns = drops if isinstance(drops, list) and drops else _SYSTEM_NOTICE_DROP
+            head = content.strip()[:120]
+            if any(str(pat) and head.startswith(str(pat)) for pat in patterns):
+                logger.info("ambient: dropped gateway notice (not posted): %s", head)
+                return self._suppressed_result()
 
         target = self._system_notice_target(content, chat_id)
         if target:

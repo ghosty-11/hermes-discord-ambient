@@ -230,6 +230,8 @@ platforms:
           allowed_users: ["<operator-user-id>"]
         system_notices:            # keep agent plumbing out of the community room
           reroute_channel: "<private-channel-id>"   # cron failures land here instead
+          # drop_patterns: [...]     # optional override; notices dropped ENTIRELY
+                                     # (logged, never posted) — see below
           # patterns: ["⚠️ Cron '", "Cronjob Response:"]   # optional override
         bot_bounce:
           enabled: true
@@ -675,3 +677,33 @@ read as "nobody is allowed".
 
 A profile without `image_gen_gate.enabled` is unaffected, so the operator's own agent keeps
 unrestricted access.
+
+## Dropping gateway plumbing notices (v1.16.0)
+
+Rerouting and dropping are different needs, so they are separate settings.
+
+A cron failure is useful *somewhere* — it goes to the operator's private channel via
+`reroute_channel`. But some notices are useful to **nobody except the log**:
+
+```
+⚠️ No activity for 15 min. If the agent does not respond soon, it will be
+timed out in 15 min. You can continue waiting or use /reset.
+```
+
+Companion posted that into the community room on 2026-08-07. It is session mechanics aimed at
+an operator, and there is no channel where it helps a room full of strangers. It comes from
+`gateway/run.py` through `adapter.send()`, which is why the plugin can intercept it.
+
+Dropped by default, logged not posted: `⚠️ No activity for`, `⏳ Still working`,
+`🔄 Reconnecting`, `⚠️ Session timed out`. Override with
+`system_notices.drop_patterns` (prefix match on the first 120 chars).
+
+## Empty markdown images (v1.15.0)
+
+A model that generated an image often also writes markdown for it — `![Luna Portrait]()` —
+while the platform is already delivering the picture as an attachment, so it renders as a
+broken image beside the real one. Same class as the `[Media: AUDIO:…]` leak: the model
+describing its own tool result instead of letting delivery handle it.
+
+Only **empty and local-path** targets are stripped. A markdown image pointing at a real
+`http(s)` URL is deliberate and survives — Klipy GIFs depend on that.
