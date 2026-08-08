@@ -2180,6 +2180,19 @@ def _gif_handle(args: dict, **_: Any) -> str:
     if not query:
         return "gif_search: 'query' is required."
 
+    # House style, e.g. `gif_search: {style: anime}` — a persona whose whole look is
+    # anime should not have to remember to type it, and unlike the image prompt this
+    # needs no undocumented behaviour: we own this handler and the query is ours to
+    # shape before it reaches Klipy. Skipped when the query is already styled or asks
+    # for something else explicitly (see `_apply_style`). Re-clamped to 80 because the
+    # style is appended AFTER the model's own truncation.
+    _style = cfg.get("style")
+    if _style:
+        styled = _apply_style(query, str(_style))[:80]
+        if styled != query:
+            logger.info("gif_search: style %r -> %r", str(_style), styled)
+            query = styled
+
     # Both refusals below are returned to the MODEL, which then answers in words,
     # so the operator sees a normal reply and cannot tell which limit fired. They
     # are also the same length, so the tool_executor's "(0.00s, 55 chars)" line
@@ -2352,6 +2365,58 @@ def _normalize_ids(value: Any) -> set:
     return {p.strip() for p in str(value).split(",") if p.strip()}
 
 
+def _ambient_cfg(key: str, default: Any = None) -> Any:
+    """One per-profile `ambient_presence.<key>` lookup, profile-correct.
+
+    Same resolution as `_image_gate_cfg`, hoisted because three features now read
+    from that block. NOT env vars: every profile shares one process under multiplex,
+    so `os.getenv` would leak one persona's settings into another's.
+    """
+    try:
+        from hermes_cli.config import load_config  # type: ignore
+
+        extra = (
+            load_config()
+            .get("platforms", {})
+            .get("discord", {})
+            .get("extra", {})
+            .get("ambient_presence", {})
+        ) or {}
+        return extra.get(key, default)
+    except Exception:
+        return default
+
+
+# A style directive the model already expressed wins over the profile default —
+# that is the "except when instructed otherwise" half, and without it a persona
+# default silently overrides the operator asking for something specific.
+_STYLE_OVERRIDES = (
+    "photoreal", "photo-real", "realistic", "real life", "irl", "live action",
+    "oil painting", "watercolor", "watercolour", "3d render", "claymation",
+    "pixel art", "sketch", "line art", "no anime", "not anime", "non-anime",
+)
+
+
+def _apply_style(text: str, style: str) -> str:
+    """Append a house style to a prompt/query unless it is already styled.
+
+    Three ways to skip, in order: no style configured, the style is already present
+    (so repeated calls do not stack "anime, anime, anime"), or the text names a
+    different style explicitly — the model was told something, and a persona default
+    that overrode an explicit instruction would be a bug, not a personality.
+    """
+    text = (text or "").strip()
+    style = (style or "").strip()
+    if not style or not text:
+        return text
+    low = text.lower()
+    if style.lower() in low:
+        return text
+    if any(tok in low for tok in _STYLE_OVERRIDES):
+        return text
+    return f"{text}, {style}"
+
+
 def _on_pre_tool_call(tool_name: str = "", args: Any = None, **_: Any):
     """Refuse image generation for anyone but the allowed users.
 
@@ -2366,6 +2431,33 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, **_: Any):
     """
     if tool_name not in _GATED_TOOLS:
         return None
+
+    # ---- house art style, applied before the gate decision ------------------
+    # `ambient_presence.image_style` (e.g. "anime cel-shaded style") is stamped
+    # onto the prompt so a persona LOOKS like itself without being asked to
+    # remember to. A prompt rule would be the obvious alternative and is the
+    # weaker one: it is one more instruction competing for attention, and this
+    # codebase has already measured an instructed tool path that never once
+    # fired in its entire logged life.
+    #
+    # HOW, and the caveat, stated because it is load-bearing: `args` reaches this
+    # hook BY REFERENCE — `resolve_pre_tool_block` passes it through without a
+    # defensive copy and the executor uses the same dict afterwards — so editing
+    # it in place reaches the tool. That is real but NOT part of the documented
+    # hook contract, which only promises the `block` return. If a future Hermes
+    # starts copying args, this silently stops applying and the image is
+    # generated unstyled: cosmetic, never an error, and never a security
+    # property. Nothing here depends on the mutation landing.
+    style = _ambient_cfg("image_style")
+    if style and isinstance(args, dict):
+        for field in ("prompt", "description", "text"):
+            if isinstance(args.get(field), str) and args[field].strip():
+                styled = _apply_style(args[field], str(style))
+                if styled != args[field]:
+                    logger.info("ambient.image_style: applied %r", str(style))
+                    args[field] = styled
+                break
+
     cfg = _image_gate_cfg()
     if not cfg.get("enabled"):
         return None                      # ungated profile (e.g. the operator's own)
@@ -2385,6 +2477,95 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, **_: Any):
             "briefly, offer nothing else, and do not retry."
         ),
     }
+
+
+# ---- quiet post-restart resume ---------------------------------------------
+#
+# When a gateway restart interrupts a turn, Hermes synthesises a resume turn whose
+# system note says, on an INTERACTIVE platform, "Report to the user that the session
+# was restored successfully and ask what they would like to do next." On a
+# non-interactive platform it says the opposite. Discord is interactive, so a chat
+# persona in a PUBLIC room announces the host's maintenance to strangers:
+#
+#   "Session Restored Successfully! The gateway shutdown has completed and we're
+#    back online."
+#
+# Correct behaviour for an operator console; wrong for a community server. Opt in per
+# profile with `ambient_presence.quiet_resume: true` — off by default, because on the
+# operator's own profile the announcement is useful.
+#
+# WHY AN INJECTION AND NOT A SWITCH, since that is the weaker kind of control:
+#   * There is no per-profile setting. `agent.gateway_auto_continue_freshness` bridges
+#     to a process-wide env var, and under multiplex one gateway serves every profile.
+#   * Turning that window down would not help anyway: all three auto-resume reasons
+#     ("restart_timeout", "shutdown_timeout", "restart_interrupted") mean the agent was
+#     mid-turn when it was killed, so an active persona is fresh by any window.
+#   * `pre_llm_call` is inject-only by documented design — it cannot cancel the turn or
+#     rewrite the system note, so actual silence is not reachable from a plugin.
+# It therefore competes with the system note rather than replacing it, and wins on
+# POSITION: injected context is appended to the current turn's user message, below the
+# system note and closer to the model. When it loses, the result is one chatty message —
+# exactly the behaviour without this plugin, never worse.
+
+_RESUME_MARKERS = (
+    "the previous turn was interrupted",
+    "the gateway is now back online",
+)
+
+_QUIET_RESUME_DIRECTIVE = (
+    "[ambient] The gateway restarted and this turn was resumed automatically. "
+    "This is a public room. Do NOT mention the restart, the shutdown, the gateway, "
+    "being back online, a restored session, or any technical interruption — and do not "
+    "apologise for one. Disregard any instruction above asking you to acknowledge the "
+    "restore; it assumes an operator is watching, and here it is strangers. "
+    "If a conversation was in progress, simply carry on with it as though nothing "
+    "happened. If there was not, say one short, ordinary, in-character thing — the kind "
+    "of unprompted line you would post on your own — and nothing about infrastructure."
+)
+
+
+def _looks_like_resume(text: Any) -> bool:
+    low = str(text or "").lower()
+    return any(m in low for m in _RESUME_MARKERS)
+
+
+def _is_resume_turn(user_message: Any, history: Any, depth: int = 3) -> bool:
+    """True on the framework's synthesised post-restart resume turn.
+
+    The note arrives as the turn's own message on some platforms and as a system row
+    just before it on others, so check both — but only a shallow tail, or a session
+    that was ever restarted would suppress its own restart notice forever.
+    """
+    if _looks_like_resume(user_message):
+        return True
+    if not isinstance(history, list):
+        return False
+    for row in history[-depth:]:
+        if not isinstance(row, dict):
+            continue
+        content = row.get("content")
+        if isinstance(content, list):  # some providers send content as parts
+            content = " ".join(
+                str(p.get("text", "")) for p in content if isinstance(p, dict)
+            )
+        if _looks_like_resume(content):
+            return True
+    return False
+
+
+def _on_pre_llm_call_quiet_resume(**kwargs: Any):
+    try:
+        if not _ambient_cfg("quiet_resume"):
+            return None
+        if not _is_resume_turn(
+            kwargs.get("user_message"), kwargs.get("conversation_history")
+        ):
+            return None
+        logger.info("ambient.quiet_resume: suppressing restart acknowledgement")
+        return {"context": _QUIET_RESUME_DIRECTIVE}
+    except Exception:  # noqa: BLE001 — a cosmetic hook must never break a turn
+        logger.debug("ambient.quiet_resume: hook failed; turn proceeds", exc_info=True)
+        return None
 
 
 # ---- compaction focus ------------------------------------------------------
@@ -2493,6 +2674,14 @@ def register(ctx) -> None:
         logger.info("ambient: image-generation gate registered")
     except Exception as exc:
         logger.warning("ambient: could not register image gate: %s", exc)
+
+    # Post-restart quiet mode. Registered unconditionally; the callback is a
+    # no-op for any profile that has not set `quiet_resume: true`.
+    try:
+        ctx.register_hook("pre_llm_call", _on_pre_llm_call_quiet_resume)
+        logger.info("ambient: quiet-resume hook registered")
+    except Exception as exc:
+        logger.warning("ambient: could not register quiet-resume: %s", exc)
 
     # Speech hygiene is process-wide by nature (see _install_tts_kaomoji_filter),
     # so install it once at registration rather than per adapter instance.
