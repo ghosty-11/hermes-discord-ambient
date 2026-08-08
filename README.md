@@ -34,7 +34,7 @@ serious work.
 | **Return greetings** | 1 inference | Someone's first message after N days away is prioritised over the dice, with a hint telling the model they've been gone. Last-seen state persists across restarts. |
 | **Rotating presence** | **zero** | Custom status rotated from a list on a background task. |
 | **No-thread mode** | **zero** | Per-profile kill switch for auto-threading. Upstream reads `DISCORD_AUTO_THREAD` via `os.getenv()` — process-wide — so under multiplex one profile's preference silently overrides every other profile's. This restores per-profile control by adding the channel to the no-thread set (NOT by failing thread creation — upstream treats that as an error and drops the message). |
-| **Bot bounce** | **zero** while suppressing, 1 inference for the goodbye | Circuit breaker for bot-to-bot volleys under `DISCORD_ALLOW_BOTS`. Two bots whose replies auto-@mention each other volley forever — upstream documents the topology as unsupported, with no breaker. After 3–5 replies to a given bot in a channel (limit rolled per conversation, so the patience varies), the last allowed reply carries a goodbye hint and every later message from that bot is dropped **before** admission: no inference, no reply. A human speaking in the channel resets the pair, as does `reset_after_seconds` of quiet. Humans are never gated, and `[SILENT]` replies never count against the limit. |
+| **Bot bounce** | **zero** while suppressing, 1 inference for the goodbye | Circuit breaker for bot-to-bot volleys under `DISCORD_ALLOW_BOTS`. Two bots whose replies auto-@mention each other volley forever — upstream documents the topology as unsupported, with no breaker. Two independent dials. `probability` (default 1.0) decides how *often* an exchange happens at all — each bot message is answered only on a winning roll, and a losing roll leaves the pair untouched, so it neither starts the renewal clock nor spends one of the rolled replies. `min_replies`/`max_replies` bound how *long* one runs once it starts: after that many replies to a given bot in a channel (limit rolled per conversation, so the patience varies), the last allowed reply carries a goodbye hint and every later message from that bot is dropped **before** admission: no inference, no reply. A human speaking in the channel resets the pair, as does `reset_after_seconds` of quiet. Humans are never gated, and `[SILENT]` replies never count against the limit. |
 | **Fleet standby** | **zero** while holding | For hosts where several profiles share ONE inference slot (local CPU model). A dispatch arriving while any other agent turn or agent-mode cron job is running is *held* — the message's own coroutine sleeps, polling — and released the moment the slot frees; at `max_wait_seconds` it dispatches anyway, so standby can only ever delay a reply, never eat one. Opportunistic dice-roll joins are skipped outright while busy; named triggers and return greetings still answer. Every failure in the busy probe answers "not busy". With `only_when_local: true`, a profile whose primary model is *hosted* engages standby only while it is actually running on a local fallback model (observed via the fallback-switch notice, for `local_fallback_ttl_seconds`) — cloud turns are never held, so the higher-priority local profile keeps the slot exactly when contention is real. |
 | **Fallback-notice suppression** | **zero** | Upstream announces a provider/model fallback switch with a one-shot status send ("🔄 Switched to fallback model: …"). Right for an operator channel, noise (and an internals leak) in a public community room. `suppress_fallback_notice: true` swallows it for this profile only — logged, never posted — while every other profile keeps the operator-facing notice. Suppressed or not, the notice is parsed as the local-fallback signal that drives `only_when_local` standby. |
 | **Group-address greetings** | 1 inference when it answers | "good morning agents" / "hello everyone" is addressed to the room — not a mention, not a name trigger, but ignoring it reads as absent. Opt-in `group_address` matches greeting+collective regex pairs (both words required, close together — a bare "agents" mid-sentence never triggers) and answers at its own probability (default 0.6) and short cooldown (default 300s), exempt from the daily cap: being spoken to is not inserting herself. |
@@ -259,8 +259,14 @@ platforms:
           # drop_patterns: [...]     # optional override; notices dropped ENTIRELY
                                      # (logged, never posted) — see below
           # patterns: ["⚠️ Cron '", "Cronjob Response:"]   # optional override
+          drain_notice: "..."        # in-voice text for "gateway is shutting
+                                     # down / restarting, not accepting work"
+          drain_notice_queued: "..." # optional; for the variant that QUEUED the
+                                     # message. Falls back to drain_notice
         bot_bounce:
           enabled: true
+          probability: 0.3           # chance of engaging with any one bot
+                                     # message (default 1.0 = every one)
           min_replies: 3             # limit rolled per conversation in [min, max]
           max_replies: 5
           reset_after_seconds: 1800  # a quiet half hour renews the pair
@@ -723,6 +729,39 @@ an operator, and there is no channel where it helps a room full of strangers. It
 Dropped by default, logged not posted: `⚠️ No activity for`, `⏳ Still working`,
 `🔄 Reconnecting`, `⚠️ Session timed out`. Override with
 `system_notices.drop_patterns` (prefix match on the first 120 chars).
+
+## Drain notices in the profile's own voice (v1.17.0)
+
+Rerouting and dropping do not cover every notice. While the gateway is stopping or
+restarting it refuses new turns and says so:
+
+```
+⏳ Gateway is shutting down and is not accepting new work right now.
+```
+
+That is emitted **in reply to a message someone just sent**, so dropping it leaves them
+hanging, and rerouting it sends the answer to a channel they cannot see. It is the one
+class of notice that belongs exactly where it landed — just not in that wording. A
+persona bot announcing its own process lifecycle breaks character precisely when a
+stranger is watching.
+
+So it is rewritten, not suppressed:
+
+```yaml
+system_notices:
+  drain_notice: "I'm going to have a nap, remind me later."
+  drain_notice_queued: "I'm going to have a nap, but I'll answer this when I wake up."
+```
+
+Two settings because upstream emits two *different* facts. The refusal variants drop the
+message; the queued variant (`busy_input_mode: queue` or `steer`, during a restart) keeps
+it and answers after the gateway comes back. Telling someone to remind you later about a
+message already sitting in a queue is a small lie, and the bot will then answer it anyway,
+which reads as a bug. `drain_notice_queued` is optional and falls back to `drain_notice`.
+
+Matching is on the `⏳ Gateway <shutting down|restarting>` head, not the whole sentence, so
+an upstream rewording of the tail still matches. With neither key set — every profile that
+has not opted in — the stock notice goes out unchanged.
 
 ## Empty markdown images (v1.15.0)
 
