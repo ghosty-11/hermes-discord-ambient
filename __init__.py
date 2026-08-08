@@ -2417,6 +2417,75 @@ def _apply_style(text: str, style: str) -> str:
     return f"{text}, {style}"
 
 
+def _as_list(value: Any) -> list:
+    """Coerce a config value to a list of strings, whatever shape it arrived in.
+
+    NOT defensive padding — `hermes config set` genuinely turns a bracketed list into a
+    STRING. Setting `reference_images '["/path/x.png"]'` stores the literal characters
+    `["/path/x.png"]`, and a plain `isinstance(v, list)` test then sees a str, treats the
+    whole thing as one path, finds no such file, and skips it. Measured 2026-08-08: both
+    keys here landed as strings and the feature would have done nothing at all, silently.
+    `_normalize_ids` above documents the same hazard for the gate's user ids.
+
+    Handles: a real list, a JSON array in a string, a comma-separated string, a bare
+    string. Returns [] for anything else.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    text = str(value).strip()
+    if not text:
+        return []
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(v).strip() for v in parsed if str(v).strip()]
+        except Exception:  # noqa: BLE001 — fall through to the comma path
+            text = text[1:-1]
+    return [p.strip().strip("\"'") for p in text.split(",") if p.strip().strip("\"'")]
+
+
+def _self_portrait_cfg() -> dict:
+    """`ambient_presence.self_portrait` — how a persona depicts ITSELF.
+
+    A generic house style ("anime cel-shaded") makes every image look right in KIND
+    while leaving the character random: same medium, different person each time. That
+    is the complaint this answers. Two mechanisms, because they fail differently:
+
+      reference_images  paths handed to the model as `reference_image_urls`. Highest
+                        fidelity — the model sees the actual character sheet — but only
+                        honoured by backends that accept image references.
+      description       a compact character sheet in words. Lower fidelity, works
+                        everywhere, and carries the look when the reference is ignored.
+
+    Both are applied when either is configured; they are complements, not alternatives.
+    """
+    cfg = _ambient_cfg("self_portrait")
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _is_self_portrait(text: str, triggers: Any) -> bool:
+    """Does this prompt ask for the persona itself?
+
+    Word-boundary matched, and the trigger list is configuration rather than a guess:
+    a bare substring test on "you" fires on "a gift for you", and depicting the persona
+    when nobody asked is worse than not depicting it when they did.
+    """
+    if not text:
+        return False
+    triggers = _as_list(triggers)
+    if not triggers:
+        return False
+    low = text.lower()
+    for t in triggers:
+        t = str(t).strip().lower()
+        if t and re.search(rf"(?<![\w-]){re.escape(t)}(?![\w-])", low):
+            return True
+    return False
+
+
 def _on_pre_tool_call(tool_name: str = "", args: Any = None, **_: Any):
     """Refuse image generation for anyone but the allowed users.
 
@@ -2448,15 +2517,49 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, **_: Any):
     # starts copying args, this silently stops applying and the image is
     # generated unstyled: cosmetic, never an error, and never a security
     # property. Nothing here depends on the mutation landing.
-    style = _ambient_cfg("image_style")
-    if style and isinstance(args, dict):
-        for field in ("prompt", "description", "text"):
-            if isinstance(args.get(field), str) and args[field].strip():
+    if isinstance(args, dict):
+        field = next(
+            (f for f in ("prompt", "description", "text")
+             if isinstance(args.get(f), str) and args[f].strip()),
+            None,
+        )
+        if field:
+            # SELF-PORTRAIT first: it is the more specific claim, and it must land
+            # inside the prompt before the generic house style is appended after it.
+            sp = _self_portrait_cfg()
+            if _is_self_portrait(args[field], sp.get("triggers")):
+                desc = str(sp.get("description") or "").strip()
+                if desc and desc.lower() not in args[field].lower():
+                    args[field] = f"{args[field]}. {desc}"
+                    logger.info("ambient.self_portrait: character sheet applied")
+
+                # Reference images are additive and de-duplicated: a caller who already
+                # passed one is asking for something specific, and dropping it to force
+                # the house reference would override an explicit instruction. Missing
+                # files are skipped rather than passed on — a backend handed a dead path
+                # can fail the whole call, and a portrait that is merely less accurate
+                # beats one that errors.
+                refs = _as_list(sp.get("reference_images"))
+                usable = [r for r in refs if os.path.isfile(r)]
+                for missing in [r for r in refs if r not in usable]:
+                    logger.warning(
+                        "ambient.self_portrait: reference not readable, skipping: %s", missing
+                    )
+                if usable:
+                    existing = args.get("reference_image_urls")
+                    existing = list(existing) if isinstance(existing, list) else []
+                    merged = existing + [r for r in usable if r not in existing]
+                    args["reference_image_urls"] = merged
+                    logger.info(
+                        "ambient.self_portrait: %d reference image(s) attached", len(merged)
+                    )
+
+            style = _ambient_cfg("image_style")
+            if style:
                 styled = _apply_style(args[field], str(style))
                 if styled != args[field]:
                     logger.info("ambient.image_style: applied %r", str(style))
                     args[field] = styled
-                break
 
     cfg = _image_gate_cfg()
     if not cfg.get("enabled"):
