@@ -29,9 +29,12 @@ to that 10k-line file keep flowing — and adds ten opt-in behaviours:
 6. BOT BOUNCE — a circuit breaker for bot-to-bot conversations. Under
    DISCORD_ALLOW_BOTS + require_mention in a server full of agents, two bots
    whose replies auto-@mention each other volley FOREVER — upstream documents
-   the topology as unsupported with no breaker. After 3-5 replies to a given
-   bot in a given conversation (rolled per conversation so her patience
-   varies), the last reply carries a goodbye hint and every later message from
+   the topology as unsupported with no breaker. Two independent dials: an
+   optional `probability` decides how OFTEN an exchange happens at all (each
+   bot message is answered only on a winning roll), and min/max_replies bound
+   how LONG one runs once it starts. After min-max replies to a given bot in a
+   given conversation (rolled per conversation so her patience varies), the
+   last reply carries a goodbye hint and every later message from
    that bot is suppressed BEFORE admission: zero inference, zero reply. A
    human speaking in the channel, or reset_after_seconds of quiet (measured
    from HER last counted reply, so a bot chattering at a tripped pair cannot
@@ -131,6 +134,11 @@ UPSTREAM COUPLING (what discord-adapter-watch.sh guards)
     gateway delivers it through adapter.send. Suppression + local-fallback
     detection match on the stable prefix — if upstream rewords it, both
     degrade to stock (notice shown, standby stays dormant), never worse.
+  * drain notice text: gateway/run.py emits three variants while _draining,
+    all built from GatewayRunner._status_action_gerund() ("shutting down" /
+    "restarting"). The in-voice rewrite matches only the "⏳ Gateway <gerund>"
+    head — if upstream rewords the tail the rewrite still fires; if it rewords
+    the head, the stock notice goes out, which is the pre-1.17.0 behaviour.
   * self._dedup.discard/contains/is_duplicate(message_id) / self._client
   * standby busy probe (all optional — absence degrades to "not busy"):
       - BasePlatformAdapter.gateway_runner (base.py declares it; run.py stamps
@@ -465,6 +473,25 @@ _SYSTEM_NOTICE_DROP = [
     "⏳ Subagent working",
     "⏳ Compressing context",
 ]
+
+# Drain notices. While the gateway is stopping or restarting it refuses (or
+# queues) new turns and says so in operator language — gateway/run.py builds
+# all three from _status_action_gerund():
+#   "⏳ Gateway is shutting down and is not accepting new work right now."
+#   "⏳ Gateway is restarting and is not accepting another turn right now."
+#   "⏳ Gateway restarting — queued for the next turn after it comes back."
+# Neither existing treatment fits. Dropping is wrong: someone just spoke and is
+# owed an answer. Rerouting is wrong: the answer belongs in the room they spoke
+# in. So a profile may supply its own wording and the notice is REWRITTEN in
+# place; with nothing configured the stock text goes out untouched.
+#
+# Matched on the "⏳ Gateway <gerund>" head rather than the whole sentence, so
+# an upstream rewording of the tail still matches. The queued variant is told
+# apart by its own clause because it carries information the other two do not:
+# the message was KEPT, not refused, and saying "ask me later" about a message
+# that is already queued would be a lie.
+_DRAIN_NOTICE_RE = re.compile(r"^⏳\s*Gateway\s+(?:is\s+)?(?:shutting down|restarting)\b")
+_DRAIN_QUEUED_RE = re.compile(r"queued for the next turn", re.IGNORECASE)
 
 # ---- outbound text hygiene ------------------------------------------------
 # CONTROL-TOKEN LEAKAGE. Models trained on OpenAI's "harmony" chat format
@@ -939,6 +966,18 @@ class AmbientDiscordAdapter(DiscordAdapter):
     def _bounce_reset_after(self) -> float:
         return float(self._sub("bot_bounce").get("reset_after_seconds", 1800))
 
+    def _bounce_probability(self) -> float:
+        """Chance of engaging with any one bot message. 1.0 (default) = stock.
+
+        Distinct from min/max_replies, which bound how long an exchange runs
+        once it has started. This bounds how often one starts at all — the
+        breaker alone still lets every volley begin, it only ends them.
+        """
+        try:
+            return min(1.0, max(0.0, float(self._sub("bot_bounce").get("probability", 1.0))))
+        except Exception:
+            return 1.0  # unreadable config must never mute her
+
     def _bounce_pair(self, channel_key: str, bot_id: str) -> dict:
         """Live state for one (channel, bot) conversation, re-rolled if stale."""
         now = time.time()
@@ -1006,6 +1045,20 @@ class AmbientDiscordAdapter(DiscordAdapter):
             bot_id = str(getattr(message.author, "id", "") or "")
             if not bot_id:
                 return None
+            # Engagement roll, BEFORE any pair state is touched. Creating the
+            # pair here would start its reset_after_seconds clock on a
+            # conversation she never joined, and burn one of the rolled replies
+            # on a message she never answered. Reported as "suppress" so both
+            # dispatch paths treat it exactly like a tripped pair: no
+            # admission, no inference, and the id claimed against backfill
+            # replay (an unclaimed skip comes back on the next reconnect).
+            prob = self._bounce_probability()
+            if prob < 1.0 and random.random() >= prob:
+                logger.info(
+                    "ambient.bot_bounce: skipped bot %s in %s (engagement roll, p=%.2f)",
+                    bot_id, channel_key, prob,
+                )
+                return "suppress"
             pair = self._bounce_pair(channel_key, bot_id)
             if pair["count"] >= pair["limit"]:
                 logger.info(
@@ -1636,6 +1689,33 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.debug("ambient: system-notice check failed", exc_info=True)
             return None
 
+    def _drain_notice_rewrite(self, content: Any) -> str | None:
+        """This profile's own wording for a gateway drain notice, or None.
+
+        None means "not a drain notice, or nothing configured" and the stock
+        text goes out unchanged — the right failure mode here, because the
+        worst case is operator phrasing in a public room rather than a
+        swallowed reply.
+        """
+        try:
+            if not self._ambient_enabled() or not isinstance(content, str):
+                return None
+            stripped = content.strip()
+            if not _DRAIN_NOTICE_RE.match(stripped):
+                return None
+            sn = self._sub("system_notices")
+            refused = str(sn.get("drain_notice") or "").strip()
+            if _DRAIN_QUEUED_RE.search(stripped):
+                # Falls back to the refusal wording only when no queued wording
+                # is given: a profile that configures one line rather than two
+                # still gets its own voice, just a slightly less accurate one.
+                queued = str(sn.get("drain_notice_queued") or "").strip()
+                return queued or refused or None
+            return refused or None
+        except Exception:
+            logger.debug("ambient: drain-notice check failed", exc_info=True)
+            return None
+
     # ---- per-profile slash-command policy ---------------------------------
     async def _check_slash_authorization(self, interaction: Any, command_text: str) -> bool:
         """Optional per-profile slash-command allowlist, independent of chat.
@@ -2031,6 +2111,18 @@ class AmbientDiscordAdapter(DiscordAdapter):
             if any(str(pat) and head.startswith(str(pat)) for pat in patterns):
                 logger.info("ambient: dropped gateway notice (not posted): %s", head)
                 return self._suppressed_result()
+
+        # Drain notices are rewritten, not dropped or rerouted: the person who
+        # just spoke is owed an answer, in the channel they spoke in. Done here
+        # so everything downstream (scrub, media isolation) treats the new text
+        # exactly like any other reply.
+        _drain = self._drain_notice_rewrite(content)
+        if _drain is not None:
+            logger.info(
+                "ambient: drain notice rewritten in-voice: %r -> %r",
+                str(content).strip()[:80], _drain[:80],
+            )
+            content = _drain
 
         target = self._system_notice_target(content, chat_id)
         if target:
