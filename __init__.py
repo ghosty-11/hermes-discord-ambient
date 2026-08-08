@@ -557,6 +557,72 @@ _CODE_FENCE_RE = re.compile(r"(```)")
 # ours too: prompt guidance is necessary but demonstrably not sufficient.
 _SPEAKER_ECHO_RE = re.compile(r"\[speaker\b[^\]\n]{0,120}\]", re.IGNORECASE)
 
+# The ambient DIRECTIVE echo — the same failure as the speaker tag above, in the
+# other thing we inject into the user turn, and it took a public leak to notice
+# the rule had only ever been written for one of the two.
+#
+# 2026-08-08: an agent posted its own ambient hint verbatim followed by `(SILENT)`
+# — 201 chars, the exact length the turn logged. Conditions: model=openrouter/free,
+# in=31700 tokens, and two failed provider attempts (EmptyStreamError, then a 36s
+# timeout) before the retry that answered. A degraded small model on a long context
+# regurgitated the tail of its input. Prompt guidance cannot prevent that; only a
+# deterministic outbound rule can, which is why this lives here and not in SOUL.md.
+#
+# Greedy to the last `]` on the line, because the hint CONTAINS a bracketed marker
+# (`... reply with exactly [SILENT] ...`) and an exclusion class would stop at it.
+# Bounded to one line and 400 chars so it cannot run away. Over-stripping degrades
+# to a suppressed reply, never to a leaked prompt — that is the safe direction.
+_AMBIENT_ECHO_RE = re.compile(r"\[ambient\b[^\n]{0,400}\]", re.IGNORECASE)
+
+# Letters only, for sentinel comparison. The marker is `[SILENT]`, but a small
+# model reaches for `(SILENT)`, `**[SILENT]**` or a bare `SILENT` just as readily,
+# and the original exact-match test posted every one of those to the channel.
+_NON_LETTER_RE = re.compile(r"[^A-Za-z]")
+
+
+def _looks_like_sentinel(text: str, marker: str) -> bool:
+    """True when `text` is the silence marker in any plausible dress.
+
+    Compares letters only, so `(SILENT)`, `**[SILENT]**`, `[silent].` and a bare
+    `SILENT` all read as silence — while `I am silent tonight` does not, because
+    its letters spell something longer. The length guard keeps a long reply that
+    happens to reduce to the right letters from being swallowed.
+    """
+    core = _NON_LETTER_RE.sub("", marker or "").upper()
+    if not core:
+        return False
+    stripped = (text or "").strip()
+    if not stripped or len(stripped) > len(marker) + 24:
+        return False
+    return _NON_LETTER_RE.sub("", stripped).upper() == core
+
+
+def _screen_ambient_reply(content: str, marker: str) -> tuple:
+    """Strip any echoed ambient directive, then decide if anything is left to say.
+
+    Returns `(text_or_None, n_stripped)`. None means "send nothing": either the
+    reply was the silence marker, or it was nothing but the echoed directive.
+
+    Ordering matters and is the whole point. The directive is removed FIRST, so a
+    reply of `<hint>\\n\\n(SILENT)` — the exact 2026-08-08 leak — reduces to
+    `(SILENT)` and is then recognised as silence. Checking the sentinel first (what
+    the code did before) saw only a 201-char string that matched nothing.
+
+    The emptiness test is gated on `n_stripped` so behaviour is untouched for
+    replies we did not modify: an emoji-only reply has no word characters and must
+    still go out.
+    """
+    text, n = _AMBIENT_ECHO_RE.subn(" ", content or "")
+    if n:
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if _looks_like_sentinel(text if n else content, marker):
+        return None, n
+    if n and not _HAS_WORD_RE.search(text):
+        return None, n
+    return (text if n else content), n
+
+
 # Recall backends bracket their output with chatter rather than facts: a trailing
 # "3 matches." count, and "No match." when nothing was found. Both must be dropped —
 # testing against the real store caught an unknown speaker rendering as
@@ -2155,11 +2221,20 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     return None
         if self._ambient_enabled() and isinstance(content, str):
             marker = self._ambient_marker()
-            stripped = content.strip()
-            if stripped == marker or (
-                stripped.startswith(marker) and len(stripped) <= len(marker) + 8
-            ):
-                logger.info("ambient: response suppressed by %s sentinel", marker)
+            screened, n_echo = _screen_ambient_reply(content, marker)
+            if n_echo:
+                # WARNING, not info: the model just tried to publish an instruction
+                # we gave it. The rule caught it, but the frequency of this line is
+                # how we find out a model or a prompt has started misbehaving.
+                logger.warning(
+                    "ambient: stripped %d echoed ambient directive(s) from a reply: %r",
+                    n_echo, content[:200],
+                )
+            if screened is None:
+                logger.info(
+                    "ambient: response suppressed (%s sentinel or bare directive echo)",
+                    marker,
+                )
                 # A swallowed reply was never sent: it must not count against
                 # the pair, nor sit around to be charged to a later send.
                 self._bounce_discard_pending(reply_to)
@@ -2169,9 +2244,13 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     return SendResult(success=True, message_id=None)
                 except Exception:
                     return None
-        # Scrub last, so the sentinel/notice comparisons above still match on
-        # the model's verbatim text. A fully-suppressed reply is accounted for
-        # exactly like a [SILENT] one: it never went out, so it must not be
+            content = screened
+        # General scrub last, so the fallback-notice comparison above still matches
+        # on the model's verbatim text. The ONE thing that now runs earlier is the
+        # ambient-directive strip: a `<hint>\n\n(SILENT)` reply only reads as silence
+        # once the hint is gone, and checking the sentinel first is precisely how the
+        # 2026-08-08 leak reached the channel. A fully-suppressed reply is accounted
+        # for exactly like a [SILENT] one: it never went out, so it must not be
         # charged to the bot-bounce pair.
         if isinstance(content, str):
             scrubbed = self._scrub_outbound(content)
