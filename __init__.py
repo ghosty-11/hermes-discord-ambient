@@ -401,6 +401,32 @@ _ambient_open: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "hermes_ambient_open", default=False
 )
 
+# The ambient directive for the turn currently being dispatched, delivered to the
+# model through `llm_request` middleware instead of being concatenated onto the
+# user's message.
+#
+# WHY THIS EXISTS (2026-08-08): the hint used to be prepended to
+# `message.content`. That text is the USER TURN, so Hermes persisted it — 59 rows
+# across 20 sessions in the root state.db, 8 of them in one agent session. The
+# directive therefore stopped being an instruction for one turn and became a
+# standing feature of her transcript, and the model started reproducing it on
+# turns where nobody had issued it. It cost a real request: asked directly for a
+# self-portrait, she echoed a stale "nobody addressed you ... reply [SILENT]" out
+# of her own history and declined.
+#
+# Injected via middleware, the hint reaches the provider for exactly one request
+# and is never written to history: `apply_llm_request_middleware` rewrites the
+# outgoing payload only. Appended at the END of the message list so the cached
+# prefix is untouched (the AGENTS.md prompt-cache invariant).
+#
+# A ContextVar rather than a dict keyed by session: the middleware is handed
+# session_id/platform but never a chat id, and this plugin already relies on
+# ContextVars surviving into the turn (see _current_speaker_id, read by the
+# image gate inside the agent loop).
+_ambient_hint: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "hermes_ambient_hint", default=""
+)
+
 # Channel keys for which threading is suppressed, scoped to one dispatch task.
 # Who sent the message currently being handled. Set at dispatch, read inside the
 # agent turn by the image-generation gate. ContextVars are copied into tasks
@@ -1227,13 +1253,13 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 hint = str(
                     self._sub("bot_bounce").get("goodbye_hint") or _GOODBYE_HINT
                 ).replace("{who}", str(who))
-                message.content = f"{hint}\n\n{getattr(message, 'content', '')}"
+                _ambient_hint.set(hint)
                 logger.info(
                     "ambient.bot_bounce: last allowed reply to %s — goodbye hint injected",
                     who,
                 )
             except Exception:
-                pass  # frozen message object; the breaker still trips next round
+                pass  # breaker still trips next round even if the nudge is lost
         return verdict
 
     # ---- fleet standby (one shared inference slot) ---------------------
@@ -1453,9 +1479,14 @@ class AmbientDiscordAdapter(DiscordAdapter):
 
     async def _dispatch_discord_message(self, message: Any) -> bool:
         token = self._ambient_no_thread_token(message)
+        # Open a fresh directive scope per dispatch and close it here. Both the
+        # ambient and the bot-bounce goodbye path set the hint somewhere inside,
+        # and neither should be able to leak one into the NEXT message's turn.
+        hint_token = _ambient_hint.set("")
         try:
             return await self._dispatch_inner(message)
         finally:
+            _ambient_hint.reset(hint_token)
             if token is not None:
                 _no_thread_keys.reset(token)
 
@@ -1545,10 +1576,10 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 )
             else:
                 hint = str(cfg.get("hint") or _DEFAULT_HINT).replace("{marker}", marker)
-            try:
-                message.content = f"{hint}\n\n{getattr(message, 'content', '')}"
-            except Exception:
-                pass  # some message objects are frozen; the nudge is optional
+            # NOT written into message.content: that is the user turn, and Hermes
+            # persists it. See the _ambient_hint comment — this is the fix for the
+            # 2026-08-08 self-portrait refusal.
+            _ambient_hint.set(hint)
 
             token = _ambient_open.set(True)
             try:
@@ -2827,6 +2858,41 @@ def _is_resume_turn(user_message: Any, history: Any, depth: int = 3) -> bool:
     return False
 
 
+def _on_llm_request_ambient_hint(**kwargs: Any):
+    """Deliver this turn's ambient directive as a request-only system message.
+
+    Returns ``{"request": ...}`` with the hint appended, or None to leave the
+    payload byte-identical — which is the case for every turn that is not an
+    ambient join, on every profile and platform, because `_ambient_hint` is only
+    ever set inside an ambient dispatch.
+
+    Appended at the END of the message list on purpose: the cached prefix stays
+    intact (AGENTS.md prompt-cache invariant), and a trailing instruction is the
+    position models weight most heavily — which is the whole point of a directive.
+
+    Nothing here may raise. A failure returns None and the turn proceeds with the
+    stock payload; losing a hint costs one over-chatty reply, while raising would
+    cost the whole conversation.
+    """
+    try:
+        hint = _ambient_hint.get("")
+        if not hint:
+            return None
+        request = kwargs.get("request")
+        if not isinstance(request, dict):
+            return None
+        messages = request.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return None
+        patched = dict(request)
+        patched["messages"] = list(messages) + [{"role": "system", "content": hint}]
+        logger.info("ambient: directive delivered via llm_request middleware (request-only)")
+        return {"request": patched}
+    except Exception:  # noqa: BLE001 — never break a turn over a nudge
+        logger.debug("ambient: hint middleware failed; turn proceeds", exc_info=True)
+        return None
+
+
 def _on_pre_llm_call_quiet_resume(**kwargs: Any):
     try:
         if not _ambient_cfg("quiet_resume"):
@@ -2948,6 +3014,15 @@ def register(ctx) -> None:
         logger.info("ambient: image-generation gate registered")
     except Exception as exc:
         logger.warning("ambient: could not register image gate: %s", exc)
+
+    # Ambient directive delivery. Registered unconditionally and process-wide;
+    # scoping is automatic because the callback no-ops unless _ambient_hint is
+    # set, which only happens inside an ambient dispatch on this adapter.
+    try:
+        ctx.register_middleware("llm_request", _on_llm_request_ambient_hint)
+        logger.info("ambient: directive middleware registered (request-only injection)")
+    except Exception as exc:
+        logger.warning("ambient: could not register directive middleware: %s", exc)
 
     # Post-restart quiet mode. Registered unconditionally; the callback is a
     # no-op for any profile that has not set `quiet_resume: true`.
