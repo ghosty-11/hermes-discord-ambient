@@ -519,6 +519,25 @@ _SYSTEM_NOTICE_DROP = [
 _DRAIN_NOTICE_RE = re.compile(r"^⏳\s*Gateway\s+(?:is\s+)?(?:shutting down|restarting)\b")
 _DRAIN_QUEUED_RE = re.compile(r"queued for the next turn", re.IGNORECASE)
 
+# Gateway STALL notices. When a turn produces no tool call and no API response for
+# `agent.gateway_timeout`, gateway/run.py interrupts it and posts a diagnostic built
+# from _diag_lines (run.py ~25378): the inactivity headline, then either "stuck on
+# tool `x`" or "Last activity: …", then instructions to edit config.yaml and restart
+# the gateway. That last part is operator language and it reached a public room on
+# 2026-08-08, telling strangers to set `agent.gateway_timeout` and use /reset.
+#
+# Same treatment as the drain notice, for the same reason: someone spoke and is owed
+# an answer, in the room they spoke in — so it is REWRITTEN in place, never dropped
+# or rerouted. With nothing configured the stock text goes out, which is ugly but
+# honest; a swallowed reply would be worse.
+#
+# Matched on the headline only. The tail carries the diagnosis (which tool, how many
+# seconds, which iteration) and varies per incident, so anchoring to it would match
+# one shape of stall and miss the rest. `\s*[-—–]` because outbound hygiene rewrites
+# em dashes before this runs on some paths, and the notice must still be recognised
+# after its own punctuation has been normalised.
+_STALL_NOTICE_RE = re.compile(r"^⏱️\s*Agent inactive for\b")
+
 # ---- outbound text hygiene ------------------------------------------------
 # CONTROL-TOKEN LEAKAGE. Models trained on OpenAI's "harmony" chat format
 # (gpt-oss and its many free-tier rebadges) express a tool call as
@@ -1813,6 +1832,25 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.debug("ambient: drain-notice check failed", exc_info=True)
             return None
 
+    def _stall_notice_rewrite(self, content: Any) -> str | None:
+        """This profile's own wording for a gateway stall notice, or None.
+
+        None means "not a stall notice, or nothing configured" and the stock text
+        goes out unchanged — the same deliberate failure mode as the drain notice:
+        operator phrasing in a public room is bad, a silently dropped answer is
+        worse, because the person who spoke is left with nothing at all.
+        """
+        try:
+            if not self._ambient_enabled() or not isinstance(content, str):
+                return None
+            if not _STALL_NOTICE_RE.match(content.strip()):
+                return None
+            wording = str(self._sub("system_notices").get("stall_notice") or "").strip()
+            return wording or None
+        except Exception:
+            logger.debug("ambient: stall-notice check failed", exc_info=True)
+            return None
+
     # ---- per-profile slash-command policy ---------------------------------
     async def _check_slash_authorization(self, interaction: Any, command_text: str) -> bool:
         """Optional per-profile slash-command allowlist, independent of chat.
@@ -2220,6 +2258,16 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 str(content).strip()[:80], _drain[:80],
             )
             content = _drain
+
+        # A stall notice is the same shape of problem as a drain notice: upstream
+        # explaining its own internals to whoever happened to be in the room.
+        _stall = self._stall_notice_rewrite(content)
+        if _stall is not None:
+            logger.info(
+                "ambient: stall notice rewritten in-voice: %r -> %r",
+                str(content).strip()[:80], _stall[:80],
+            )
+            content = _stall
 
         target = self._system_notice_target(content, chat_id)
         if target:
