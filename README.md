@@ -605,6 +605,31 @@ age of a channel's newest message is available with **no API call at all**. Chan
 are mid-conversation or long dead are dropped for free, before anything is fetched; only
 the survivors (bounded by `max_channels_per_pass`, and logged when that bites) are read.
 
+### Reading the log
+
+Two lines tell you what the scanner is doing, and the second one matters more than it
+looks. At startup:
+
+    ambient: catch-up scanner started (channels: * — every visible channel she can speak in)
+
+then, once per process on the first pass:
+
+    ambient.catch_up: watching 3 channel(s): #general, #random, #offtopic
+    ambient.catch_up: watching 0 channel(s): (none — check permissions and channel ids)
+
+**Every pass that finds nothing logs nothing**, so a scanner watching zero channels and one
+watching thirty quiet rooms produce identical output: silence. Without the second line,
+"no check-in yet" cannot be distinguished from "the wildcard resolved to nothing" — a
+negative result with no control, which is how you end up diagnosing by guessing.
+
+Two bugs already lived in this one line. The first version counted *config entries*, so
+`["*"]` printed as "1 channel(s)" while she watched the whole server — a line that
+misreports the only thing it exists to report. The second sat **after** the startup-grace
+check, so it would not have printed for thirty minutes after a restart; a diagnostic that
+arrives after the window you wanted it in is not a diagnostic. It now logs before every
+gate, because which rooms she watches is a static fact about config and permissions, not a
+decision about this pass. Both have tests, both mutation-checked.
+
 ### Restarts
 
 Every bound started life in memory, which meant a restart reset the gap, the daily cap and
@@ -669,7 +694,7 @@ model has started reproducing its input.
 
 ### Testing
 
-`test_catchup.py` covers the decision layer — 62 assertions on *whether she speaks*, where, and how
+`test_catchup.py` covers the decision layer — 72 assertions on *whether she speaks*, where, and how
 often — not on plumbing. It stubs the stock adapter's `__init__` and dispatch, and runs the real
 ambient code against fake channel history:
 

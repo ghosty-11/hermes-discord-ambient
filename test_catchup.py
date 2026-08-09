@@ -319,6 +319,28 @@ async def main():
         check("logged once per process, not once per pass",
               not [ln for ln in cap.lines if "watching" in ln])
 
+        # The regression this ordering fixes: the scope line described a static
+        # fact but sat behind the startup grace, so on the real box it would
+        # not have printed for 30 minutes after a restart. It must arrive on
+        # the first pass regardless of any gate that stops her SPEAKING.
+        cap.lines.clear()
+        g = make_adapter(dict(BASE, channels=["*"], startup_grace_seconds=1800),
+                         channels=rooms)
+        d = stub_dispatch()
+        await g._catchup_pass()
+        scope = [ln for ln in cap.lines if "watching" in ln]
+        check("scope is logged even inside the startup grace",
+              scope and "watching 3 channel(s)" in scope[0], cap.lines)
+        check("...while the grace still suppresses the check-in itself", d["n"] == 0)
+
+        cap.lines.clear()
+        q = make_adapter(dict(BASE, channels=["*"], min_gap_seconds=7200),
+                         channels=rooms)
+        q._catchup_last = time.time() - 60          # budget spent
+        await q._catchup_pass()
+        check("scope is logged even when the budget is spent",
+              [ln for ln in cap.lines if "watching 3 channel(s)" in ln], cap.lines)
+
         cap.lines.clear()
         mute = live_room(7272, "no-perms")
         mute._can_speak = False

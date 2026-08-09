@@ -2202,6 +2202,36 @@ class AmbientDiscordAdapter(DiscordAdapter):
         except Exception:
             logger.debug("ambient.catch_up: could not persist state", exc_info=True)
 
+    def _catchup_log_scope(self, eligible: list) -> None:
+        """Announce the resolved channel set once per process.
+
+        WHY IT EXISTS AT ALL: every pass that finds nothing logs nothing, so a
+        scanner watching ZERO channels and one watching thirty quiet rooms
+        produce identical output — silence. Without this line, "no check-in
+        yet" cannot be told apart from "the wildcard resolved to nothing", and
+        the difference would be settled by guessing.
+
+        Names, not just a count, so a room she should not be in is visible at a
+        glance rather than requiring an id lookup.
+        """
+        if self._catchup_logged_scope:
+            return
+        self._catchup_logged_scope = True
+        try:
+            named = ", ".join(
+                f"#{getattr(c, 'name', None) or getattr(c, 'id', '?')}"
+                for c in eligible[:20]
+            )
+            if len(eligible) > 20:
+                named += f", … (+{len(eligible) - 20} more)"
+            logger.info(
+                "ambient.catch_up: watching %d channel(s): %s",
+                len(eligible),
+                named or "(none — check permissions and channel ids)",
+            )
+        except Exception:
+            logger.debug("ambient.catch_up: scope log failed", exc_info=True)
+
     def _in_startup_grace(self) -> bool:
         grace = float(self._catchup_cfg().get("startup_grace_seconds", 1800))
         return (time.time() - self._catchup_started_at) < grace
@@ -2398,8 +2428,21 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.debug("ambient.catch_up: enabled but no channels configured")
             return
         self._catchup_load_state()
-        # Budget gates before any channel work: on a pass that cannot possibly
-        # speak there is no reason to read anyone's history at all.
+
+        # Scope FIRST, before any gate can return. Which rooms she watches is a
+        # static fact about config and permissions — not a decision about this
+        # pass — and logging it behind the startup grace delayed the one line
+        # that makes a silent scanner readable by however long the grace was
+        # set to (30 minutes, as deployed). A diagnostic that arrives after the
+        # window in which you wanted it is not a diagnostic.
+        #
+        # Cheap enough to sit here: resolving eligible channels reads the
+        # client's channel cache and Discord permission bits. The expensive
+        # part is the per-channel history fetch, and that still happens only
+        # after every gate below has passed.
+        eligible = self._catchup_eligible_channels()
+        self._catchup_log_scope(eligible)
+
         if self._in_startup_grace():
             return
         if self._in_quiet_hours():
@@ -2407,22 +2450,6 @@ class AmbientDiscordAdapter(DiscordAdapter):
         if not self._catchup_quota_ok():
             return
 
-        eligible = self._catchup_eligible_channels()
-        # Once per process, at INFO, because otherwise a scanner watching ZERO
-        # channels and a scanner watching thirty quiet ones produce exactly the
-        # same log: nothing. That is not a distinction to leave to inference —
-        # a silent pass has to be readable as "nothing qualified" rather than
-        # as "the wildcard resolved to nothing".
-        if not self._catchup_logged_scope:
-            self._catchup_logged_scope = True
-            logger.info(
-                "ambient.catch_up: watching %d channel(s): %s",
-                len(eligible),
-                ", ".join(
-                    f"#{getattr(c, 'name', None) or getattr(c, 'id', '?')}"
-                    for c in eligible[:20]
-                ) or "(none — check permissions and channel ids)",
-            )
         channels = [ch for ch in eligible if self._catchup_activity_hint(ch)]
         if not channels:
             return
