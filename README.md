@@ -43,7 +43,7 @@ serious work.
 | **Speaker memory** | **zero** | Recall is normally left to the model — "look this person up before replying" — and that is an instruction, not a mechanism. Measured on one profile across four log files: **170 calls to the unconditional memory instruction against 10 to the conditional one**, same file, same agent, same session; the only variable was whether the model had to decide. Strengthening the wording had already been tried and did not move it. `speaker_memory.enabled` moves the lookup into the dispatch path instead: every message from an identified speaker arrives carrying what is already known about them, fetched by a subprocess at zero inference cost. Keyed on the **numeric id**, never the handle, because a rename would otherwise return the wrong person's history. Cached per speaker (default 300 s) so a busy channel does not spawn a subprocess per message. The agent may still call recall itself for a deeper search — this only guarantees the floor. |
 | **Speaker boost** | **zero** | Ambient presence is tuned for a room of strangers: a low dice-roll behind a long cooldown, so she is a presence rather than a chatterbox. That tuning is wrong for exactly one person — whoever runs the bot, who is the human most likely to actually want an answer and gets the same 15% as everyone else. `speaker_boost` overrides probability, cooldown and the daily cap per numeric user id. **Overriding the cooldown is the load-bearing half**: the daily cooldown gates the roll, so raising probability alone changes almost nothing. Keyed on the id, never the handle, so a rename cannot transfer someone else's boost. |
 | **Conversation window** | **zero** | Being addressed does not require being named. Someone answers what she just said, without an @-mention and without Discord's reply affordance — and every stock signal misses it, so the message is decided by a dice-roll tuned for a room of strangers. The agent ends up ignoring the reply to its own question. `conversation_window` gives messages landing in her wake a high response chance. Bounded **both** ways on purpose: message count alone would hold the window open across a quiet night, and elapsed time alone would hold it open through fifty messages of someone else's conversation. Being the second message after she spoke, four hours later, is not a reply to her. Overrides `speaker_boost` when both apply — continuing her conversation outranks generic per-person tuning. |
-| **Catch-up (idle check-in)** | **zero** per scan; 1 inference on a check-in | Every other path here is *reactive*: a message arrives and something decides about **that message**. So a conversation whose messages each lose their dice roll passes with the bot never having considered the conversation at all — from the room's side, indistinguishable from absence. A timer is the only thing that can close it, because the trigger is the *absence* of a decision. `catch_up` runs a scanner (not a speaker): every pass is free, nearly all end in a skip, and the most it can ever do is hand **one** real message to the normal ambient dispatch with a transcript of what she missed attached — request-only, never persisted. It fires only when she actually missed something: she is not the last speaker, at least `min_messages` humans have spoken since she was, the room has **settled** for `min_quiet_seconds` (a live exchange belongs to the per-message dice; arriving late into one is what reads as barging in) but has not gone **cold** past `max_age_seconds` (answering into a dead channel is the loudest possible way to be wrong, because hers is the only message anyone sees), the newest message has not been read before, and the dice agree. Requires explicit channel ids — no `"*"`. Subordinate to the shared ambient budget by default, so it cannot make her measurably more talkative, only better informed; and it is charged to that budget **at send**, so a check-in answered `[SILENT]` does not eat her ordinary cooldown. |
+| **Catch-up (idle check-in)** | **zero** per scan; 1 inference on a check-in | Every other path here is *reactive*: a message arrives and something decides about **that message**. So a conversation whose messages each lose their dice roll passes with the bot never having considered the conversation at all — from the room's side, indistinguishable from absence. A timer is the only thing that can close it, because the trigger is the *absence* of a decision. `catch_up` runs a scanner (not a speaker): every pass is free, nearly all end in a skip, and the most it can ever do is hand **one** real message to the normal ambient dispatch with a transcript of what she missed attached — request-only, never persisted. It fires only when she actually missed something: she is not the last speaker, at least `min_messages` humans have spoken since she was, the room has **settled** for `min_quiet_seconds` (a live exchange belongs to the per-message dice; arriving late into one is what reads as barging in) but has not gone **cold** past `max_age_seconds` (answering into a dead channel is the loudest possible way to be wrong, because hers is the only message anyone sees), the newest message has not been read before, and the dice agree. `channels: ["*"]` covers every room she can see and speak in (Discord's own permissions are the allowlist), pre-filtered for free via each channel's `last_message_id` so no API call is spent on a room that cannot qualify; a pass stops at the FIRST check-in, so widening the list changes where she may speak, never how often. A `startup_grace_seconds` window and a persisted budget stop a gateway restart from being a reason to speak. Subordinate to the shared ambient budget by default, so it cannot make her measurably more talkative, only better informed; and it is charged to that budget **at send**, so a check-in answered `[SILENT]` does not eat her ordinary cooldown. |
 | **Compaction focus** | **zero** | When the context window fills, the compaction summary is written into the *most privileged position of the next window* — the top of what the agent reads. Hermes' summariser template is built for coding work (Goal, Progress, Decisions, Files, Remaining Work; its constraints field says "coding style"), so for a social agent it preserves the plumbing and discards the only thing that mattered: who these people are, what they shared, the rapport. The `compression` config has ~14 knobs and **no prompt keys**. The lever that does exist is `focus_topic`, appended last so it takes precedence and instructed to take **60–70% of the summary token budget** — already wired, but derived from the most recent user turns. Recency is the wrong axis here: what a companion must carry across a boundary is *who these people are*, which is durable, and which recency-based focus drops exactly when the window is longest and the relationship most established. `compaction_focus` sets a standing one. Unset = stock behaviour. |
 | **GIF search** | **zero** (one HTTP call) | Registers a `gif_search` tool returning an embeddable GIF URL from [Klipy](https://klipy.com/developers) — the successor to Tenor, whose API Google discontinued 2026-06-30. A tool rather than the bundled `gif-search` skill, because that skill drives curl+jq at a shell prompt and a public persona profile has no terminal (nor should it); Discord auto-embeds a bare URL, so a URL is all the agent needs. `content_filter: high` by default (the agent cannot preview what it posts), per-profile rate limits, and the tool is hidden entirely unless the profile sets `gif_search.enabled` **and** has `KLIPY_API_KEY` in its `.env`. Serves **animated WebP, not GIF**, by default: GIF is capped at a 256-colour palette, so gradients and dark scenes band into visible black blocks — WebP is 24-bit, roughly a third the bytes, and still embeds as an *image* (autoplays and loops inline, no player chrome), while `mp4`/`webm` are smaller still but render as a video embed. One trap worth knowing: the API's `format_filter` parameter reads like a search facet but actually strips the response to that single rendition, so requesting `format_filter=gif` makes every other format vanish from the payload. Omit it. |
 | **Media URL isolation** | **zero** | Discord hides the raw URL and renders only the media when a message's *entire* content is one media link — that is the whole reason a GIF from the built-in picker looks clean, and it is not something the API can be asked for. Models never post a bare URL; they wrap it in chatter, so a GIF reply arrives as visible link + text + embed underneath. `isolate_media_urls` (default true) sends the prose first, keeping the reply anchor, then each media URL as its own bare message. Matching is per whitespace token rather than one regex over the message, because a greedy URL pattern swallows trailing punctuation and the next word; trailing sentence punctuation is trimmed, query strings are ignored when testing the extension, and a message that is *already* a bare URL is left untouched. Bot-bounce is charged once for the pair, not once per message. |
@@ -288,20 +288,29 @@ platforms:
                                      # target as the shared local model
         catch_up:                  # the idle check-in — see the section below
           enabled: true
-          channels: ["<community-channel-id>"]  # REQUIRED, explicit ids, no "*"
+          channels: ["*"]            # "*" = any text channel she can see AND
+                                     # speak in; or list explicit ids
+          exclude_channels: []       # opt-outs under "*" (the
+                                     # system_notices.reroute_channel is
+                                     # excluded automatically)
           interval_seconds: 900      # how often it LOOKS (free; it rarely speaks)
           probability: 0.2           # roll, applied only to a qualifying room
           min_gap_seconds: 7200      # its own floor between check-ins
-          max_per_day: 2             # its own daily cap
+          max_per_day: 2             # its own daily cap — GLOBAL, not per channel
           min_quiet_seconds: 300     # the room must have settled...
           max_age_seconds: 5400      # ...but not gone cold
           min_messages: 3            # she must have actually missed a conversation
+          max_channels_per_pass: 6   # history reads per pass, after the free filter
+          startup_grace_seconds: 1800  # silence after a (re)start
           transcript_messages: 8     # how much she reads before deciding
           transcript_max_chars: 1200
           transcript_message_chars: 240
-          quiet_hours: [1, 9]        # local time; never initiates in this window
           respect_ambient_budget: true   # default true — obeys the shared
                                      # cooldown_seconds / max_per_day above
+          # quiet_hours: [1, 9]      # OPT-IN, and usually wrong: see below.
+                                     # Local host time. An international room
+                                     # has no dead hours, and the activity
+                                     # gates already measure "is anyone here".
           # hint: "..."              # override the directive.
                                      # {transcript} and {marker} are substituted.
                                      # Keep every bracketed line under 400 chars
@@ -560,8 +569,61 @@ applies to *qualifying rooms* rather than to every tick of the clock.
 | already read | this newest message id was checked before | one check-in per conversation, ever. A room that goes quiet after one exchange cannot be re-opened repeatedly |
 | `probability` | the roll loses | a losing roll costs nothing and is simply retried next pass, so `interval × probability` shapes the rate without a fixed cadence anyone can notice |
 | standby | the shared inference slot is busy | opportunistic traffic must never be what occupies it |
-| `quiet_hours` | inside the window (local time) | 04:00 is when a timer-driven bot does its worst work |
-| explicit `channels` | `"*"`, or unset | scanning every visible channel on a timer is how a bot ends up talking to itself in six rooms. Unlike the reactive path there is no human message justifying the visit, so the operator names the rooms |
+| `startup_grace_seconds` | the process started less than this ago | a restart is the moment every in-memory bound is at its most permissive. On a host where restarting the gateway is *how plugin code is loaded*, no grace makes "deploy" and "make her speak" the same gesture |
+| `quiet_hours` | inside the window (local time) | **opt-in, and usually wrong** — see below |
+| `channels` | the channel is not listed, or (under `"*"`) she cannot read history and send there | Discord's own permissions become the allowlist under `"*"`, the same bargain the reactive path already makes |
+
+### Why `quiet_hours` is off by default
+
+It looks like the obvious safety rail and it is mostly a trap. A community with
+people across several timezones has no dead hours — 04:00 for the host is the middle of
+someone's evening, and a clock window would mute her for exactly the people furthest from
+the server. "Local time" is a *proxy* for "is anyone around", and the other gates measure
+that property **directly**: `min_messages` needs real people to have actually spoken, and
+the settled-but-not-cold window needs them to have spoken *recently*. A channel nobody is
+using cannot produce a check-in at any hour, because there is nothing to catch up on.
+
+It stays available for the case it genuinely fits — a single-timezone server, or a room
+you want provably silent overnight — and does nothing unless you set it.
+
+### What `"*"` does and does not widen
+
+`"*"` means every text channel she can both **see** and **speak in**, checked against
+Discord's own permissions rather than assumed. `exclude_channels` opts individual rooms
+out, and the channel `system_notices.reroute_channel` points at is excluded
+automatically — a room that exists to receive her own cron failures is not a conversation
+to join, and under `"*"` it would otherwise be opted in by default.
+
+The thing worth being clear about: **widening the channel list changes where a check-in
+may happen, never how often one does.** `min_gap_seconds`, `max_per_day` and the shared
+ambient budget are all global, and `_catchup_pass` stops at the **first** check-in — so
+eight qualifying rooms produce one check-in, not eight. There is a test for exactly that.
+
+It is also cheap, which is the part that is not obvious. A Discord snowflake encodes its
+own creation time and `last_message_id` is already on the cached channel object, so the
+age of a channel's newest message is available with **no API call at all**. Channels that
+are mid-conversation or long dead are dropped for free, before anything is fetched; only
+the survivors (bounded by `max_channels_per_pass`, and logged when that bites) are read.
+
+### Restarts
+
+Every bound started life in memory, which meant a restart reset the gap, the daily cap and
+the already-read set together — and on this host restarting the gateway is the normal way
+to load plugin code, so the real ceiling would have been "one check-in per restart" rather
+than two a day. Two things fix it: `startup_grace_seconds` (default 1800) buys silence
+while the process settles, and the budget is persisted to
+`$HERMES_HOME/state/ambient-catchup-<bot-user-id>.json` and restored on the first pass.
+
+Keyed on the bot's own Discord user id, deliberately **not** the profile name: under the
+multiplexed gateway `HERMES_HOME` resolves to *root's* for every profile, so a shared
+filename would have one seat spending another's budget — the same trap that puts every
+profile's sessions in root's `state.db`. Each profile authenticates as its own Discord
+account, so that account's id is the seat, with no profile plumbing to get wrong.
+
+One honest gap: `_ambient_last` (the *shared* cooldown) is still in-memory and resets on
+restart, as it always has for the reactive path. The catch-up path is covered by its own
+persisted gap plus the grace; the reactive path's cooldown behaves after a restart exactly
+as it did before this feature.
 
 ### It cannot make her chattier — only better informed
 
@@ -607,8 +669,8 @@ model has started reproducing its input.
 
 ### Testing
 
-`test_catchup.py` covers the decision layer — 40 assertions on *whether she speaks*, not
-on plumbing. It stubs the stock adapter's `__init__` and dispatch, and runs the real
+`test_catchup.py` covers the decision layer — 62 assertions on *whether she speaks*, where, and how
+often — not on plumbing. It stubs the stock adapter's `__init__` and dispatch, and runs the real
 ambient code against fake channel history:
 
 ```bash

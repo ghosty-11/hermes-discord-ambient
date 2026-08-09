@@ -1,21 +1,29 @@
 """Behavioural test for the catch-up (idle check-in) extension.
 
-Run with the framework venv:
-  cd /var/lib/hermes/.hermes/hermes-agent && venv/bin/python <this file>
+Run with the framework venv (system python cannot resolve the adapter import):
 
-Exercises the gates that decide whether she speaks, because those are the ones
-that make the difference between "present" and "obnoxious". Every case asserts
-the DECISION, not the plumbing.
+    cd /var/lib/hermes/.hermes/hermes-agent
+    venv/bin/python /path/to/hermes-discord-ambient/test_catchup.py
+
+Asserts DECISIONS — whether she speaks, where, and how often — rather than
+plumbing. The fakes subclass the real discord.py classes so the production code
+keeps its precise isinstance checks instead of being loosened for the test.
 """
 import asyncio
 import importlib.util
+import json
 import os
 import sys
+import tempfile
 import time
 import types
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, "/var/lib/hermes/.hermes/hermes-agent")
+
+# State must not land in a real HERMES_HOME.
+_STATE_DIR = tempfile.mkdtemp(prefix="catchup-test-")
+os.environ["HERMES_HOME"] = _STATE_DIR
 
 import discord  # noqa: E402
 import plugins.platforms.discord.adapter as _ad  # noqa: E402
@@ -51,10 +59,39 @@ class FakeAuthor:
         return getattr(other, "id", None) == self.id
 
 
-class FakeChannel:
-    def __init__(self, cid, msgs):
+class FakePerms:
+    def __init__(self, ok=True):
+        self.view_channel = ok
+        self.read_message_history = ok
+        self.send_messages = ok
+
+
+class FakeGuild:
+    def __init__(self):
+        self.me = object()
+
+
+class FakeChannel(discord.TextChannel):
+    """A real TextChannel by type, with only the attributes the code reads.
+
+    Subclassed rather than duck-typed so `_catchup_candidates` can keep its
+    exact `isinstance(ch, discord.TextChannel)` check — the thing that keeps
+    categories, voice channels and threads out of the wildcard.
+    """
+
+    def __init__(self, cid, msgs, name="general", can_speak=True, last_age=None):
         self.id = cid
+        self.name = name
         self._msgs = msgs  # newest first
+        self.guild = FakeGuild()
+        self._can_speak = can_speak
+        age = last_age if last_age is not None else (msgs[0].age_s if msgs else None)
+        self.last_message_id = _snowflake(age) if age is not None else None
+        for m in msgs:
+            m.channel = self
+
+    def permissions_for(self, _member):
+        return FakePerms(self._can_speak)
 
     def history(self, limit=50):
         msgs = self._msgs[:limit]
@@ -76,11 +113,18 @@ class FakeChannel:
         return _It()
 
 
+def _snowflake(age_s):
+    """A Discord id whose encoded creation time is `age_s` seconds ago."""
+    when = datetime.now(timezone.utc) - timedelta(seconds=age_s)
+    return ((int(when.timestamp() * 1000) - 1420070400000) << 22) | 1
+
+
 class FakeMsg:
     def __init__(self, mid, author, content, age_s):
         self.id = mid
         self.author = author
         self.content = content
+        self.age_s = age_s
         self.type = discord.MessageType.default
         self.created_at = datetime.now(timezone.utc) - timedelta(seconds=age_s)
         self.attachments = []
@@ -93,15 +137,32 @@ BOB = FakeAuthor(2, "bob")
 
 
 class FakeClient:
-    def __init__(self, channel):
+    def __init__(self, channels):
         self.user = BOT
-        self._channel = channel
+        self._channels = {c.id: c for c in channels}
 
     def get_channel(self, cid):
-        return self._channel if int(cid) == self._channel.id else None
+        return self._channels.get(int(cid))
+
+    def get_all_channels(self):
+        return list(self._channels.values())
 
 
-def make_adapter(catch_up=None, ambient_over=None):
+BASE = dict(
+    enabled=True,
+    channels=[4242],
+    probability=1.0,
+    min_gap_seconds=0,
+    max_per_day=5,
+    min_quiet_seconds=300,
+    max_age_seconds=5400,
+    min_messages=3,
+    transcript_messages=8,
+    startup_grace_seconds=0,   # tested explicitly below; off elsewhere
+)
+
+
+def make_adapter(catch_up=None, ambient_over=None, channels=None):
     extra = {
         "ambient_presence": {
             "enabled": True,
@@ -115,58 +176,45 @@ def make_adapter(catch_up=None, ambient_over=None):
         }
     }
     extra["ambient_presence"].update(ambient_over or {})
-    cfg = types.SimpleNamespace(extra=extra)
-    a = amb.AmbientDiscordAdapter(cfg)
+    a = amb.AmbientDiscordAdapter(types.SimpleNamespace(extra=extra))
     a._dedup = set()
     a._get_parent_channel_id = lambda ch: None
+    if channels is not None:
+        a._client = FakeClient(channels)
+    a._catchup_state_loaded = True  # opt in per test; most do not want disk
     return a
 
 
-def scenario(msgs, catch_up=None, ambient_over=None, cid=4242):
-    ch = FakeChannel(cid, msgs)
-    for m in msgs:
-        m.channel = ch
-    a = make_adapter(catch_up, ambient_over)
-    a._client = FakeClient(ch)
-    dispatched = {}
+def stub_dispatch():
+    seen = {"n": 0}
 
-    async def fake_dispatch(self, message):
-        dispatched["msg"] = message
-        dispatched["hint"] = amb._ambient_hint.get("")
-        dispatched["open"] = amb._ambient_open.get()
+    async def fake(self, message):
+        seen["n"] += 1
+        seen["msg"] = message
+        seen["hint"] = amb._ambient_hint.get("")
+        seen["open"] = amb._ambient_open.get()
         return True
 
-    _ad.DiscordAdapter._dispatch_discord_message = fake_dispatch
-    return a, dispatched
+    _ad.DiscordAdapter._dispatch_discord_message = fake
+    return seen
 
 
-BASE = dict(
-    enabled=True,
-    channels=[4242],
-    probability=1.0,
-    min_gap_seconds=0,
-    max_per_day=5,
-    min_quiet_seconds=300,
-    max_age_seconds=5400,
-    min_messages=3,
-    transcript_messages=8,
-)
-
-
-def live_room():
-    """Three humans talking, last message 10 minutes ago, bot silent before."""
-    return [
-        FakeMsg(103, BOB, "yeah the deploy went fine in the end", 600),
-        FakeMsg(102, ALICE, "did anyone look at the staging box", 700),
-        FakeMsg(101, BOB, "morning all", 800),
-        FakeMsg(100, BOT, "I was asleep", 9000),
-    ]
+def live_room(cid=4242, name="general"):
+    """Three humans talking, newest 10 minutes ago, bot silent before them."""
+    return FakeChannel(cid, [
+        FakeMsg(cid * 10 + 3, BOB, "yeah the deploy went fine in the end", 600),
+        FakeMsg(cid * 10 + 2, ALICE, "did anyone look at the staging box", 700),
+        FakeMsg(cid * 10 + 1, BOB, "morning all", 800),
+        FakeMsg(cid * 10 + 0, BOT, "I was asleep", 9000),
+    ], name=name)
 
 
 async def main():
     print("\n-- qualifying room: she reads it and gets the transcript --")
-    a, d = scenario(live_room(), BASE)
-    fired = await a._catchup_scan_channel("4242")
+    ch = live_room()
+    a = make_adapter(BASE, channels=[ch])
+    d = stub_dispatch()
+    fired = await a._catchup_scan_channel(ch)
     check("dispatches on a conversation she missed", fired)
     hint = d.get("hint", "")
     check("transcript carries the actual messages",
@@ -175,7 +223,7 @@ async def main():
     check("her own last line is included so she does not repeat it",
           "TestBot: I was asleep" in hint)
     check("mention gates were open for the re-dispatch", d.get("open") is True)
-    check("target is the newest human message", getattr(d.get("msg"), "id", None) == 103)
+    check("target is the newest human message", getattr(d.get("msg"), "id", None) == 42423)
     check("silence is offered as the default", "[SILENT]" in hint)
 
     print("\n-- the echo rule must catch every bracketed line of that hint --")
@@ -185,38 +233,118 @@ async def main():
             check(f"wrapper line {i} is strippable", n >= 1 and stripped is None,
                   repr(line[:60]))
 
-    print("\n-- she spoke last: never talk to yourself --")
-    msgs = live_room()
-    msgs.insert(0, FakeMsg(104, BOT, "sounds good", 300))
-    a, d = scenario(msgs, BASE)
-    check("no check-in when hers is the newest message",
-          not await a._catchup_scan_channel("4242"))
+    print("\n-- the per-message gates --")
+    cases = [
+        ("no check-in when hers is the newest message",
+         FakeChannel(1, [FakeMsg(14, BOT, "sounds good", 300)] + live_room()._msgs)),
+        ("no check-in while the conversation is in flight",
+         FakeChannel(2, [FakeMsg(23, BOB, "still here", 30),
+                         FakeMsg(22, ALICE, "hi", 40), FakeMsg(21, BOB, "hey", 50)])),
+        ("no necromancy on a dead channel",
+         FakeChannel(3, [FakeMsg(33, BOB, "night", 20000),
+                         FakeMsg(32, ALICE, "bye", 20100),
+                         FakeMsg(31, BOB, "see you", 20200)])),
+    ]
+    for label, chan in cases:
+        a = make_adapter(BASE, channels=[chan])
+        stub_dispatch()
+        check(label, not await a._catchup_scan_channel(chan))
 
-    print("\n-- nothing was missed --")
-    a, d = scenario(live_room(), dict(BASE, min_messages=5))
-    check("no check-in below min_messages", not await a._catchup_scan_channel("4242"))
-
-    print("\n-- room still live: that belongs to the per-message dice --")
-    a, d = scenario(
-        [FakeMsg(203, BOB, "still here", 30), FakeMsg(202, ALICE, "hi", 40),
-         FakeMsg(201, BOB, "hey", 50)], BASE)
-    check("no check-in while the conversation is in flight",
-          not await a._catchup_scan_channel("4242"))
-
-    print("\n-- room went cold hours ago --")
-    a, d = scenario(
-        [FakeMsg(303, BOB, "night", 20000), FakeMsg(302, ALICE, "bye", 20100),
-         FakeMsg(301, BOB, "see you", 20200)], BASE)
-    check("no necromancy on a dead channel",
-          not await a._catchup_scan_channel("4242"))
+    ch = live_room()
+    a = make_adapter(dict(BASE, min_messages=5), channels=[ch])
+    stub_dispatch()
+    check("no check-in below min_messages", not await a._catchup_scan_channel(ch))
 
     print("\n-- anti-repeat: one check-in per conversation, ever --")
-    a, d = scenario(live_room(), BASE)
-    await a._catchup_scan_channel("4242")
-    a._catchup_last = 0.0          # neutralise the gap so ONLY the seen-guard is under test
+    ch = live_room()
+    a = make_adapter(BASE, channels=[ch])
+    stub_dispatch()
+    await a._catchup_scan_channel(ch)
+    a._catchup_last = 0.0          # neutralise the gap: ONLY the seen-guard under test
     a._catchup_hits.clear()
     check("second pass on the same newest message is refused",
-          not await a._catchup_scan_channel("4242"))
+          not await a._catchup_scan_channel(ch))
+
+    print("\n-- wildcard: any channel she can see --")
+    rooms = [live_room(4242, "general"), live_room(5252, "random"),
+             live_room(6262, "offtopic")]
+    a = make_adapter(dict(BASE, channels=["*"]), channels=rooms)
+    check("'*' resolves to every visible text channel", len(a._catchup_candidates()) == 3)
+    muted = live_room(7272, "announcements")
+    muted._can_speak = False
+    a = make_adapter(dict(BASE, channels=["*"]), channels=rooms + [muted])
+    ids = {c.id for c in a._catchup_candidates()}
+    check("a channel she cannot speak in is excluded", 7272 not in ids)
+    a = make_adapter(dict(BASE, channels=["*"], exclude_channels=[5252]),
+                     channels=rooms)
+    check("exclude_channels is honoured",
+          {c.id for c in a._catchup_candidates()} == {4242, 6262})
+    a = make_adapter(dict(BASE, channels=["*"]), channels=rooms,
+                     ambient_over={"system_notices": {"reroute_channel": 6262}})
+    check("the system-notice channel is auto-excluded",
+          {c.id for c in a._catchup_candidates()} == {4242, 5252})
+    a = make_adapter(dict(BASE, channels=[4242, 5252]), channels=rooms)
+    check("an explicit list still means exactly those",
+          {c.id for c in a._catchup_candidates()} == {4242, 5252})
+
+    print("\n-- the free activity pre-filter (no API call) --")
+    a = make_adapter(dict(BASE, channels=["*"]), channels=[
+        live_room(1111, "quiet-enough"),
+        FakeChannel(2222, [FakeMsg(1, BOB, "talking now", 10)], name="live"),
+        FakeChannel(3333, [FakeMsg(1, BOB, "old", 40000)], name="dead"),
+        FakeChannel(4444, [], name="never-used", last_age=None),
+    ])
+    ids = {c.id for c in a._catchup_candidates()}
+    check("a live channel is skipped before any history read", 2222 not in ids)
+    check("a cold channel is skipped before any history read", 3333 not in ids)
+    check("a settled channel survives the filter", 1111 in ids)
+    check("an unknown last_message_id falls through rather than being dropped",
+          4444 in ids)
+
+    print("\n-- one check-in per pass, however many channels qualify --")
+    rooms = [live_room(1000 + i, f"room{i}") for i in range(8)]
+    a = make_adapter(dict(BASE, channels=["*"], max_channels_per_pass=8),
+                     channels=rooms)
+    d = stub_dispatch()
+    await a._catchup_pass()
+    check("eight qualifying rooms produce exactly ONE check-in", d["n"] == 1)
+    check("and it spends exactly one from the daily cap", len(a._catchup_hits) == 1)
+    a = make_adapter(dict(BASE, channels=["*"], max_channels_per_pass=2, probability=0.0),
+                     channels=rooms)
+    cands = a._catchup_candidates()
+    check("max_channels_per_pass does not shrink the candidate set", len(cands) == 8)
+
+    print("\n-- startup grace: a restart must not be a reason to speak --")
+    a = make_adapter(dict(BASE, channels=["*"], startup_grace_seconds=1800),
+                     channels=[live_room()])
+    d = stub_dispatch()
+    await a._catchup_pass()
+    check("no check-in inside the grace window", d["n"] == 0)
+    check("_in_startup_grace agrees", a._in_startup_grace())
+    a._catchup_started_at = time.time() - 3600
+    check("...and it lapses", not a._in_startup_grace())
+    await a._catchup_pass()
+    check("a check-in is allowed once it has", d["n"] == 1)
+
+    print("\n-- budget survives a restart --")
+    ch = live_room()
+    a = make_adapter(BASE, channels=[ch])
+    a._catchup_state_loaded = False
+    a._catchup_load_state()
+    stub_dispatch()
+    await a._catchup_scan_channel(ch)
+    path = a._catchup_state_path()
+    check("state was written", path and os.path.exists(path), str(path))
+    saved = json.load(open(path))
+    check("it records the check-in", len(saved["hits"]) == 1 and saved["last"] > 0)
+    check("and the conversation it already read", str(42423) in saved["seen"])
+    b = make_adapter(dict(BASE, min_gap_seconds=7200), channels=[ch])
+    b._catchup_state_loaded = False
+    b._catchup_load_state()
+    check("a fresh process restores the gap", not b._catchup_quota_ok())
+    check("a fresh process restores the already-read set",
+          str(42423) in list(b._catchup_seen))
+    os.remove(path)
 
     print("\n-- budget: the sub-cap and the shared ambient budget --")
     a = make_adapter(dict(BASE, min_gap_seconds=7200))
@@ -235,12 +363,14 @@ async def main():
     a._ambient_hits.extend([time.time()] * 10)  # ambient daily cap of 10 spent
     check("the shared daily cap blocks too", not a._catchup_quota_ok())
 
-    print("\n-- quiet hours (clock pinned to 03:00, so the wrap branch is real) --")
+    print("\n-- quiet hours: off unless asked for (clock pinned to 03:00) --")
+    a = make_adapter(BASE)
+    check("absent from config means never quiet", not a._in_quiet_hours())
 
     class _TimeShim:
-        """Real `time`, except localtime() always reports a fixed hour. Without
-        pinning it, the wrap-around branch is only exercised on whatever hour
-        the suite happens to run at — which is how a green run means nothing."""
+        """Real `time`, except localtime() reports a fixed hour. Without pinning
+        it, the wrap-around branch is only exercised on whatever hour the suite
+        happens to run at — which is how a green run means nothing."""
 
         def __init__(self, hour):
             self._h = hour
@@ -258,77 +388,69 @@ async def main():
     real_time = amb.time
     amb.time = _TimeShim(3)
     try:
-        cases = [
+        for window, want, label in [
             ([1, 9], True, "03:00 inside a plain 01-09 window"),
             ([9, 17], False, "03:00 outside a daytime window"),
             ([22, 6], True, "03:00 inside a window that wraps midnight"),
             ([22, 2], False, "03:00 outside a wrapping window that ended at 02"),
             ([3, 3], False, "a degenerate start==end window is never quiet"),
             ("1,9", True, "a comma string from `hermes config set` parses"),
-        ]
-        for window, want, label in cases:
-            a = make_adapter(dict(BASE, quiet_hours=window))
-            check(label, a._in_quiet_hours() is want)
-        a = make_adapter(dict(BASE, quiet_hours=[22, 6]))
-        a._catchup_last = 0.0
-        fired = {"n": 0}
-
-        async def never(self, message):
-            fired["n"] += 1
-            return True
-
-        _ad.DiscordAdapter._dispatch_discord_message = never
-        ch = FakeChannel(4242, live_room())
-        for m in ch._msgs:
-            m.channel = ch
-        a._client = FakeClient(ch)
+        ]:
+            check(label, make_adapter(dict(BASE, quiet_hours=window))._in_quiet_hours()
+                  is want)
+        a = make_adapter(dict(BASE, quiet_hours=[22, 6]), channels=[live_room()])
+        d = stub_dispatch()
         await a._catchup_pass()
-        check("a full pass dispatches nothing during quiet hours", fired["n"] == 0)
+        check("a full pass dispatches nothing during quiet hours", d["n"] == 0)
     finally:
         amb.time = real_time
 
     print("\n-- charge at send, not at dispatch --")
-    a, d = scenario(live_room(), BASE)
-    await a._catchup_scan_channel("4242")
+    ch = live_room()
+    a = make_adapter(BASE, channels=[ch])
+    stub_dispatch()
+    await a._catchup_scan_channel(ch)
     check("dispatch alone does not spend the shared budget", a._ambient_last == 0.0)
     check("but it does spend a check-in", len(a._catchup_hits) == 1)
-    a._catchup_count_sent("103", None)
+    a._catchup_count_sent("42423", None)
     check("speaking spends the shared budget", a._ambient_last > 0)
-    a2, _ = scenario(live_room(), BASE)
-    await a2._catchup_scan_channel("4242")
-    a2._catchup_discard_pending("103")
-    a2._catchup_count_sent("103", None)
-    check("a [SILENT] check-in never spends it", a2._ambient_last == 0.0)
+    ch2 = live_room()
+    b = make_adapter(BASE, channels=[ch2])
+    await b._catchup_scan_channel(ch2)
+    b._catchup_discard_pending("42423")
+    b._catchup_count_sent("42423", None)
+    check("a [SILENT] check-in never spends it", b._ambient_last == 0.0)
 
     print("\n-- echo guard: never repost the room's own words --")
-    a, d = scenario(live_room(), BASE)
-    await a._catchup_scan_channel("4242")
+    ch = live_room()
+    a = make_adapter(BASE, channels=[ch])
+    stub_dispatch()
+    await a._catchup_scan_channel(ch)
     leak = "bob: yeah the deploy went fine in the end\nalice: did anyone look at the staging box"
     check("two verbatim transcript lines are suppressed", a._catchup_echo_leak(leak))
     check("one quoted line is allowed through",
-          not a._catchup_echo_leak("bob: yeah the deploy went fine in the end — glad it worked"))
+          not a._catchup_echo_leak("bob: yeah the deploy went fine in the end - glad it worked"))
     check("an ordinary reply is untouched",
           not a._catchup_echo_leak("mm. staging is always the one that breaks."))
 
-    print("\n-- channels: no wildcard on the timer path --")
-    a = make_adapter(dict(BASE, channels=["*"]))
-    check("'*' is refused as a catch-up channel", a._catchup_channels() == [])
-    a = make_adapter(dict(BASE, channels="4242,777"))
-    check("a comma string from `hermes config set` still parses",
-          a._catchup_channels() == ["4242", "777"])
-    a = make_adapter(dict(BASE, channels=4242))
-    check("a bare int id still parses", a._catchup_channels() == ["4242"])
+    print("\n-- config shapes `hermes config set` actually produces --")
+    check("a comma string parses",
+          make_adapter(dict(BASE, channels="4242,777"))._catchup_channels()
+          == ["4242", "777"])
+    check("a bare int id parses",
+          make_adapter(dict(BASE, channels=4242))._catchup_channels() == ["4242"])
 
     print("\n-- off by default --")
-    a = make_adapter(None)
-    check("no catch_up block means disabled", not a._catchup_enabled())
-    a = make_adapter(dict(BASE), ambient_over={"enabled": False})
-    check("ambient off means catch-up off", not a._catchup_enabled())
+    check("no catch_up block means disabled", not make_adapter(None)._catchup_enabled())
+    check("ambient off means catch-up off",
+          not make_adapter(dict(BASE), ambient_over={"enabled": False})._catchup_enabled())
+    check("no channels means no candidates",
+          make_adapter(dict(BASE, channels=[]), channels=[live_room()])
+          ._catchup_candidates() == [])
 
     print("\n-- transcript bounds --")
     a = make_adapter(dict(BASE, transcript_max_chars=200, transcript_message_chars=50))
-    long_msgs = [FakeMsg(i, ALICE, "x" * 500, 100) for i in range(10)]
-    t = a._render_transcript(long_msgs)
+    t = a._render_transcript([FakeMsg(i, ALICE, "x" * 500, 100) for i in range(10)])
     check("total cap holds", len(t) <= 201, len(t))
     check("per-message cap holds", all(len(ln) <= 70 for ln in t.splitlines()))
 

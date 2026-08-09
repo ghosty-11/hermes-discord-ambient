@@ -816,6 +816,13 @@ class AmbientDiscordAdapter(DiscordAdapter):
         self._catchup_hits: deque[float] = deque(maxlen=128)
         self._catchup_last: float = 0.0
         self._catchup_seen: deque[str] = deque(maxlen=256)
+        # When this process came up, for the startup grace period. A gateway
+        # restart is the one moment every in-memory bound is at its most
+        # permissive, and on this host restarts are routine (they are how
+        # plugin code is loaded) — so without a grace, "deploy a plugin" and
+        # "make her speak unprompted" become the same gesture.
+        self._catchup_started_at: float = time.time()
+        self._catchup_state_loaded: bool = False
         # inbound message id -> dispatched_at, for check-ins whose reply has not
         # been charged to the SHARED ambient budget yet. Charged at send, never
         # at dispatch: a check-in that ends in [SILENT] put no words in the
@@ -2006,12 +2013,184 @@ class AmbientDiscordAdapter(DiscordAdapter):
         return bool(self._ambient_enabled() and self._catchup_cfg().get("enabled"))
 
     def _catchup_channels(self) -> list:
-        """Explicit channel ids. No "*": scanning every visible channel on a
-        timer is how a bot ends up talking to itself in six rooms at once, and
-        unlike the reactive path there is no human message to justify the visit.
+        """The configured ids, `"*"` included, exactly as written."""
+        return sorted(_id_set(self._catchup_cfg().get("channels")))
+
+    def _catchup_can_speak(self, channel: Any) -> bool:
+        """Can she actually read history AND reply here, per Discord itself.
+
+        Only consulted for `"*"`. An explicit id is the operator naming a room
+        on purpose, and second-guessing that would silently ignore config; a
+        wildcard is us choosing, so we check rather than assume. Discord's own
+        permissions are the allowlist in that case, which is the same bargain
+        `channels: ["*"]` already makes on the reactive path.
         """
-        ids = _id_set(self._catchup_cfg().get("channels"))
-        return sorted(i for i in ids if i.isdigit())
+        try:
+            perms = channel.permissions_for(channel.guild.me)
+            return bool(
+                perms.view_channel and perms.read_message_history and perms.send_messages
+            )
+        except Exception:
+            return False
+
+    def _catchup_activity_hint(self, channel: Any) -> bool:
+        """Cheap pre-filter: could this channel possibly qualify right now?
+
+        This is what makes `"*"` affordable. A Discord snowflake encodes its own
+        creation time, and `last_message_id` is already on the cached channel
+        object — so the age of a channel's newest message is available for
+        FREE, with no API call. On a server with thirty channels, all but a
+        couple are excluded before we fetch a single message.
+
+        Unknown (None) falls through to the real history read rather than
+        skipping: absence of the hint is not evidence the channel is quiet.
+        """
+        try:
+            import discord
+
+            last_id = getattr(channel, "last_message_id", None)
+            if not last_id:
+                return True
+            cfg = self._catchup_cfg()
+            age = time.time() - discord.utils.snowflake_time(last_id).timestamp()
+            if age < float(cfg.get("min_quiet_seconds", 300)):
+                return False
+            if age > float(cfg.get("max_age_seconds", 5400)):
+                return False
+            return True
+        except Exception:
+            return True
+
+    def _catchup_candidates(self) -> list:
+        """Channel objects worth reading this pass. Cheapest filters first.
+
+        `"*"` means every text channel she can see and speak in — the same
+        bargain the reactive path's `channels: ["*"]` already makes. It changes
+        WHERE a check-in may happen, never HOW OFTEN: the gap, the daily cap and
+        the shared ambient budget are all global, and a pass stops at the first
+        check-in, so widening the channel list cannot widen her output.
+        """
+        import discord
+
+        cfg = self._catchup_cfg()
+        raw = _id_set(cfg.get("channels"))
+        if not raw:
+            return []
+        exclude = _id_set(cfg.get("exclude_channels"))
+        # A channel that exists to receive her own plumbing is never a
+        # conversation to join. Auto-excluded rather than left to the operator,
+        # because under "*" it is opted IN by default and the failure mode is
+        # her catching up on her own cron failure notices.
+        reroute = str(self._sub("system_notices").get("reroute_channel") or "").strip()
+        if reroute:
+            exclude.add(reroute)
+
+        wildcard = "*" in raw
+        explicit = {i for i in raw if i.isdigit()}
+        pool = []
+        if wildcard:
+            pool = list(self._client.get_all_channels())
+        else:
+            for cid in sorted(explicit):
+                ch = self._client.get_channel(int(cid))
+                if ch is None:
+                    # Loud, because a typo'd id is otherwise indistinguishable
+                    # from a quiet room and the feature just never fires.
+                    logger.warning(
+                        "ambient.catch_up: configured channel %s is not visible "
+                        "to this bot; it will never be scanned", cid,
+                    )
+                    continue
+                pool.append(ch)
+
+        out = []
+        for ch in pool:
+            cid = str(getattr(ch, "id", ""))
+            if cid in exclude:
+                continue
+            if not isinstance(ch, discord.TextChannel):
+                continue  # threads/voice/forums are not rooms she lurks in
+            if wildcard and not self._catchup_can_speak(ch):
+                continue
+            if not self._catchup_activity_hint(ch):
+                continue
+            out.append(ch)
+        return out
+
+    # ---- state that must survive a restart --------------------------------
+    def _catchup_state_path(self) -> str | None:
+        """Keyed on the BOT's own Discord user id, deliberately not the profile.
+
+        Under the multiplexed gateway HERMES_HOME resolves to ROOT's for every
+        profile, so a shared filename would have one seat spending another's
+        check-in budget — the same trap that makes root's state.db hold every
+        profile's sessions. Each profile authenticates as its own Discord
+        account, so that account's id IS the seat, with no profile plumbing.
+        """
+        try:
+            uid = getattr(getattr(self, "_client", None), "user", None)
+            uid = getattr(uid, "id", None)
+            if not uid:
+                return None
+            home = os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
+            return os.path.join(home, "state", f"ambient-catchup-{uid}.json")
+        except Exception:
+            return None
+
+    def _catchup_load_state(self) -> None:
+        """Restore the budget once per process, after the client has an identity.
+
+        WHY THIS EXISTS: every bound on this feature was in-memory, so a restart
+        reset the gap, the daily cap AND the already-read set. On a host where
+        restarting the gateway is the normal way to load plugin code, that made
+        "one check-in per restart" the actual ceiling rather than two a day.
+        """
+        if self._catchup_state_loaded:
+            return
+        path = self._catchup_state_path()
+        if not path:
+            return  # no identity yet; try again next pass
+        self._catchup_state_loaded = True
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+            self._catchup_last = float(data.get("last") or 0.0)
+            cutoff = time.time() - 86400
+            self._catchup_hits.extend(
+                float(t) for t in (data.get("hits") or []) if float(t) > cutoff
+            )
+            self._catchup_seen.extend(str(m) for m in (data.get("seen") or []))
+            logger.info(
+                "ambient.catch_up: restored budget (%d check-in(s) in the last "
+                "24h, %d conversation(s) already read)",
+                len(self._catchup_hits), len(self._catchup_seen),
+            )
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.debug("ambient.catch_up: could not restore state", exc_info=True)
+
+    def _catchup_save_state(self) -> None:
+        path = self._catchup_state_path()
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            payload = {
+                "last": self._catchup_last,
+                "hits": list(self._catchup_hits),
+                "seen": list(self._catchup_seen)[-256:],
+            }
+            tmp = f"{path}.tmp"
+            with open(tmp, "w") as fh:
+                json.dump(payload, fh)
+            os.replace(tmp, path)
+        except Exception:
+            logger.debug("ambient.catch_up: could not persist state", exc_info=True)
+
+    def _in_startup_grace(self) -> bool:
+        grace = float(self._catchup_cfg().get("startup_grace_seconds", 1800))
+        return (time.time() - self._catchup_started_at) < grace
 
     def _in_quiet_hours(self) -> bool:
         """True inside the configured local-time window she never initiates in.
@@ -2083,7 +2262,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             out = "…" + out[-max_chars:]
         return out
 
-    async def _catchup_scan_channel(self, cid: str) -> bool:
+    async def _catchup_scan_channel(self, channel: Any) -> bool:
         """One channel pass. True only when a check-in actually dispatched.
 
         Everything before the dispatch is free. The order is deliberate: the
@@ -2093,13 +2272,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
         """
         cfg = self._catchup_cfg()
         client = getattr(self, "_client", None)
-        if client is None:
+        if client is None or channel is None or not hasattr(channel, "history"):
             return False
-        channel = client.get_channel(int(cid))
-        if channel is None:
-            channel = await client.fetch_channel(int(cid))
-        if channel is None or not hasattr(channel, "history"):
-            return False
+        cid = str(getattr(channel, "id", ""))
 
         want = max(2, int(cfg.get("transcript_messages", 8)))
         history = [m async for m in channel.history(limit=min(50, want + 8))]
@@ -2197,29 +2372,56 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.info(
                 "ambient.catch_up: read %d message(s) in #%s (%.0fs quiet) and "
                 "handed them to the agent",
-                len(humans), cid, age,
+                len(humans), getattr(channel, "name", None) or cid, age,
             )
+        self._catchup_save_state()
         return bool(handled)
 
     async def _catchup_pass(self) -> None:
         if not self._catchup_enabled():
             return
-        channels = self._catchup_channels()
-        if not channels:
+        if not self._catchup_channels():
             logger.debug("ambient.catch_up: enabled but no channels configured")
+            return
+        self._catchup_load_state()
+        # Budget gates before any channel work: on a pass that cannot possibly
+        # speak there is no reason to read anyone's history at all.
+        if self._in_startup_grace():
             return
         if self._in_quiet_hours():
             return
         if not self._catchup_quota_ok():
             return
+
+        channels = self._catchup_candidates()
+        if not channels:
+            return
+        cap = max(1, int(self._catchup_cfg().get("max_channels_per_pass", 6)))
         # Randomised so a multi-channel config does not permanently favour the
-        # lowest id, and stopped after the first hit: one check-in per pass, ever.
-        for cid in random.sample(channels, len(channels)):
+        # lowest id — and, under "*", so no room is systematically starved.
+        random.shuffle(channels)
+        if len(channels) > cap:
+            # Stated rather than silent: a truncated scan looks exactly like
+            # "nothing qualified", and a cap nobody can see is a cap nobody
+            # can tune.
+            logger.info(
+                "ambient.catch_up: %d channel(s) qualify, reading %d this pass",
+                len(channels), cap,
+            )
+            channels = channels[:cap]
+
+        # Stopped at the first hit: ONE check-in per pass, whatever the channel
+        # count. This is what makes "*" safe — widening the list changes where
+        # she might speak, never how often.
+        for ch in channels:
             try:
-                if await self._catchup_scan_channel(cid):
+                if await self._catchup_scan_channel(ch):
                     return
             except Exception:
-                logger.debug("ambient.catch_up: channel %s scan failed", cid, exc_info=True)
+                logger.debug(
+                    "ambient.catch_up: channel %s scan failed",
+                    getattr(ch, "id", "?"), exc_info=True,
+                )
 
     async def _catchup_loop(self) -> None:
         cfg = self._catchup_cfg()
