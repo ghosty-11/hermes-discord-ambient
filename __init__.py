@@ -147,6 +147,13 @@ UPSTREAM COUPLING (what discord-adapter-watch.sh guards)
         session keys; pending sentinel placed synchronously at turn start)
       - cron.scheduler.get_running_job_ids() + jobs.json "no_agent" field
       - tools.async_delegation.active_count()
+  * catch-up scanner: discord.py's own Client.get_channel / fetch_channel and
+    Messageable.history(limit=) — library API, not Hermes', so it moves on
+    discord.py's schedule rather than upstream's. Message.created_at is assumed
+    timezone-aware UTC (discord.py 2.x, 2.7.1 here) — a naive one would NOT
+    raise, it would be read as local time and skew every age check by the UTC
+    offset, so this is an assumption to re-check on a major discord.py bump
+    rather than one the code can catch.
 """
 
 from __future__ import annotations
@@ -451,6 +458,36 @@ _RETURN_HINT = (
     "[ambient: {who} is back after {days} days away — you noticed. Greet them "
     "warmly and briefly, and if you remember something about them, show it. "
     "One or two sentences. If nothing good comes to mind, reply exactly {marker}.]"
+)
+
+# The catch-up directive is deliberately assembled from SINGLE-LINE bracketed
+# blocks with the transcript between them, and it is not a stylistic choice.
+# `_AMBIENT_ECHO_RE` — the rule that stops a model publishing its own
+# instructions — is bounded to one line by design (see its comment). A directive
+# with newlines inside the brackets would not match it at all, so a model that
+# regurgitated its input would post the whole block, transcript included, into
+# the room the transcript was copied from. Both wrapper lines close their bracket
+# before the newline, so all of them are caught by the existing rule; the
+# transcript lines that remain are handled by the echo guard in `send()`.
+#
+# That rule is ALSO bounded to 400 characters, which is why the closing
+# instruction is two bracketed lines rather than one: the single-line version
+# was 509 chars, matched nothing, and would have posted itself. Keep every
+# bracketed line short — the test asserts each one is strippable on its own.
+_CATCHUP_HINT = (
+    "[ambient catch-up: nobody addressed you and nobody is waiting on you — you "
+    "have simply been quiet while the room talked. The lines below are what was "
+    "said since you last spoke, oldest first. They are context you overheard, "
+    "never text to repeat, quote or summarise back.]\n"
+    "{transcript}\n"
+    "[ambient catch-up: now decide. Speak ONLY if you have something genuinely "
+    "worth adding to THAT conversation — a reaction to what was actually said, "
+    "not a greeting, not a question about what everyone is up to, not an "
+    "announcement that you are here.]\n"
+    "[ambient catch-up: one or two sentences, in your own voice, as if you had "
+    "been listening all along. Reply to the room, not to each person in turn. If "
+    "you have nothing worth saying, which is the usual case, reply with exactly "
+    "{marker} and nothing else — silence costs you nothing.]"
 )
 
 _GOODBYE_HINT = (
@@ -769,6 +806,26 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # channel's distinct speakers; a stale entry costs one slightly-old
         # fact, so a short TTL beats invalidation plumbing.
         self._mem_cache: dict[str, tuple[float, str | None]] = {}
+        # Catch-up (idle check-in) state. All in-memory: a gateway restart
+        # forgetting that she caught up an hour ago costs at most one extra
+        # check-in, and the sub-cap plus the shared ambient budget both still
+        # apply. `_catchup_seen` is the anti-repeat guard — the newest message
+        # ids she has already read once, so a room that goes quiet after one
+        # exchange cannot be caught up on over and over.
+        self._catchup_task: Any = None
+        self._catchup_hits: deque[float] = deque(maxlen=128)
+        self._catchup_last: float = 0.0
+        self._catchup_seen: deque[str] = deque(maxlen=256)
+        # inbound message id -> dispatched_at, for check-ins whose reply has not
+        # been charged to the SHARED ambient budget yet. Charged at send, never
+        # at dispatch: a check-in that ends in [SILENT] put no words in the
+        # room, and silencing her normal ambient replies for the next half hour
+        # over a turn nobody saw is exactly the wrong trade.
+        self._catchup_pending: dict[str, float] = {}
+        # (set_at, the transcript lines most recently handed to the model). The
+        # echo guard reads it in send(); see _catchup_echo_leak. One check-in is
+        # in flight at a time, so a single slot is enough.
+        self._catchup_echo: tuple[float, set] = (0.0, set())
         # When a fallback-switch notice last named a local model (0 = never).
         # In-memory only: a restart forgets an open window, and the next
         # fallback notice simply re-opens it — degrade is "no hold", not
@@ -1920,6 +1977,337 @@ class AmbientDiscordAdapter(DiscordAdapter):
         extra = _no_thread_keys.get()
         return (base | extra) if extra else base
 
+    # ---- catch-up: the idle check-in -------------------------------------
+    #
+    # WHAT IS MISSING WITHOUT IT: every ambient path in this plugin is reactive —
+    # a message arrives, and something decides whether to answer THAT message.
+    # So a conversation whose every message loses its dice roll passes with the
+    # bot never having considered the conversation at all, only its messages one
+    # at a time. From the room's side that is indistinguishable from absence: ten
+    # people talked for an hour and she never looked up.
+    #
+    # A timer is the only thing that closes it, because the trigger is the
+    # *absence* of a decision, and nothing reactive can fire on that. But a bare
+    # timer is also the single most obnoxious thing a bot can have — it produces
+    # "hey what's everyone up to" into a dead channel at 04:00 — so the loop is
+    # a scanner, not a speaker. Every pass is free (no inference), the vast
+    # majority end in a skip, and the only thing it can ever do is hand ONE real
+    # message to the normal ambient dispatch path with a transcript attached.
+    #
+    # It is subordinate to the shared ambient budget on purpose (see
+    # `_catchup_quota_ok`): a check-in can never fire during the ordinary
+    # cooldown, and one that actually speaks spends from the same daily cap. The
+    # feature can therefore make her *better informed*, but not measurably more
+    # talkative — which is the requirement it was built under.
+    def _catchup_cfg(self) -> dict:
+        return self._sub("catch_up")
+
+    def _catchup_enabled(self) -> bool:
+        return bool(self._ambient_enabled() and self._catchup_cfg().get("enabled"))
+
+    def _catchup_channels(self) -> list:
+        """Explicit channel ids. No "*": scanning every visible channel on a
+        timer is how a bot ends up talking to itself in six rooms at once, and
+        unlike the reactive path there is no human message to justify the visit.
+        """
+        ids = _id_set(self._catchup_cfg().get("channels"))
+        return sorted(i for i in ids if i.isdigit())
+
+    def _in_quiet_hours(self) -> bool:
+        """True inside the configured local-time window she never initiates in.
+
+        Local host time deliberately: the room is one community in one place,
+        and the operator reads the config in the same clock they live in.
+        """
+        try:
+            window = self._catchup_cfg().get("quiet_hours")
+            if not window:
+                return False
+            if isinstance(window, str):
+                window = [p for p in window.split(",")]
+            start, end = int(window[0]), int(window[1])
+            if start == end:
+                return False
+            hour = time.localtime().tm_hour
+            if start < end:
+                return start <= hour < end
+            return hour >= start or hour < end  # window wraps midnight
+        except Exception:
+            return False
+
+    def _catchup_quota_ok(self) -> bool:
+        cfg = self._catchup_cfg()
+        now = time.time()
+        if now - self._catchup_last < float(cfg.get("min_gap_seconds", 7200)):
+            return False
+        cutoff = now - 86400
+        while self._catchup_hits and self._catchup_hits[0] < cutoff:
+            self._catchup_hits.popleft()
+        if len(self._catchup_hits) >= int(cfg.get("max_per_day", 2)):
+            return False
+        # The shared budget, last and load-bearing. Without this the two paths
+        # add up: the reactive one spends its ten a day and the timer adds its
+        # own on top, which is precisely the "she got chatty" failure. Charged
+        # at send (see _catchup_count_sent), so a check-in that ends in silence
+        # does not eat the ordinary cooldown.
+        if cfg.get("respect_ambient_budget", True) and not self._ambient_quota_ok():
+            return False
+        return True
+
+    def _render_transcript(self, msgs: list) -> str:
+        """Oldest-first `name: text` lines, bounded twice.
+
+        Truncated per message AND in total, because a single pasted stack trace
+        would otherwise fill the whole budget and push the actual conversation
+        out. The total cap trims from the FRONT: the most recent lines are the
+        ones she is deciding about.
+        """
+        cfg = self._catchup_cfg()
+        per_msg = max(40, int(cfg.get("transcript_message_chars", 240)))
+        max_chars = max(200, int(cfg.get("transcript_max_chars", 1200)))
+        lines = []
+        for m in msgs:
+            who = getattr(getattr(m, "author", None), "display_name", None) or "someone"
+            text = " ".join((getattr(m, "content", "") or "").split())
+            if not text:
+                attachments = getattr(m, "attachments", None) or []
+                if attachments:
+                    text = f"<{len(attachments)} attachment(s)>"
+                else:
+                    continue
+            if len(text) > per_msg:
+                text = text[: per_msg - 1] + "…"
+            lines.append(f"{who}: {text}")
+        out = "\n".join(lines)
+        if len(out) > max_chars:
+            out = "…" + out[-max_chars:]
+        return out
+
+    async def _catchup_scan_channel(self, cid: str) -> bool:
+        """One channel pass. True only when a check-in actually dispatched.
+
+        Everything before the dispatch is free. The order is deliberate: the
+        structural facts (did she miss a conversation, has the room settled, is
+        it still warm) are decided before the dice, so the probability applies
+        to *qualifying* rooms rather than to every tick of the clock.
+        """
+        cfg = self._catchup_cfg()
+        client = getattr(self, "_client", None)
+        if client is None:
+            return False
+        channel = client.get_channel(int(cid))
+        if channel is None:
+            channel = await client.fetch_channel(int(cid))
+        if channel is None or not hasattr(channel, "history"):
+            return False
+
+        want = max(2, int(cfg.get("transcript_messages", 8)))
+        history = [m async for m in channel.history(limit=min(50, want + 8))]
+        if not history:
+            return False
+
+        me = getattr(client, "user", None)
+        my_id = getattr(me, "id", None)
+        since = []  # newest-first, everything after her last message
+        mine = None
+        for m in history:
+            if my_id is not None and getattr(getattr(m, "author", None), "id", None) == my_id:
+                mine = m
+                break
+            since.append(m)
+        if not since:
+            return False  # she spoke last — a check-in here would be a monologue
+
+        humans = [m for m in since if self._basic_ambient_eligible(m)]
+        if len(humans) < int(cfg.get("min_messages", 3)):
+            return False  # nothing she can meaningfully be said to have missed
+
+        target = humans[0]  # the newest real message: what she is replying into
+        if str(getattr(target, "id", "")) in self._catchup_seen:
+            return False  # already read this conversation once; do not re-open it
+
+        now = time.time()
+        try:
+            age = now - target.created_at.timestamp()
+        except Exception:
+            return False
+        # A conversation still in flight belongs to the per-message dice, which
+        # is tuned for it. Arriving late into a live exchange is the thing that
+        # reads as a bot barging in.
+        if age < float(cfg.get("min_quiet_seconds", 300)):
+            return False
+        # ...and a room that stopped talking hours ago is not a conversation any
+        # more. Answering into it is necromancy, and it is the loudest possible
+        # way to be wrong, because hers is the only message anyone will see.
+        if age > float(cfg.get("max_age_seconds", 5400)):
+            return False
+
+        if random.random() >= float(cfg.get("probability", 0.2)):
+            return False
+
+        # Opportunistic traffic, exactly like a dice-roll join: it must never be
+        # what occupies the one shared inference slot.
+        if self._standby_enabled() and self._standby_engaged() and self._fleet_busy():
+            logger.info("ambient.catch_up: slot busy, skipping this pass")
+            return False
+
+        window = list(reversed(since[: want]))
+        if mine is not None:
+            window.insert(0, mine)  # her own last line, so she does not repeat it
+        transcript = self._render_transcript(window)
+        if not transcript.strip():
+            return False
+        self._catchup_echo = (
+            time.time(),
+            {" ".join(ln.split()) for ln in transcript.splitlines() if ln.strip()},
+        )
+
+        marker = self._ambient_marker()
+        hint = (
+            str(cfg.get("hint") or _CATCHUP_HINT)
+            .replace("{transcript}", transcript)
+            .replace("{marker}", marker)
+        )
+
+        # The stock pass already claimed this id when the message first arrived;
+        # release it so the check-in can claim it exactly once (same reasoning as
+        # the ambient re-dispatch in _dispatch_inner).
+        self._dedup.discard(str(getattr(target, "id", "")))
+        self._apply_speaker_tag(target)
+
+        hint_token = _ambient_hint.set(hint)
+        thread_token = self._ambient_no_thread_token(target)
+        open_token = _ambient_open.set(True)
+        try:
+            handled = await super()._dispatch_discord_message(target)
+        finally:
+            _ambient_open.reset(open_token)
+            _ambient_hint.reset(hint_token)
+            if thread_token is not None:
+                _no_thread_keys.reset(thread_token)
+
+        # Charged whether or not she ends up speaking: the turn happened, the
+        # inference was spent, and the conversation has now been read. The
+        # SHARED budget is charged separately, at send.
+        self._catchup_seen.append(str(getattr(target, "id", "")))
+        if handled:
+            self._catchup_last = time.time()
+            self._catchup_hits.append(self._catchup_last)
+            self._catchup_note_dispatch(target)
+            logger.info(
+                "ambient.catch_up: read %d message(s) in #%s (%.0fs quiet) and "
+                "handed them to the agent",
+                len(humans), cid, age,
+            )
+        return bool(handled)
+
+    async def _catchup_pass(self) -> None:
+        if not self._catchup_enabled():
+            return
+        channels = self._catchup_channels()
+        if not channels:
+            logger.debug("ambient.catch_up: enabled but no channels configured")
+            return
+        if self._in_quiet_hours():
+            return
+        if not self._catchup_quota_ok():
+            return
+        # Randomised so a multi-channel config does not permanently favour the
+        # lowest id, and stopped after the first hit: one check-in per pass, ever.
+        for cid in random.sample(channels, len(channels)):
+            try:
+                if await self._catchup_scan_channel(cid):
+                    return
+            except Exception:
+                logger.debug("ambient.catch_up: channel %s scan failed", cid, exc_info=True)
+
+    async def _catchup_loop(self) -> None:
+        cfg = self._catchup_cfg()
+        interval = max(60, int(cfg.get("interval_seconds", 900)))
+        try:
+            # Settle first. A gateway restart must not produce an immediate
+            # check-in on a conversation that ended before it, and on a host
+            # that restarts the gateway to load plugin changes that would fire
+            # every time we deploy.
+            await asyncio.sleep(min(interval, 300) + random.randint(0, 120))
+            while True:
+                try:
+                    await self._catchup_pass()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug("ambient.catch_up: pass failed", exc_info=True)
+                # Jittered so she is not visibly on a clock.
+                await asyncio.sleep(interval + random.randint(0, max(1, interval // 3)))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("ambient: catch-up loop stopped", exc_info=True)
+
+    def _catchup_echo_leak(self, content: Any) -> bool:
+        """True when a reply is largely the transcript we just fed her.
+
+        The two bracketed wrapper lines are removed by the ordinary echo rule;
+        these lines cannot be, because they are other people's actual sentences
+        and no pattern distinguishes them from ordinary speech. So they are
+        matched against what we know we sent — which we do know, exactly.
+
+        The threshold is two lines, not one: a single overlapping line is
+        plausibly her quoting someone on purpose, which is normal conversation.
+        Two verbatim lines is regurgitation. Over-suppressing costs one reply;
+        under-suppressing reposts the room's own conversation back at it.
+        """
+        try:
+            set_at, lines = self._catchup_echo
+            if not lines or time.time() - set_at > 900:
+                return False
+            body = [" ".join(ln.split()) for ln in str(content or "").splitlines()]
+            hits = sum(1 for ln in body if ln and ln in lines)
+            return hits >= 2
+        except Exception:
+            return False
+
+    def _catchup_note_dispatch(self, message: Any) -> None:
+        """Mark this check-in's reply as owing a charge to the shared budget."""
+        try:
+            now = time.time()
+            for key, when in list(self._catchup_pending.items()):
+                if now - when > 900:
+                    self._catchup_pending.pop(key, None)
+            self._catchup_pending[str(getattr(message, "id", ""))] = now
+        except Exception:
+            pass
+
+    def _catchup_discard_pending(self, reply_to: Any) -> None:
+        """A reply that never went out must not be charged — nor left lying
+        around to be mischarged to some later send in the same channel."""
+        try:
+            self._catchup_pending.pop(str(reply_to or ""), None)
+        except Exception:
+            pass
+
+    def _catchup_count_sent(self, reply_to: Any, result: Any) -> None:
+        """Charge the SHARED ambient budget once the check-in actually spoke.
+
+        At send, not at dispatch, for the same reason the bounce breaker counts
+        here: a dispatch is an intention. A check-in answered with [SILENT] put
+        no words in the room, and charging it would silence her ordinary ambient
+        replies for the next cooldown over a turn nobody saw.
+        """
+        try:
+            key = str(reply_to or "")
+            if key not in self._catchup_pending:
+                return
+            if result is not None and getattr(result, "success", True) is False:
+                return
+            self._catchup_pending.pop(key, None)
+            now = time.time()
+            self._ambient_last = now
+            self._ambient_hits.append(now)
+            logger.info("ambient.catch_up: spoke; charged to the shared ambient budget")
+        except Exception:
+            pass
+
     # ---- rotating presence (zero inference) ------------------------------
     async def _presence_loop(self) -> None:
         pc = self._sub("presence")
@@ -1952,6 +2340,19 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     logger.info("ambient: presence rotation started")
         except Exception:
             logger.debug("ambient: could not start presence rotation", exc_info=True)
+        try:
+            # Guarded on done() as well as None: connect() runs again on every
+            # reconnect, and a second loop would double the check-in rate while
+            # each one's own sub-cap still read as respected.
+            if ok and self._catchup_enabled():
+                if self._catchup_task is None or self._catchup_task.done():
+                    self._catchup_task = asyncio.create_task(self._catchup_loop())
+                    logger.info(
+                        "ambient: catch-up scanner started for %d channel(s)",
+                        len(self._catchup_channels()),
+                    )
+        except Exception:
+            logger.debug("ambient: could not start catch-up scanner", exc_info=True)
         return ok
 
     # ---- outbound text hygiene -------------------------------------------
@@ -2212,6 +2613,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 _MEDIA_NARRATION_RE.sub("", content).strip()[:80],
             )
             self._bounce_discard_pending(reply_to)
+            self._catchup_discard_pending(reply_to)
             return self._suppressed_result()
 
         # Voice-only, runner path: a voice message just went out for this chat,
@@ -2227,6 +2629,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 content.strip()[:100],
             )
             self._bounce_discard_pending(reply_to)
+            self._catchup_discard_pending(reply_to)
             return self._suppressed_result()
 
         if self._voice_only_enabled() and self._voice_just_sent(chat_id):
@@ -2235,6 +2638,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 str(content).strip()[:80],
             )
             self._bounce_discard_pending(reply_to)
+            self._catchup_discard_pending(reply_to)
             return self._suppressed_result()
 
         # Drop pure plumbing notices outright. Logged, never posted — there is no
@@ -2298,6 +2702,19 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     return SendResult(success=True, message_id=None)
                 except Exception:
                     return None
+        # Catch-up echo guard, before the general ambient screen so it sees the
+        # reply exactly as the model wrote it. WARNING, not info: this firing at
+        # all means the model is reproducing its input, and the frequency of the
+        # line is how we find out a model or a prompt has started misbehaving.
+        if self._ambient_enabled() and isinstance(content, str) and self._catchup_echo_leak(content):
+            logger.warning(
+                "ambient.catch_up: suppressed a reply that repeated the "
+                "transcript back into the room: %r", content[:200],
+            )
+            self._bounce_discard_pending(reply_to)
+            self._catchup_discard_pending(reply_to)
+            return self._suppressed_result()
+
         if self._ambient_enabled() and isinstance(content, str):
             marker = self._ambient_marker()
             screened, n_echo = _screen_ambient_reply(content, marker)
@@ -2317,6 +2734,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 # A swallowed reply was never sent: it must not count against
                 # the pair, nor sit around to be charged to a later send.
                 self._bounce_discard_pending(reply_to)
+                self._catchup_discard_pending(reply_to)
                 try:
                     from gateway.platforms.base import SendResult  # type: ignore
 
@@ -2335,6 +2753,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             scrubbed = self._scrub_outbound(content)
             if scrubbed is None:
                 self._bounce_discard_pending(reply_to)
+                self._catchup_discard_pending(reply_to)
                 try:
                     from gateway.platforms.base import SendResult  # type: ignore
 
@@ -2365,10 +2784,12 @@ class AmbientDiscordAdapter(DiscordAdapter):
                         len(media),
                     )
                     self._bounce_count_sent(reply_to, first)
+                    self._catchup_count_sent(reply_to, first)
                     return first
 
         result = await super().send(chat_id, content, *args, **kwargs)
         self._bounce_count_sent(reply_to, result)
+        self._catchup_count_sent(reply_to, result)
         return result
 
 

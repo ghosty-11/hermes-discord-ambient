@@ -1,13 +1,17 @@
 name: discord-ambient
 label: Discord (ambient presence)
 kind: platform
-version: 1.17.0
+version: 1.18.0
 description: >
   Subclasses the bundled Discord adapter to add opt-in "ambient presence":
   a profile may occasionally join conversations it was not mentioned in
   (hard rate-limited), and may decline to speak by answering with a
   [SILENT] sentinel that the adapter swallows. Profiles that do not set
   DISCORD_AMBIENT_ENABLED=true behave exactly like stock Discord.
+  Also adds an opt-in catch-up scanner: a free timer that notices when a
+  conversation went by without her considering it, and hands it to the normal
+  ambient path with a transcript attached. Subordinate to the same budget, so
+  it changes what she knows rather than how often she speaks.
   Built for an always-on agent host, 2026-08-04.
 author: ghosty
 optional_env:
