@@ -1,7 +1,7 @@
 name: discord-ambient
 label: Discord (ambient presence)
 kind: platform
-version: 1.18.1
+version: 1.18.2
 description: >
   Subclasses the bundled Discord adapter to add opt-in "ambient presence":
   a profile may occasionally join conversations it was not mentioned in
@@ -12,6 +12,8 @@ description: >
   conversation went by without her considering it, and hands it to the normal
   ambient path with a transcript attached. Subordinate to the same budget, so
   it changes what she knows rather than how often she speaks.
+  Direct replies are annotated with their replied-to author and cannot be
+  silently swallowed: a model-emitted silence marker becomes a small fallback.
   Built for an always-on agent host, 2026-08-04.
 author: ghosty
 optional_env:

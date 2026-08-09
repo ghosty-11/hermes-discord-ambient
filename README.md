@@ -17,8 +17,8 @@ The obvious extension points don't help:
 
 - **Gateway hooks** (`agent:start`, `agent:end`, …) are fire-and-forget observers. Only
   `pre_tool_call` can veto anything, and only for tools.
-- **`[SILENT]` suppression** — the "say nothing this time" mechanism — exists only in the
-  cron path, not in messaging.
+- **`[SILENT]` suppression** is global at the gateway boundary. It does not know whether a
+  Discord turn was ambient or directly addressed, so the plugin must preserve that distinction.
 
 ## What it adds
 
@@ -30,6 +30,7 @@ serious work.
 |---|---|---|
 | **Ambient joining** | 1 inference | A message the stock gate rejects for lacking a mention may be re-dispatched as if the channel were free-response. Random joins are rate-limited by cooldown, daily cap and probability. Plain-text name triggers (which Discord's @-detection misses entirely) **bypass both** — typing the bot's name is addressing it, and "not now, I spoke recently" reads as broken; only a short anti-spam floor applies. The budget is charged only when a join actually reaches the agent, since the re-dispatch can still be refused by an auth gate. |
 | **Silence** | — | The model may answer with a sentinel (`[SILENT]`) which the adapter swallows, so it can see a message and decide not to speak. |
+| **Direct-reply guarantee** | **zero** | Discord admits a reply-ping as a mention but upstream omits the replied-to author's identity from `MessageEvent`, so the model sees a generic quote and may copy prior ambient `[SILENT]` turns. The plugin restores `reply_to_author_*` and `reply_to_is_own_message`, adds a request-only direct-address directive, and deterministically converts a direct silence token into `direct_silence_fallback` (default `I'm here.`). DMs, explicit mentions, plain-text name triggers, and replies to the profile's own message count as direct. Unaddressed ambient silence is unchanged. |
 | **Reactions** | **zero** | Messages it doesn't answer may still get an emoji reaction, chosen by regex→emoji rules with a fallback pool. Costs no inference at all — the difference between a bot that feels present and one that feels absent between slow or expensive replies. People react far more often than they reply. |
 | **Return greetings** | 1 inference | Someone's first message after N days away is prioritised over the dice, with a hint telling the model they've been gone. Last-seen state persists across restarts. |
 | **Rotating presence** | **zero** | Custom status rotated from a list on a background task. |
@@ -181,6 +182,7 @@ platforms:
         name_triggers: ["companion"]  # plain-text names Discord's @-detection misses
         name_cooldown_seconds: 60  # anti-spam floor for name hits (NOT the long cooldown)
         silent_marker: "[SILENT]"
+        direct_silence_fallback: "I'm here."  # sent only if a direct turn emits silence
         no_threads: true           # never auto-create threads for this profile
         speaker_identity: true     # prepend [speaker @handle id:123] so memories
         speaker_memory:            # deterministic recall, injected at dispatch

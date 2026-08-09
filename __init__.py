@@ -8,7 +8,7 @@ occasionally. Gateway hooks can't help (fire-and-forget observers; only
 pre_tool_call can veto) and `[SILENT]` suppression exists only in cron.
 
 This subclasses the bundled Discord adapter — never forks it, so upstream fixes
-to that 10k-line file keep flowing — and adds ten opt-in behaviours:
+to that 10k-line file keep flowing — and adds profile-scoped behaviours:
 
 1. AMBIENT JOINING — a message the stock gate rejects for lacking a mention may
    be re-dispatched as if the channel were free-response. Hard rate-limited.
@@ -87,6 +87,11 @@ to that 10k-line file keep flowing — and adds ten opt-in behaviours:
    reliably visible on the interaction path under multiplex — the operator
    can end up rejected while strangers chat freely). `slash_commands`
    restricts slash invocations to explicit channels/users, chat untouched.
+12. DIRECT-REPLY GUARANTEE — the stock Discord adapter admits reply-pings but
+   omits the replied-to author's identity from MessageEvent. Restore it so the
+   model sees "your previous message", add a request-only direct-address hint,
+   and deterministically replace any direct [SILENT]/NO_REPLY with a configured
+   acknowledgment. Unaddressed ambient silence remains unchanged.
 
 HOW (and why this exact seam)
 -----------------------------
@@ -434,6 +439,19 @@ _ambient_hint: contextvars.ContextVar[str] = contextvars.ContextVar(
     "hermes_ambient_hint", default=""
 )
 
+# True only while the gateway is processing an event that addressed this
+# profile directly (DM, explicit mention, plain-text name, or a Discord reply
+# to the profile's own message).  The stock Discord adapter admits reply-pings
+# as mentions but drops the replied-to author's identity when it builds the
+# MessageEvent.  That made a direct continuation look generic to the model and
+# allowed the gateway's global [SILENT] filter to swallow it.  The adapter
+# wrapper below restores the metadata, then scopes this bit around the actual
+# gateway handler — including queued turns, whose processing happens after the
+# original Discord dispatch task has returned.
+_direct_address: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "hermes_ambient_direct_address", default=False
+)
+
 # Channel keys for which threading is suppressed, scoped to one dispatch task.
 # Who sent the message currently being handled. Set at dispatch, read inside the
 # agent turn by the image-generation gate. ContextVars are copied into tasks
@@ -458,6 +476,11 @@ _RETURN_HINT = (
     "[ambient: {who} is back after {days} days away — you noticed. Greet them "
     "warmly and briefly, and if you remember something about them, show it. "
     "One or two sentences. If nothing good comes to mind, reply exactly {marker}.]"
+)
+
+_DIRECT_REPLY_HINT = (
+    "[direct address: this person is speaking to you personally. Answer them "
+    "normally. Do not use [SILENT], SILENT, NO_REPLY, or NO REPLY on this turn.]"
 )
 
 # The catch-up directive is deliberately assembled from SINGLE-LINE bracketed
@@ -834,6 +857,13 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # echo guard reads it in send(); see _catchup_echo_leak. One check-in is
         # in flight at a time, so a single slot is enough.
         self._catchup_echo: tuple[float, set] = (0.0, set())
+        # inbound message id -> timestamp for directly addressed turns whose
+        # outbound reply has not completed yet.  The id returns as send's
+        # reply_to anchor, giving deterministic correlation even when a turn
+        # was queued behind another one.  This is also the final safety net for
+        # a model that ignores the request-only direct-address directive and
+        # still emits a silence control token.
+        self._direct_pending: dict[str, float] = {}
         # When a fallback-switch notice last named a local model (0 = never).
         # In-memory only: a restart forgets an open window, and the next
         # fallback notice simply re-opens it — degrade is "no hold", not
@@ -853,6 +883,105 @@ class AmbientDiscordAdapter(DiscordAdapter):
 
     def _ambient_marker(self) -> str:
         return str(self._ambient_cfg().get("silent_marker") or "[SILENT]").strip()
+
+    def _direct_silence_fallback(self) -> str:
+        fallback = str(
+            self._ambient_cfg().get("direct_silence_fallback") or "I'm here."
+        ).strip()
+        return fallback or "I'm here."
+
+    def _annotate_reply_context(self, event: Any) -> None:
+        """Restore Discord reply-author fields omitted by the stock adapter."""
+        try:
+            raw = getattr(event, "raw_message", None)
+            reference = getattr(raw, "reference", None)
+            resolved = getattr(reference, "resolved", None)
+            author = getattr(resolved, "author", None)
+            if author is None:
+                return
+            author_id = str(getattr(author, "id", "") or "")
+            author_name = str(
+                getattr(author, "display_name", None)
+                or getattr(author, "name", None)
+                or ""
+            )
+            event.reply_to_author_id = author_id or None
+            event.reply_to_author_name = author_name or None
+            own = getattr(getattr(self, "_client", None), "user", None)
+            own_id = str(getattr(own, "id", "") or "")
+            event.reply_to_is_own_message = bool(author_id and own_id == author_id)
+        except Exception:
+            logger.debug("ambient.direct: reply metadata recovery failed", exc_info=True)
+
+    def _event_is_direct(self, event: Any) -> bool:
+        """Whether this inbound event is personally addressed to the profile."""
+        try:
+            if getattr(event, "reply_to_is_own_message", False):
+                return True
+            source = getattr(event, "source", None)
+            if str(getattr(source, "chat_type", "") or "").lower() == "dm":
+                return True
+            raw = getattr(event, "raw_message", None)
+            if raw is not None and self._self_is_explicitly_mentioned(raw):
+                return True
+            cfg = self._ambient_cfg()
+            triggers = cfg.get("name_triggers") or []
+            if isinstance(triggers, str):
+                triggers = [part.strip() for part in triggers.split(",")]
+            content = str(getattr(raw, "content", "") or getattr(event, "text", ""))
+            lowered = content.lower()
+            return any(
+                str(trigger).strip().lower() in lowered
+                for trigger in triggers
+                if str(trigger).strip()
+            )
+        except Exception:
+            logger.debug("ambient.direct: address classification failed", exc_info=True)
+            return False
+
+    def _direct_prune_pending(self) -> None:
+        now = time.time()
+        stale = [key for key, when in self._direct_pending.items() if now - when > 3600]
+        for key in stale:
+            self._direct_pending.pop(key, None)
+        while len(self._direct_pending) > 512:
+            self._direct_pending.pop(next(iter(self._direct_pending)), None)
+
+    def _direct_note_event(self, event: Any) -> bool:
+        """Record one direct turn and return whether it was direct."""
+        self._annotate_reply_context(event)
+        direct = self._ambient_enabled() and self._event_is_direct(event)
+        if direct:
+            message_id = str(getattr(event, "message_id", "") or "")
+            if message_id:
+                self._direct_prune_pending()
+                self._direct_pending[message_id] = time.time()
+        return direct
+
+    def _direct_is_pending(self, reply_to: Any) -> bool:
+        self._direct_prune_pending()
+        return bool(reply_to) and str(reply_to) in self._direct_pending
+
+    def _direct_count_sent(self, reply_to: Any, result: Any) -> None:
+        if not reply_to:
+            return
+        try:
+            if result is not None and getattr(result, "success", False):
+                self._direct_pending.pop(str(reply_to), None)
+        except Exception:
+            pass
+
+    def set_message_handler(self, handler) -> None:
+        """Scope directness around the real gateway turn, including queued turns."""
+        async def _direct_scoped_handler(event):
+            direct = self._direct_note_event(event)
+            token = _direct_address.set(direct)
+            try:
+                return await handler(event)
+            finally:
+                _direct_address.reset(token)
+
+        super().set_message_handler(_direct_scoped_handler)
 
     def _sub(self, key: str) -> dict:
         v = self._ambient_cfg().get(key)
@@ -2984,6 +3113,24 @@ class AmbientDiscordAdapter(DiscordAdapter):
 
         if self._ambient_enabled() and isinstance(content, str):
             marker = self._ambient_marker()
+            direct_pending = self._direct_is_pending(reply_to)
+            direct_silence = False
+            if direct_pending:
+                try:
+                    from gateway.response_filters import (
+                        is_intentional_silence_response,
+                    )
+
+                    direct_silence = is_intentional_silence_response(content)
+                except Exception:
+                    direct_silence = _looks_like_sentinel(content, marker)
+            if direct_silence:
+                fallback = self._direct_silence_fallback()
+                logger.warning(
+                    "ambient.direct: replaced direct silence marker with fallback: %r",
+                    fallback,
+                )
+                content = fallback
             screened, n_echo = _screen_ambient_reply(content, marker)
             if n_echo:
                 # WARNING, not info: the model just tried to publish an instruction
@@ -2994,20 +3141,27 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     n_echo, content[:200],
                 )
             if screened is None:
-                logger.info(
-                    "ambient: response suppressed (%s sentinel or bare directive echo)",
-                    marker,
-                )
-                # A swallowed reply was never sent: it must not count against
-                # the pair, nor sit around to be charged to a later send.
-                self._bounce_discard_pending(reply_to)
-                self._catchup_discard_pending(reply_to)
-                try:
-                    from gateway.platforms.base import SendResult  # type: ignore
+                if direct_pending:
+                    screened = self._direct_silence_fallback()
+                    logger.warning(
+                        "ambient.direct: replaced an empty direct reply with fallback: %r",
+                        screened,
+                    )
+                else:
+                    logger.info(
+                        "ambient: response suppressed (%s sentinel or bare directive echo)",
+                        marker,
+                    )
+                    # A swallowed reply was never sent: it must not count against
+                    # the pair, nor sit around to be charged to a later send.
+                    self._bounce_discard_pending(reply_to)
+                    self._catchup_discard_pending(reply_to)
+                    try:
+                        from gateway.platforms.base import SendResult  # type: ignore
 
-                    return SendResult(success=True, message_id=None)
-                except Exception:
-                    return None
+                        return SendResult(success=True, message_id=None)
+                    except Exception:
+                        return None
             content = screened
         # General scrub last, so the fallback-notice comparison above still matches
         # on the model's verbatim text. The ONE thing that now runs earlier is the
@@ -3052,11 +3206,13 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     )
                     self._bounce_count_sent(reply_to, first)
                     self._catchup_count_sent(reply_to, first)
+                    self._direct_count_sent(reply_to, first)
                     return first
 
         result = await super().send(chat_id, content, *args, **kwargs)
         self._bounce_count_sent(reply_to, result)
         self._catchup_count_sent(reply_to, result)
+        self._direct_count_sent(reply_to, result)
         return result
 
 
@@ -3595,7 +3751,7 @@ def _is_resume_turn(user_message: Any, history: Any, depth: int = 3) -> bool:
 
 
 def _on_llm_request_ambient_hint(**kwargs: Any):
-    """Deliver this turn's ambient directive as a request-only system message.
+    """Deliver this turn's ambient/direct directive as a request-only message.
 
     Returns ``{"request": ...}`` with the hint appended, or None to leave the
     payload byte-identical — which is the case for every turn that is not an
@@ -3611,7 +3767,11 @@ def _on_llm_request_ambient_hint(**kwargs: Any):
     cost the whole conversation.
     """
     try:
-        hint = _ambient_hint.get("")
+        hint = (
+            _DIRECT_REPLY_HINT
+            if _direct_address.get(False)
+            else _ambient_hint.get("")
+        )
         if not hint:
             return None
         request = kwargs.get("request")
@@ -3622,7 +3782,11 @@ def _on_llm_request_ambient_hint(**kwargs: Any):
             return None
         patched = dict(request)
         patched["messages"] = list(messages) + [{"role": "system", "content": hint}]
-        logger.info("ambient: directive delivered via llm_request middleware (request-only)")
+        kind = "direct-address" if _direct_address.get(False) else "ambient"
+        logger.info(
+            "ambient: %s directive delivered via llm_request middleware (request-only)",
+            kind,
+        )
         return {"request": patched}
     except Exception:  # noqa: BLE001 — never break a turn over a nudge
         logger.debug("ambient: hint middleware failed; turn proceeds", exc_info=True)
@@ -3729,6 +3893,63 @@ def _install_compaction_focus() -> None:
     logger.info("ambient: compaction focus installed (per-profile, resolved per call)")
 
 
+def _install_direct_silence_filter() -> None:
+    """Keep direct silence controls in the delivery path for adapter recovery.
+
+    Hermes normally turns a successful whole-response ``[SILENT]``/``NO_REPLY``
+    into an empty gateway response before the platform adapter sees it.  That is
+    correct for ambient turns.  A directly addressed turn is different: leave
+    its marker intact so ``AmbientDiscordAdapter.send`` can replace it with the
+    configured acknowledgment.  Both patches are process-wide but context-
+    gated, so other profiles and unaddressed turns retain stock behavior.
+    """
+    try:
+        from gateway import response_filters as filters
+
+        current = filters.is_intentional_silence_agent_result
+        original = getattr(current, "_ambient_direct_original", current)
+
+        def _direct_aware_agent_result(agent_result, response):
+            silent = original(agent_result, response)
+            if silent and _direct_address.get(False):
+                logger.warning(
+                    "ambient.direct: retained a direct silence marker for fallback delivery"
+                )
+                return False
+            return silent
+
+        _direct_aware_agent_result._ambient_direct_original = original
+        filters.is_intentional_silence_agent_result = _direct_aware_agent_result
+
+        # The stream consumer imports its response predicate by value, so patch
+        # that alias as well.  Partial-marker buffering remains unchanged; only
+        # the completed direct marker is allowed through to adapter.send().
+        try:
+            from gateway import stream_consumer
+
+            stream_current = stream_consumer._is_intentional_silence_response
+            stream_original = getattr(
+                stream_current, "_ambient_direct_original", stream_current
+            )
+
+            def _direct_aware_stream_response(response):
+                silent = stream_original(response)
+                return False if silent and _direct_address.get(False) else silent
+
+            _direct_aware_stream_response._ambient_direct_original = stream_original
+            stream_consumer._is_intentional_silence_response = (
+                _direct_aware_stream_response
+            )
+        except Exception:
+            logger.debug(
+                "ambient.direct: streaming silence filter unavailable",
+                exc_info=True,
+            )
+        logger.info("ambient: direct-address silence recovery installed")
+    except Exception:
+        logger.exception("ambient: could not install direct-address silence recovery")
+
+
 def register(ctx) -> None:
     """Install the stock Discord platform entry, then swap in our subclass.
 
@@ -3740,6 +3961,7 @@ def register(ctx) -> None:
     under two names.
     """
     _install_compaction_focus()
+    _install_direct_silence_filter()
 
     _bundled.register(ctx)
 
