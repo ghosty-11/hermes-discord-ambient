@@ -823,6 +823,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # "make her speak unprompted" become the same gesture.
         self._catchup_started_at: float = time.time()
         self._catchup_state_loaded: bool = False
+        self._catchup_logged_scope: bool = False
         # inbound message id -> dispatched_at, for check-ins whose reply has not
         # been charged to the SHARED ambient budget yet. Charged at send, never
         # at dispatch: a check-in that ends in [SILENT] put no words in the
@@ -2061,8 +2062,11 @@ class AmbientDiscordAdapter(DiscordAdapter):
         except Exception:
             return True
 
-    def _catchup_candidates(self) -> list:
-        """Channel objects worth reading this pass. Cheapest filters first.
+    def _catchup_eligible_channels(self) -> list:
+        """Every channel this profile may EVER check in on, before the
+        activity filter. Stable between passes, so it is the honest answer to
+        "what is she watching" — unlike `_catchup_candidates`, which is a
+        snapshot of what happens to qualify this minute.
 
         `"*"` means every text channel she can see and speak in — the same
         bargain the reactive path's `channels: ["*"]` already makes. It changes
@@ -2112,10 +2116,20 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 continue  # threads/voice/forums are not rooms she lurks in
             if wildcard and not self._catchup_can_speak(ch):
                 continue
-            if not self._catchup_activity_hint(ch):
-                continue
             out.append(ch)
         return out
+
+    def _catchup_candidates(self) -> list:
+        """Eligible channels that could plausibly qualify right now.
+
+        The activity hint is applied here rather than in the eligible set so
+        the two questions stay separate: what she watches (stable) versus what
+        is worth reading this pass (a snapshot).
+        """
+        return [
+            ch for ch in self._catchup_eligible_channels()
+            if self._catchup_activity_hint(ch)
+        ]
 
     # ---- state that must survive a restart --------------------------------
     def _catchup_state_path(self) -> str | None:
@@ -2393,7 +2407,23 @@ class AmbientDiscordAdapter(DiscordAdapter):
         if not self._catchup_quota_ok():
             return
 
-        channels = self._catchup_candidates()
+        eligible = self._catchup_eligible_channels()
+        # Once per process, at INFO, because otherwise a scanner watching ZERO
+        # channels and a scanner watching thirty quiet ones produce exactly the
+        # same log: nothing. That is not a distinction to leave to inference —
+        # a silent pass has to be readable as "nothing qualified" rather than
+        # as "the wildcard resolved to nothing".
+        if not self._catchup_logged_scope:
+            self._catchup_logged_scope = True
+            logger.info(
+                "ambient.catch_up: watching %d channel(s): %s",
+                len(eligible),
+                ", ".join(
+                    f"#{getattr(c, 'name', None) or getattr(c, 'id', '?')}"
+                    for c in eligible[:20]
+                ) or "(none — check permissions and channel ids)",
+            )
+        channels = [ch for ch in eligible if self._catchup_activity_hint(ch)]
         if not channels:
             return
         cap = max(1, int(self._catchup_cfg().get("max_channels_per_pass", 6)))
@@ -2549,9 +2579,17 @@ class AmbientDiscordAdapter(DiscordAdapter):
             if ok and self._catchup_enabled():
                 if self._catchup_task is None or self._catchup_task.done():
                     self._catchup_task = asyncio.create_task(self._catchup_loop())
+                    # Says what was CONFIGURED, not what resolved — the client
+                    # cache is not necessarily populated yet at connect. The
+                    # resolved count is logged on the first pass instead.
+                    # (The first version printed len(channels), which reads as
+                    # "1 channel" for `["*"]` — a log line that misreports the
+                    # thing it exists to report.)
+                    ids = self._catchup_channels()
                     logger.info(
-                        "ambient: catch-up scanner started for %d channel(s)",
-                        len(self._catchup_channels()),
+                        "ambient: catch-up scanner started (channels: %s)",
+                        "* — every visible channel she can speak in"
+                        if "*" in ids else ", ".join(ids),
                     )
         except Exception:
             logger.debug("ambient: could not start catch-up scanner", exc_info=True)

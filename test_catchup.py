@@ -287,6 +287,50 @@ async def main():
     check("an explicit list still means exactly those",
           {c.id for c in a._catchup_candidates()} == {4242, 5252})
 
+    print("\n-- the scope log must distinguish 'watching none' from 'none qualified' --")
+    import logging
+
+    class _Capture(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.lines = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())  # already interpolates args
+
+    cap = _Capture()
+    amb.logger.addHandler(cap)
+    amb.logger.setLevel(logging.INFO)
+    try:
+        # A wildcard over three rooms must not report "1 channel" just because
+        # the CONFIG has one entry — the bug the first deploy shipped with.
+        rooms = [live_room(4242, "general"), live_room(5252, "random"),
+                 live_room(6262, "offtopic")]
+        a = make_adapter(dict(BASE, channels=["*"], probability=0.0), channels=rooms)
+        await a._catchup_pass()
+        scope = [ln for ln in cap.lines if "watching" in ln]
+        check("the resolved channel count is logged", len(scope) == 1, cap.lines)
+        check("...and it is the RESOLVED count, not the config entry count",
+              scope and "watching 3 channel(s)" in scope[0], scope)
+        check("...naming them, so a wrong room is visible",
+              scope and "#general" in scope[0] and "#offtopic" in scope[0], scope)
+        cap.lines.clear()
+        await a._catchup_pass()
+        check("logged once per process, not once per pass",
+              not [ln for ln in cap.lines if "watching" in ln])
+
+        cap.lines.clear()
+        mute = live_room(7272, "no-perms")
+        mute._can_speak = False
+        b = make_adapter(dict(BASE, channels=["*"], probability=0.0), channels=[mute])
+        await b._catchup_pass()
+        scope = [ln for ln in cap.lines if "watching" in ln]
+        check("a scanner watching NOTHING says so explicitly",
+              scope and "watching 0 channel(s)" in scope[0] and "none" in scope[0],
+              scope)
+    finally:
+        amb.logger.removeHandler(cap)
+
     print("\n-- the free activity pre-filter (no API call) --")
     a = make_adapter(dict(BASE, channels=["*"]), channels=[
         live_room(1111, "quiet-enough"),
@@ -439,6 +483,13 @@ async def main():
           == ["4242", "777"])
     check("a bare int id parses",
           make_adapter(dict(BASE, channels=4242))._catchup_channels() == ["4242"])
+    # The shape `hermes config set ... .channels '*'` actually writes: a bare
+    # string, not a list. Deployed live on 2026-08-09, so it is worth asserting
+    # rather than assuming the list form covers it.
+    a = make_adapter(dict(BASE, channels="*"), channels=[live_room(), live_room(5252)])
+    check("a bare '*' string is the wildcard", a._catchup_channels() == ["*"])
+    check("...and resolves to every visible channel",
+          len(a._catchup_eligible_channels()) == 2)
 
     print("\n-- off by default --")
     check("no catch_up block means disabled", not make_adapter(None)._catchup_enabled())
