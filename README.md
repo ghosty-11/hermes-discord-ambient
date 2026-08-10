@@ -866,6 +866,12 @@ never arms it and therefore can never cause another profile's message to be drop
 Together with **consume-once** (at most one text send is ever affected) and logging on
 every suppression, cross-profile interference is closed rather than merely made unlikely.
 
+**Reply correlation (v1.21.1).** Only a send carrying Discord's inbound-message
+`reply_to` anchor may consume the tool-path signal. This keeps unanchored gateway status
+messages out of the race. On 2026-08-10 a fallback-model notice arrived between TTS
+generation and the model's `Empty response.` placeholder; the notice consumed the signal,
+so the placeholder escaped beside the audio. Anchoring makes the actual reply consume it.
+
 **Window: 45s**, and picked from measurement, not taste. Across five real turns the gap
 between the TTS call and the text send was 2.7s / 5.6s / 12.8s / 15.4s / 35.4s — dominated
 by how long the model takes to finish generating *after* calling the tool, which on a

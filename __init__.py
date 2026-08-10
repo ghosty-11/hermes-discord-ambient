@@ -3408,7 +3408,18 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # already GENERATED before this text was sent (measured: ~14s before), so
         # the signal exists by now even though the audio has not been delivered
         # yet. Consume-once, so only the first text after a TTS call is dropped.
-        if self._voice_only_enabled() and isinstance(content, str) and _claim_recent_tts():
+        # A model reply produced for a live Discord turn carries the inbound
+        # message id as ``reply_to``. Gateway status sends do not. Requiring
+        # that anchor prevents an interleaved fallback/lifecycle notice from
+        # consuming the process-wide one-shot signal before the actual text
+        # twin arrives (observed 2026-08-10: fallback notice, then
+        # ``Empty response.``, then the voice attachment).
+        if (
+            self._voice_only_enabled()
+            and reply_to is not None
+            and isinstance(content, str)
+            and _claim_recent_tts()
+        ):
             logger.info(
                 "ambient: voice-only — dropped text emitted alongside speech: %s",
                 content.strip()[:100],
