@@ -1,7 +1,7 @@
 name: discord-ambient
 label: Discord (ambient presence)
 kind: platform
-version: 1.18.2
+version: 1.19.0
 description: >
   Subclasses the bundled Discord adapter to add opt-in "ambient presence":
   a profile may occasionally join conversations it was not mentioned in
@@ -14,6 +14,9 @@ description: >
   it changes what she knows rather than how often she speaks.
   Direct replies are annotated with their replied-to author and cannot be
   silently swallowed: a model-emitted silence marker becomes a small fallback.
+  Optional gateway lifecycle messages announce a profile's graceful departure
+  and return, while Discord-proxied rich-embed videos enter the stock bounded
+  media pipeline and can receive local transcription plus video analysis.
   Built for an always-on agent host, 2026-08-04.
 author: ghosty
 optional_env:
