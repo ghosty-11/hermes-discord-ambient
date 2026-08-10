@@ -894,6 +894,10 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # masquerade as the profile going to sleep and waking up.
         self._lifecycle_return_sent: bool = False
         self._lifecycle_departure_sent: bool = False
+        # Per-channel, observed Discord identities used to turn a model's
+        # plain ``@display-name`` into the wire form Discord actually pings.
+        # Values are sets because reused display names must stay ambiguous.
+        self._discord_identities: dict[str, dict[str, set[str]]] = {}
 
     # ---- config ---------------------------------------------------------
     def _ambient_cfg(self) -> dict:
@@ -935,6 +939,21 @@ class AmbientDiscordAdapter(DiscordAdapter):
             own = getattr(getattr(self, "_client", None), "user", None)
             own_id = str(getattr(own, "id", "") or "")
             event.reply_to_is_own_message = bool(author_id and own_id == author_id)
+            # The framework carries these structured author fields, but its
+            # prompt currently renders only an unattributed quote. Add the
+            # missing relationship to the quote itself so a reply to another
+            # person cannot look like a reply to this profile. Keep replies to
+            # the profile unchanged: the runner already labels those as
+            # "your previous message".
+            reply_text = str(getattr(event, "reply_to_text", "") or "")
+            if (
+                reply_text
+                and author_name
+                and not event.reply_to_is_own_message
+                and not getattr(event, "_ambient_reply_attributed", False)
+            ):
+                event.reply_to_text = f"{author_name} wrote: {reply_text}"
+                event._ambient_reply_attributed = True
         except Exception:
             logger.debug("ambient.direct: reply metadata recovery failed", exc_info=True)
 
@@ -1953,6 +1972,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
     async def _dispatch_inner(self, message: Any) -> bool:
         # Stable speaker identity before anything reads the content, so both
         # the stock pass and any ambient re-dispatch carry it.
+        self._remember_discord_identities(message)
         self._apply_speaker_tag(message)
         self._note_inbound_for_window(message)
 
@@ -2196,6 +2216,70 @@ class AmbientDiscordAdapter(DiscordAdapter):
             message.content = f"{prefix}{content}"
         except Exception:
             pass  # frozen message object; identity is a nicety, not a gate
+
+    def _remember_discord_identities(self, message: Any) -> None:
+        """Remember unambiguous IDs for authors visibly present in a channel.
+
+        Discord does not treat ``@name`` as a ping; the outbound wire form is
+        ``<@numeric-id>``. Models naturally write the former. Resolve only
+        identities supplied by Discord on an inbound message, scoped to the
+        same channel, and retain collisions as ambiguous rather than guessing.
+        """
+        if not self._hygiene_cfg().get("resolve_plain_mentions", False):
+            return
+        try:
+            channel_id = str(
+                getattr(getattr(message, "channel", None), "id", "") or ""
+            )
+            if not channel_id:
+                return
+            directory = self._discord_identities.setdefault(channel_id, {})
+            people = [getattr(message, "author", None)]
+            people.extend(list(getattr(message, "mentions", None) or []))
+            for person in people:
+                uid = str(getattr(person, "id", "") or "")
+                if not uid.isdigit():
+                    continue
+                aliases = {
+                    str(getattr(person, field, "") or "").strip().lstrip("@")
+                    for field in ("name", "display_name", "global_name", "nick")
+                }
+                for alias in aliases:
+                    if not alias or len(alias) > 64 or alias.isdigit():
+                        continue
+                    directory.setdefault(alias.casefold(), set()).add(uid)
+            # A busy public channel should not grow this process-lifetime cache
+            # without bound. Dropping an old alias merely leaves future text
+            # unconverted; it can never produce a false ping.
+            while len(directory) > 512:
+                directory.pop(next(iter(directory)))
+        except Exception:
+            logger.debug("ambient: Discord identity observation failed", exc_info=True)
+
+    def _resolve_plain_mentions(self, content: str, chat_id: Any) -> str:
+        """Convert known, unambiguous ``@aliases`` to Discord mention syntax."""
+        if not self._hygiene_cfg().get("resolve_plain_mentions", False):
+            return content
+        try:
+            directory = self._discord_identities.get(str(chat_id), {})
+            aliases = [
+                (alias, next(iter(ids)))
+                for alias, ids in directory.items()
+                if len(ids) == 1
+            ]
+            text = content
+            for alias, uid in sorted(aliases, key=lambda item: len(item[0]), reverse=True):
+                pattern = re.compile(
+                    rf"(?<![\w@])@{re.escape(alias)}(?![\w.])",
+                    re.IGNORECASE,
+                )
+                text = pattern.sub(f"<@{uid}>", text)
+            if text != content:
+                logger.info("ambient: resolved plain handle text to Discord mention syntax")
+            return text
+        except Exception:
+            logger.debug("ambient: plain Discord mention resolution failed", exc_info=True)
+            return content
 
     # ---- system-notice rerouting ------------------------------------------
     def _system_notice_target(self, content: Any, chat_id: Any) -> str | None:
@@ -2727,6 +2811,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
         window = list(reversed(since[: want]))
         if mine is not None:
             window.insert(0, mine)  # her own last line, so she does not repeat it
+        for observed in window:
+            self._remember_discord_identities(observed)
         transcript = self._render_transcript(window)
         if not transcript.strip():
             return False
@@ -3077,7 +3163,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.info("ambient.voice: marked chat=%s for text-twin suppression", chat_id)
         return result
 
-    def _scrub_outbound(self, content: str) -> str | None:
+    def _scrub_outbound(self, content: str, chat_id: Any = None) -> str | None:
         """Clean a reply before it goes out.
 
         Returns the cleaned text, or None when the message was nothing but
@@ -3134,6 +3220,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 text[:160],
             )
             text = cleaned
+
+        text = self._resolve_plain_mentions(text, chat_id)
 
         # A leaked media narration is always a bug: it is the model describing a
         # tool result instead of letting the platform deliver it, and it puts a
@@ -3428,7 +3516,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # for exactly like a [SILENT] one: it never went out, so it must not be
         # charged to the bot-bounce pair.
         if isinstance(content, str):
-            scrubbed = self._scrub_outbound(content)
+            scrubbed = self._scrub_outbound(content, chat_id)
             if scrubbed is None:
                 self._bounce_discard_pending(reply_to)
                 self._catchup_discard_pending(reply_to)

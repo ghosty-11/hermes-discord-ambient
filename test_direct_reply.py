@@ -64,11 +64,13 @@ class RepliedMessage:
 
 
 class RawMessage:
-    def __init__(self, reference, message_id="200"):
+    def __init__(self, reference, message_id="200", author=None, mentions=None):
         self.reference = reference
         self.id = message_id
         self.content = "good girl"
-        self.mentions = []
+        self.author = author
+        self.mentions = mentions or []
+        self.channel = types.SimpleNamespace(id="channel-1")
 
 
 def make_adapter():
@@ -78,6 +80,7 @@ def make_adapter():
                 "enabled": True,
                 "silent_marker": "[SILENT]",
                 "direct_silence_fallback": "I'm here.",
+                "text_hygiene": {"resolve_plain_mentions": True},
             }
         }
     )
@@ -105,6 +108,11 @@ async def main():
     check("reply author name is preserved", event.reply_to_author_name == "Muse")
     check("reply to this bot is marked as own", event.reply_to_is_own_message is True)
     check("reply to this bot is a direct turn", adapter._event_is_direct(event) is True)
+    check(
+        "own reply text is not relabeled as another person",
+        event.reply_to_text == "photo response",
+        repr(event.reply_to_text),
+    )
 
     other_event = MessageEvent(
         text="good point",
@@ -125,6 +133,11 @@ async def main():
     check(
         "replying to another person is not promoted to a direct turn",
         adapter._event_is_direct(other_event) is False,
+    )
+    check(
+        "reply context names the other person",
+        other_event.reply_to_text == "Alice wrote: earlier text",
+        repr(other_event.reply_to_text),
     )
 
     print("\n-- direct scope reaches request middleware and response filter --")
@@ -182,6 +195,33 @@ async def main():
         "the completed direct marker is consumed exactly once",
         len(sent) == 1,
         repr(sent),
+    )
+
+    print("\n-- known Discord handles become real mentions --")
+    speaker = Author(123, "alice.account")
+    speaker.display_name = "Alice"
+    inbound = RawMessage(None, author=speaker)
+    adapter._remember_discord_identities(inbound)
+    await adapter.send("channel-1", "Thanks, @Alice!", reply_to="202")
+    check(
+        "a known display name is rendered as a Discord user mention",
+        sent[-1][1] == "Thanks, <@123>!",
+        repr(sent[-1]),
+    )
+    await adapter.send("channel-1", "Hello, @unknown!", reply_to="203")
+    check(
+        "an unknown handle is left as ordinary text",
+        sent[-1][1] == "Hello, @unknown!",
+        repr(sent[-1]),
+    )
+    collision = Author(456, "second.account")
+    collision.display_name = "Alice"
+    adapter._remember_discord_identities(RawMessage(None, author=collision))
+    await adapter.send("channel-1", "Thanks, @Alice!", reply_to="204")
+    check(
+        "a reused display name is left ambiguous instead of guessed",
+        sent[-1][1] == "Thanks, @Alice!",
+        repr(sent[-1]),
     )
 
     print()
