@@ -50,12 +50,16 @@ def make_adapter():
                 "gateway_lifecycle": {
                     "enabled": True,
                     "shrine_channel": "shrine",
-                    "departure_messages": ["curling up beside the shrine flame"],
-                    "return_messages": ["the shrine flame is awake again"],
+                    "shrine_probability": 0.4,
+                    "inference": {
+                        "enabled": True,
+                        "task": "title_generation",
+                        "timeout_seconds": 20,
+                        "persona_prompt": "A poised cat goddess with playful warmth.",
+                    },
                     "public_return": {
                         "channel": "general",
-                        "probability": 0.5,
-                        "messages": ["a familiar tail slips back into the room"],
+                        "probability": 0.25,
                     },
                 },
                 "embed_media": {
@@ -87,22 +91,43 @@ async def check_lifecycle():
         sent.append((chat_id, content))
         return types.SimpleNamespace(success=True, message_id=f"sent-{len(sent)}")
 
+    generated = {
+        "shrine_return": "generated shrine return",
+        "public_return": "generated public return",
+        "shrine_departure": "generated shrine departure",
+    }
+
+    def fake_generate(self, events):
+        return {event: generated[event] for event in events}
+
+    async def finish_generation(adapter):
+        task = getattr(adapter, "_lifecycle_generation_task", None)
+        if task is not None:
+            await task
+
     with (
         patch.object(discord_adapter.DiscordAdapter, "connect", base_connect),
         patch.object(discord_adapter.DiscordAdapter, "disconnect", base_disconnect),
         patch.object(ambient.AmbientDiscordAdapter, "send", fake_send),
-        patch.object(ambient.random, "random", return_value=0.49),
+        patch.object(
+            ambient.AmbientDiscordAdapter,
+            "_generate_lifecycle_copy",
+            fake_generate,
+            create=True,
+        ),
+        patch.object(ambient.random, "random", side_effect=[0.39, 0.24, 0.39]),
     ):
         adapter = make_adapter()
         await adapter.connect(is_reconnect=False)
+        await finish_generation(adapter)
         check(
-            "initial connect always greets the shrine",
-            ("shrine", "the shrine flame is awake again") in sent,
+            "a roll below 0.4 sends a model-generated shrine return",
+            ("shrine", "generated shrine return") in sent,
             repr(sent),
         )
         check(
-            "a roll below 0.5 also greets public general",
-            ("general", "a familiar tail slips back into the room") in sent,
+            "a roll below 0.25 sends a model-generated public return",
+            ("general", "generated public return") in sent,
             repr(sent),
         )
         before = list(sent)
@@ -112,7 +137,15 @@ async def check_lifecycle():
         adapter.gateway_runner._draining = False
         await adapter.disconnect()
         check("non-gateway disconnect emits no departure", sent == before, repr(sent))
-        check("base disconnect still runs", len(base_disconnects) == 1)
+
+        adapter.gateway_runner._draining = True
+        await adapter.disconnect()
+        check(
+            "a roll below 0.4 sends the cached model-generated shrine departure",
+            ("shrine", "generated shrine departure") in sent,
+            repr(sent),
+        )
+        check("base disconnect still runs", len(base_disconnects) == 2)
 
     sent.clear()
     base_disconnects.clear()
@@ -120,26 +153,81 @@ async def check_lifecycle():
         patch.object(discord_adapter.DiscordAdapter, "connect", base_connect),
         patch.object(discord_adapter.DiscordAdapter, "disconnect", base_disconnect),
         patch.object(ambient.AmbientDiscordAdapter, "send", fake_send),
-        patch.object(ambient.random, "random", return_value=0.50),
+        patch.object(
+            ambient.AmbientDiscordAdapter,
+            "_generate_lifecycle_copy",
+            fake_generate,
+            create=True,
+        ),
+        patch.object(ambient.random, "random", side_effect=[0.40, 0.25, 0.40]),
     ):
         adapter = make_adapter()
         await adapter.connect(is_reconnect=False)
+        await finish_generation(adapter)
         check(
-            "the 50 percent boundary does not post publicly",
-            all(chat_id != "general" for chat_id, _ in sent),
+            "the exact 40 and 25 percent boundaries stay silent",
+            sent == [],
             repr(sent),
         )
         adapter.gateway_runner._draining = True
         await adapter.disconnect()
         check(
-            "graceful gateway drain announces departure in the shrine",
-            ("shrine", "curling up beside the shrine flame") in sent,
+            "a losing shrine departure roll stays silent",
+            sent == [],
             repr(sent),
         )
         before = list(sent)
         await adapter.disconnect()
         check("departure is emitted at most once", sent == before, repr(sent))
         check("base disconnect runs on every teardown call", len(base_disconnects) == 2)
+
+
+def check_lifecycle_generation():
+    print("\n-- gateway lifecycle inference --")
+    adapter = make_adapter()
+    generator = getattr(adapter, "_generate_lifecycle_copy", None)
+    check(
+        "lifecycle copy has a model-inference path",
+        callable(generator),
+        repr(generator),
+    )
+    if not callable(generator):
+        return
+
+    calls = []
+
+    def run_oneshot(**kwargs):
+        calls.append(kwargs)
+        return (
+            '{"shrine_return":"A new shrine line",'
+            '"public_return":"A new public line"}'
+        )
+
+    fake_oneshot = types.SimpleNamespace(run_oneshot=run_oneshot)
+    with patch.dict(sys.modules, {"agent.oneshot": fake_oneshot}):
+        copy = generator(["shrine_return", "public_return"])
+    check("one model call generates all selected events", len(calls) == 1, repr(calls))
+    check(
+        "the configured auxiliary task is used",
+        calls and calls[0].get("task") == "title_generation",
+        repr(calls),
+    )
+    check(
+        "private persona context reaches the model prompt",
+        calls
+        and "A poised cat goddess with playful warmth."
+        in calls[0].get("instructions", ""),
+        repr(calls),
+    )
+    check(
+        "generated JSON becomes event-specific copy",
+        copy
+        == {
+            "shrine_return": "A new shrine line",
+            "public_return": "A new public line",
+        },
+        repr(copy),
+    )
 
 
 async def check_embed_media():
@@ -204,6 +292,7 @@ async def check_embed_media():
 
 async def main():
     await check_lifecycle()
+    check_lifecycle_generation()
     await check_embed_media()
     print()
     if FAILURES:

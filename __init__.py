@@ -180,6 +180,30 @@ from plugins.platforms.discord import adapter as _bundled  # type: ignore
 
 logger = logging.getLogger(__name__)
 
+_LIFECYCLE_EVENT_BRIEFS = {
+    "shrine_return": (
+        "Privately return to the persona's home channel after a short rest. "
+        "Warm and intimate, not an announcement."
+    ),
+    "public_return": (
+        "Casually re-enter a lively public community channel. Keep it understated; "
+        "do not demand attention or imply anyone was waiting."
+    ),
+    "shrine_departure": (
+        "Privately settle down in the persona's home channel for rest. "
+        "Gentle and brief, with no operational language."
+    ),
+}
+
+_LIFECYCLE_COPY_INSTRUCTIONS = (
+    "Write fresh, in-character Discord lifecycle lines for the persona described below. "
+    "Each requested value must be one natural first-person line, roughly 6-25 words. "
+    "Vary imagery and wording from run to run. Never mention a bot, gateway, restart, "
+    "server, process, deployment, system, or outage. Do not tag anyone, use links, quote "
+    "prior copy, or add markdown fences. Return only one JSON object whose keys exactly "
+    "match the requested event names and whose values are the lines."
+)
+
 # ── Voice-side hygiene ──────────────────────────────────────────────────────
 # Kaomoji are ordinary punctuation and letters, so Hermes' own _EMOJI_RE (which
 # targets pictograph codepoints) never touches them and TTS reads them aloud as
@@ -894,6 +918,13 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # masquerade as the profile going to sleep and waking up.
         self._lifecycle_return_sent: bool = False
         self._lifecycle_departure_sent: bool = False
+        # Lifecycle inference happens after Discord has connected, in one
+        # background one-shot whose task inherits the profile runtime scope.
+        # This keeps model latency outside the gateway's 30-second adapter
+        # connect budget. Any selected departure is cached for shutdown, so
+        # the five-second disconnect budget never waits on inference.
+        self._lifecycle_generation_task: Any = None
+        self._lifecycle_departure_copy: str | None = None
         # Per-channel, observed Discord identities used to turn a model's
         # plain ``@display-name`` into the wire form Discord actually pings.
         # Values are sets because reused display names must stay ambiguous.
@@ -1041,21 +1072,90 @@ class AmbientDiscordAdapter(DiscordAdapter):
         return self._sub("gateway_lifecycle")
 
     @staticmethod
-    def _message_choices(value: Any) -> list[str]:
-        if isinstance(value, str):
-            value = [value]
-        if not isinstance(value, (list, tuple)):
-            return []
-        return [str(item).strip() for item in value if str(item).strip()]
+    def _lifecycle_probability(value: Any, default: float) -> float:
+        try:
+            return min(1.0, max(0.0, float(value)))
+        except (TypeError, ValueError):
+            return default
 
-    async def _send_lifecycle_message(self, channel: Any, messages: Any, *, label: str) -> bool:
+    @staticmethod
+    def _clean_lifecycle_copy(value: Any) -> str:
+        text = " ".join(str(value or "").split()).strip().strip('"')
+        if not text:
+            return ""
+        lowered = text.lower()
+        forbidden = (
+            "http://",
+            "https://",
+            "@everyone",
+            "@here",
+            "```",
+            "[silent]",
+            "no_reply",
+            "gateway",
+            "restart",
+            "systemd",
+            "server",
+            "process",
+            "deployment",
+            "outage",
+        )
+        if any(item in lowered for item in forbidden):
+            return ""
+        return text[:280].rstrip()
+
+    def _generate_lifecycle_copy(self, events: list[str]) -> dict[str, str]:
+        cfg = self._lifecycle_cfg()
+        inference = cfg.get("inference")
+        if not isinstance(inference, dict) or not inference.get("enabled"):
+            return {}
+        persona = " ".join(str(inference.get("persona_prompt") or "").split()).strip()
+        if not persona:
+            logger.warning("ambient.lifecycle: persona_prompt missing; staying silent")
+            return {}
+        selected = [event for event in events if event in _LIFECYCLE_EVENT_BRIEFS]
+        if not selected:
+            return {}
+
+        from agent.oneshot import run_oneshot
+
+        task = str(inference.get("task") or "title_generation").strip()
+        try:
+            timeout = min(30.0, max(3.0, float(inference.get("timeout_seconds", 20))))
+        except (TypeError, ValueError):
+            timeout = 20.0
+        requested = {event: _LIFECYCLE_EVENT_BRIEFS[event] for event in selected}
+        raw = run_oneshot(
+            instructions=(
+                f"{_LIFECYCLE_COPY_INSTRUCTIONS}\n\nPersona context:\n{persona[:1200]}"
+            ),
+            user_input=json.dumps(requested, ensure_ascii=False, sort_keys=True),
+            task=task or "title_generation",
+            max_tokens=240,
+            temperature=0.9,
+            timeout=timeout,
+        )
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            logger.warning("ambient.lifecycle: inference returned invalid JSON")
+            return {}
+        if not isinstance(decoded, dict):
+            return {}
+        return {
+            event: cleaned
+            for event in selected
+            if (cleaned := self._clean_lifecycle_copy(decoded.get(event)))
+        }
+
+    async def _send_lifecycle_message(self, channel: Any, content: Any, *, label: str) -> bool:
         channel_id = str(channel or "").strip()
-        choices = self._message_choices(messages)
-        if not channel_id or not choices:
-            logger.warning("ambient.lifecycle: %s skipped (channel or messages missing)", label)
+        text = self._clean_lifecycle_copy(content)
+        if not channel_id or not text:
+            logger.info("ambient.lifecycle: %s stayed silent", label)
             return False
         try:
-            result = await self.send(channel_id, random.choice(choices))
+            result = await self.send(channel_id, text)
             success = bool(getattr(result, "success", False))
             if success:
                 logger.info("ambient.lifecycle: %s sent to %s", label, channel_id)
@@ -1066,28 +1166,60 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.warning("ambient.lifecycle: %s send raised", label, exc_info=True)
             return False
 
-    async def _announce_gateway_return(self) -> None:
+    def _select_gateway_lifecycle_events(self) -> list[str]:
         cfg = self._lifecycle_cfg()
         if not self._ambient_enabled() or not cfg.get("enabled"):
-            return
-        await self._send_lifecycle_message(
-            cfg.get("shrine_channel"),
-            cfg.get("return_messages"),
-            label="return",
+            return []
+        shrine_probability = self._lifecycle_probability(
+            cfg.get("shrine_probability"), 0.4
         )
+        events = []
+        if random.random() < shrine_probability:
+            events.append("shrine_return")
         public = cfg.get("public_return")
-        if not isinstance(public, dict):
-            return
+        if isinstance(public, dict):
+            probability = self._lifecycle_probability(
+                public.get("probability"), 0.25
+            )
+            if random.random() < probability:
+                events.append("public_return")
+        if random.random() < shrine_probability:
+            events.append("shrine_departure")
+        return events
+
+    async def _prepare_gateway_lifecycle(self, events: list[str]) -> None:
         try:
-            probability = min(1.0, max(0.0, float(public.get("probability", 0.5))))
-        except (TypeError, ValueError):
-            probability = 0.5
-        if random.random() < probability:
+            copy = await asyncio.to_thread(self._generate_lifecycle_copy, events)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("ambient.lifecycle: inference failed; staying silent", exc_info=True)
+            return
+
+        self._lifecycle_departure_copy = copy.get("shrine_departure")
+        cfg = self._lifecycle_cfg()
+        if "shrine_return" in events:
+            await self._send_lifecycle_message(
+                cfg.get("shrine_channel"),
+                copy.get("shrine_return"),
+                label="return",
+            )
+        public = cfg.get("public_return")
+        if "public_return" in events and isinstance(public, dict):
             await self._send_lifecycle_message(
                 public.get("channel"),
-                public.get("messages"),
+                copy.get("public_return"),
                 label="public return",
             )
+
+    async def _announce_gateway_return(self) -> None:
+        events = self._select_gateway_lifecycle_events()
+        if not events:
+            logger.info("ambient.lifecycle: all lifecycle rolls stayed silent")
+            return
+        self._lifecycle_generation_task = asyncio.create_task(
+            self._prepare_gateway_lifecycle(events)
+        )
 
     async def _announce_gateway_departure(self) -> None:
         cfg = self._lifecycle_cfg()
@@ -1095,9 +1227,19 @@ class AmbientDiscordAdapter(DiscordAdapter):
             return
         await self._send_lifecycle_message(
             cfg.get("shrine_channel"),
-            cfg.get("departure_messages"),
+            self._lifecycle_departure_copy,
             label="departure",
         )
+
+    async def cancel_background_tasks(self) -> None:
+        task = self._lifecycle_generation_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await super().cancel_background_tasks()
 
     # ---- Discord rich-embed video ingress ------------------------------
     def _embed_media_cfg(self) -> dict:
