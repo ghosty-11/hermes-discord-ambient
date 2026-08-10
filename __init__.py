@@ -898,6 +898,10 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # plain ``@display-name`` into the wire form Discord actually pings.
         # Values are sets because reused display names must stay ambiguous.
         self._discord_identities: dict[str, dict[str, set[str]]] = {}
+        # At most one bounded history read per channel and process. This fills
+        # the ambient gap where the model names someone who was not in the
+        # narrow transcript window that triggered the turn.
+        self._mention_history_scanned: set[str] = set()
 
     # ---- config ---------------------------------------------------------
     def _ambient_cfg(self) -> dict:
@@ -2281,6 +2285,46 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.debug("ambient: plain Discord mention resolution failed", exc_info=True)
             return content
 
+    async def _refresh_plain_mention_history(self, content: str, chat_id: Any) -> None:
+        """Observe recent channel authors before resolving an ambient mention.
+
+        The reactive path normally learns the current speaker directly. An
+        idle catch-up can instead mention an earlier participant outside its
+        short prompt window. Read a bounded slice of that same channel once,
+        using Discord message objects as the identity source; never search
+        another channel or guess from model text.
+        """
+        if not self._hygiene_cfg().get("resolve_plain_mentions", False):
+            return
+        if not isinstance(content, str) or not re.search(r"(?<![\w@<])@\w", content):
+            return
+        channel_id = str(chat_id or "")
+        if not channel_id or channel_id in self._mention_history_scanned:
+            return
+        try:
+            client = getattr(self, "_client", None)
+            if client is None or not hasattr(client, "get_channel"):
+                return
+            lookup = int(channel_id) if channel_id.isdigit() else chat_id
+            channel = client.get_channel(lookup)
+            if channel is None or not hasattr(channel, "history"):
+                return
+            self._mention_history_scanned.add(channel_id)
+            configured = int(self._hygiene_cfg().get("mention_history_limit", 50))
+            limit = max(1, min(configured, 100))
+            observed = 0
+            async for message in channel.history(limit=limit):
+                self._remember_discord_identities(message)
+                observed += 1
+            logger.info(
+                "ambient: observed %d recent channel message(s) for mention resolution",
+                observed,
+            )
+        except Exception:
+            # Resolution remains fail-closed: an unavailable history leaves the
+            # model's plain text untouched and cannot ping the wrong person.
+            logger.debug("ambient: mention history refresh failed", exc_info=True)
+
     # ---- system-notice rerouting ------------------------------------------
     def _system_notice_target(self, content: Any, chat_id: Any) -> str | None:
         """Channel id to reroute an operator-facing notice to, or None.
@@ -3516,6 +3560,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # for exactly like a [SILENT] one: it never went out, so it must not be
         # charged to the bot-bounce pair.
         if isinstance(content, str):
+            await self._refresh_plain_mention_history(content, chat_id)
             scrubbed = self._scrub_outbound(content, chat_id)
             if scrubbed is None:
                 self._bounce_discard_pending(reply_to)

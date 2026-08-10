@@ -73,6 +73,20 @@ class RawMessage:
         self.channel = types.SimpleNamespace(id="channel-1")
 
 
+class HistoryChannel:
+    def __init__(self, channel_id, messages):
+        self.id = channel_id
+        self._messages = messages
+
+    def history(self, *, limit):
+        async def rows():
+            for message in self._messages[:limit]:
+                message.channel = self
+                yield message
+
+        return rows()
+
+
 def make_adapter():
     config = types.SimpleNamespace(
         extra={
@@ -212,6 +226,23 @@ async def main():
     check(
         "an unknown handle is left as ordinary text",
         sent[-1][1] == "Hello, @unknown!",
+        repr(sent[-1]),
+    )
+    older = Author(321, "garden.account")
+    older.display_name = "GardenMuse"
+    history_channel = HistoryChannel(
+        "channel-1", [RawMessage(None, author=older)],
+    )
+    adapter._client = types.SimpleNamespace(
+        user=Author(999, "Muse"),
+        get_channel=lambda channel_id: history_channel,
+    )
+    await adapter.send(
+        "channel-1", "The room saved a story for @GardenMuse!", reply_to="203b",
+    )
+    check(
+        "an ambient name from recent channel history becomes a real mention",
+        sent[-1][1] == "The room saved a story for <@321>!",
         repr(sent[-1]),
     )
     collision = Author(456, "second.account")
