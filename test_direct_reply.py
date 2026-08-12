@@ -176,6 +176,12 @@ async def main():
         repr(messages),
     )
     check(
+        "the directive is not a non-leading system row (Hetzner system-first 400)",
+        bool(messages) and messages[-1].get("role") == "user"
+        and not any(m.get("role") == "system" for m in messages[1:]),
+        repr([m.get("role") for m in messages]),
+    )
+    check(
         "gateway does not swallow a direct silence token",
         seen.get("suppressed") is False,
         repr(seen.get("suppressed")),

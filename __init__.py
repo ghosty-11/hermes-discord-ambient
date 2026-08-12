@@ -4305,6 +4305,13 @@ def _on_llm_request_ambient_hint(**kwargs: Any):
     intact (AGENTS.md prompt-cache invariant), and a trailing instruction is the
     position models weight most heavily — which is the whole point of a directive.
 
+    Appended as a USER row, not system: several OpenAI-compatible providers
+    enforce system-first message order and reject any non-leading system row
+    with HTTP 400 "System message must be at the beginning" (observed live
+    2026-08-11/12). A trailing system directive silently killed the primary
+    model lane on every ambient turn and pushed the seat onto its fallback.
+    The bracketed hint text keeps it reading as a directive.
+
     Nothing here may raise. A failure returns None and the turn proceeds with the
     stock payload; losing a hint costs one over-chatty reply, while raising would
     cost the whole conversation.
@@ -4324,7 +4331,7 @@ def _on_llm_request_ambient_hint(**kwargs: Any):
         if not isinstance(messages, list) or not messages:
             return None
         patched = dict(request)
-        patched["messages"] = list(messages) + [{"role": "system", "content": hint}]
+        patched["messages"] = list(messages) + [{"role": "user", "content": hint}]
         kind = "direct-address" if _direct_address.get(False) else "ambient"
         logger.info(
             "ambient: %s directive delivered via llm_request middleware (request-only)",
