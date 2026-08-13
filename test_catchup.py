@@ -193,6 +193,7 @@ def stub_dispatch():
         seen["msg"] = message
         seen["hint"] = amb._ambient_hint.get("")
         seen["open"] = amb._ambient_open.get()
+        seen["speaker"] = amb._speaker_context.get(("", None))
         return True
 
     _ad.DiscordAdapter._dispatch_discord_message = fake
@@ -225,6 +226,16 @@ async def main():
     check("mention gates were open for the re-dispatch", d.get("open") is True)
     check("target is the newest human message", getattr(d.get("msg"), "id", None) == 42423)
     check("silence is offered as the default", "[SILENT]" in hint)
+    check(
+        "speaker identity reaches the catch-up request",
+        d.get("speaker", ("", None))[0].startswith("[speaker @bob id:2]"),
+        repr(d.get("speaker")),
+    )
+    check(
+        "catch-up speaker identity is cleared after dispatch",
+        amb._speaker_context.get(("", None)) == ("", None),
+        repr(amb._speaker_context.get(("", None))),
+    )
 
     print("\n-- the echo rule must catch every bracketed line of that hint --")
     for i, line in enumerate(hint.splitlines()):

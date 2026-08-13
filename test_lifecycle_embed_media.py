@@ -55,7 +55,7 @@ def make_adapter():
                         "enabled": True,
                         "task": "title_generation",
                         "timeout_seconds": 20,
-                        "persona_prompt": "A poised cat goddess with playful warmth.",
+                        "persona_prompt": "A warm community regular with playful energy.",
                     },
                     "public_return": {
                         "channel": "general",
@@ -215,7 +215,7 @@ def check_lifecycle_generation():
     check(
         "private persona context reaches the model prompt",
         calls
-        and "A poised cat goddess with playful warmth."
+        and "A warm community regular with playful energy."
         in calls[0].get("instructions", ""),
         repr(calls),
     )

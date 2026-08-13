@@ -1,44 +1,17 @@
 name: discord-ambient
 label: Discord (ambient presence)
 kind: platform
-version: 1.22.1
+version: 1.23.0
 description: >
-  Subclasses the bundled Discord adapter to add opt-in "ambient presence":
-  a profile may occasionally join conversations it was not mentioned in
-  (hard rate-limited), and may decline to speak by answering with a
-  [SILENT] sentinel that the adapter swallows. Profiles that do not set
-  DISCORD_AMBIENT_ENABLED=true behave exactly like stock Discord.
-  Also adds an opt-in catch-up scanner: a free timer that notices when a
-  conversation went by without her considering it, and hands it to the normal
-  ambient path with a transcript attached. Subordinate to the same budget, so
-  it changes what she knows rather than how often she speaks.
-  Direct replies are annotated with their replied-to author and cannot be
-  silently swallowed: a model-emitted silence marker becomes a small fallback.
-  Optional gateway lifecycle messages use bounded background model generation
-  for fresh graceful-departure and return copy, while Discord-proxied rich-embed
-  videos enter the stock bounded media pipeline and can receive local
-  transcription plus video analysis.
-  Built for an always-on agent host, 2026-08-04.
+  Subclasses the bundled Discord adapter to add opt-in ambient presence.
+  A profile may occasionally join conversations it was not mentioned in,
+  decline to speak with a [SILENT] sentinel, react, catch up on missed
+  rooms, and keep operator plumbing out of public channels. Profiles
+  without platforms.discord.extra.ambient_presence.enabled behave like
+  stock Discord. Config is YAML under that block, not process-wide env
+  vars — under a multiplexed gateway every profile shares one process.
 author: ghosty
 optional_env:
-  - name: DISCORD_AMBIENT_ENABLED
-    description: "Enable ambient presence for this profile (true/false)"
-    password: false
-  - name: DISCORD_AMBIENT_CHANNELS
-    description: "Comma-separated channel IDs where ambient joining is allowed (required; no wildcard)"
-    password: false
-  - name: DISCORD_AMBIENT_COOLDOWN_SECONDS
-    description: "Minimum seconds between unprompted messages (default 1800)"
-    password: false
-  - name: DISCORD_AMBIENT_MAX_PER_DAY
-    description: "Rolling 24h cap on unprompted messages (default 12)"
-    password: false
-  - name: DISCORD_AMBIENT_PROBABILITY
-    description: "Chance a qualifying message triggers a join, 0-1 (default 0.12)"
-    password: false
-  - name: DISCORD_AMBIENT_NAME_TRIGGERS
-    description: "Comma-separated plain-text names that always trigger consideration"
-    password: false
-  - name: DISCORD_AMBIENT_SILENT_MARKER
-    description: "Sentinel response that is swallowed instead of sent (default [SILENT])"
-    password: false
+  - name: KLIPY_API_KEY
+    description: "Klipy API key for gif_search (profile .env; tool stays hidden without it)"
+    password: true

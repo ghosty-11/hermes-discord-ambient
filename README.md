@@ -3,11 +3,11 @@
 [![Support this work](https://img.shields.io/badge/Support-EVM-6f42c1?logo=ethereum&logoColor=white)](#support-development)
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) user plugin that gives a
-Discord bot **ambient presence** — the ability to lurk in a community, react, occasionally
-join a conversation it wasn't addressed in, and decide *not* to speak.
+Discord bot **ambient presence** — lurk in a community, react, occasionally join a
+conversation it was not addressed in, and decide not to speak.
 
-Built for an always-on agent host so one profile — a community chatbot — could
-behave like a person in a room rather than either a mute or a reply-to-everything bot.
+Built so one profile — a community chatbot — can behave like a person in a room rather
+than a mute or a reply-to-everything bot.
 
 ## The problem
 
@@ -17,136 +17,64 @@ Hermes' chat gate is binary. A bot either answers **every** message in a channel
 
 The obvious extension points don't help:
 
-- **Gateway hooks** (`agent:start`, `agent:end`, …) are fire-and-forget observers. Only
-  `pre_tool_call` can veto anything, and only for tools.
-- **`[SILENT]` suppression** is global at the gateway boundary. It does not know whether a
-  Discord turn was ambient or directly addressed, so the plugin must preserve that distinction.
+- **Gateway hooks** are fire-and-forget observers. Only `pre_tool_call` can veto, and only for tools.
+- **`[SILENT]` suppression** is global at the gateway boundary. It does not know whether a Discord turn was ambient or directly addressed.
 
 ## What it adds
 
-All opt-in per profile. A profile without the config block behaves **byte-identically to
-stock Discord**, which is what makes it safe to enable on a host where other profiles run
-serious work.
+All opt-in per profile. A profile without `ambient_presence.enabled` behaves like stock Discord.
 
-| Behaviour | Cost | Notes |
+| Behaviour | Cost | What it does |
 |---|---|---|
-| **Ambient joining** | 1 inference | A message the stock gate rejects for lacking a mention may be re-dispatched as if the channel were free-response. Random joins are rate-limited by cooldown, daily cap and probability. Plain-text name triggers (which Discord's @-detection misses entirely) **bypass both** — typing the bot's name is addressing it, and "not now, I spoke recently" reads as broken; only a short anti-spam floor applies. The budget is charged only when a join actually reaches the agent, since the re-dispatch can still be refused by an auth gate. |
-| **Silence** | — | The model may answer with a sentinel (`[SILENT]`) which the adapter swallows, so it can see a message and decide not to speak. |
-| **Direct-reply guarantee** | **zero** | Discord admits a reply-ping as a mention but upstream omits the replied-to author's identity from `MessageEvent`, so the model sees a generic quote and may copy prior ambient `[SILENT]` turns. The plugin restores `reply_to_author_*` and `reply_to_is_own_message`, adds a request-only direct-address directive, and deterministically converts a direct silence token into `direct_silence_fallback` (default `I'm here.`). DMs, explicit mentions, plain-text name triggers, and replies to the profile's own message count as direct. Unaddressed ambient silence is unchanged. |
-| **Reply-target attribution** | **zero** | Hermes carries the replied-to author's fields but renders replies to other people as an unattributed quote. The plugin labels that quote with the resolved Discord author, while preserving the runner's stronger “your previous message” label for replies to the bot. This keeps an ambient participant from treating somebody else's exchange as speech directed at itself. |
-| **Reactions** | **zero** | Messages it doesn't answer may still get an emoji reaction, chosen by regex→emoji rules with a fallback pool. Costs no inference at all — the difference between a bot that feels present and one that feels absent between slow or expensive replies. People react far more often than they reply. |
-| **Return greetings** | 1 inference | Someone's first message after N days away is prioritised over the dice, with a hint telling the model they've been gone. Last-seen state persists across restarts. |
-| **Rotating presence** | **zero** | Custom status rotated from a list on a background task. |
-| **No-thread mode** | **zero** | Per-profile kill switch for auto-threading. Upstream reads `DISCORD_AUTO_THREAD` via `os.getenv()` — process-wide — so under multiplex one profile's preference silently overrides every other profile's. This restores per-profile control by adding the channel to the no-thread set (NOT by failing thread creation — upstream treats that as an error and drops the message). |
-| **Bot bounce** | **zero** while suppressing, 1 inference for the goodbye | Circuit breaker for bot-to-bot volleys under `DISCORD_ALLOW_BOTS`. Two bots whose replies auto-@mention each other volley forever — upstream documents the topology as unsupported, with no breaker. Two independent dials. `probability` (default 1.0) decides how *often* an exchange happens at all — each bot message is answered only on a winning roll, and a losing roll leaves the pair untouched, so it neither starts the renewal clock nor spends one of the rolled replies. `min_replies`/`max_replies` bound how *long* one runs once it starts: after that many replies to a given bot in a channel (limit rolled per conversation, so the patience varies), the last allowed reply carries a goodbye hint and every later message from that bot is dropped **before** admission: no inference, no reply. A human speaking in the channel resets the pair, as does `reset_after_seconds` of quiet. Humans are never gated, and `[SILENT]` replies never count against the limit. |
-| **Fleet standby** | **zero** while holding | For hosts where several profiles share ONE inference slot (local CPU model). A dispatch arriving while any other agent turn or agent-mode cron job is running is *held* — the message's own coroutine sleeps, polling — and released the moment the slot frees; at `max_wait_seconds` it dispatches anyway, so standby can only ever delay a reply, never eat one. Opportunistic dice-roll joins are skipped outright while busy; named triggers and return greetings still answer. Every failure in the busy probe answers "not busy". With `only_when_local: true`, a profile whose primary model is *hosted* engages standby only while it is actually running on a local fallback model (observed via the fallback-switch notice, for `local_fallback_ttl_seconds`) — cloud turns are never held, so the higher-priority local profile keeps the slot exactly when contention is real. |
-| **Fallback-notice suppression** | **zero** | Upstream announces a provider/model fallback switch with a one-shot status send ("🔄 Switched to fallback model: …"). Right for an operator channel, noise (and an internals leak) in a public community room. `suppress_fallback_notice: true` swallows it for this profile only — logged, never posted — while every other profile keeps the operator-facing notice. Suppressed or not, the notice is parsed as the local-fallback signal that drives `only_when_local` standby. |
-| **Group-address greetings** | 1 inference when it answers | "good morning agents" / "hello everyone" is addressed to the room — not a mention, not a name trigger, but ignoring it reads as absent. Opt-in `group_address` matches greeting+collective regex pairs (both words required, close together — a bare "agents" mid-sentence never triggers) and answers at its own probability (default 0.6) and short cooldown (default 300s), exempt from the daily cap: being spoken to is not inserting herself. |
-| **System-notice rerouting** | **zero** | Cron delivery failures (`⚠️ Cron 'x' failed: …`) and the cron wrapper header are posted to whatever channel the job delivers to — for a social profile, the community room, where the bot's own plumbing does not belong. `system_notices.reroute_channel` sends them to a private channel instead: rerouted, never dropped, so the operator still sees every failure. Pairs with `cron.wrap_response: false`, which removes the `Cronjob Response / job_id / "to stop this job"` framing from normal deliveries. |
-| **Speaker identity** | **zero** | Upstream labels every inbound message with the author's *display name* (hardcoded, no config). Display names are per-guild, user-editable and freely reused — an agent writing durable notes keyed on one will merge two people, or lose someone the day they rename. Worse, an agent instructed to "record the user id" **cannot comply**: the id never reaches the model. `speaker_identity: true` prepends a compact `[speaker @handle id:123]` to the dispatched text (once, also on re-dispatch and backfill), so memory notes can key on the stable handle and numeric id. **Telling the agent never to echo the tag is not enough** — models infer "messages start with a speaker tag, I am writing a message, so mine starts with one too" and open a reply with a tag naming *themselves*. Ours did it with the id copied verbatim out of the example in its own instructions, despite two separate files forbidding it: a strong structural pattern beats a prose prohibition on a small model. The tag is injected by this plugin, so `strip_speaker_echo` (default true) removes it on the way out. Keep the prompt guidance too — belt and braces — but do not rely on it. |
-| **Speaker memory** | **zero** | Recall is normally left to the model — "look this person up before replying" — and that is an instruction, not a mechanism. Measured on one profile across four log files: **170 calls to the unconditional memory instruction against 10 to the conditional one**, same file, same agent, same session; the only variable was whether the model had to decide. Strengthening the wording had already been tried and did not move it. `speaker_memory.enabled` moves the lookup into the dispatch path instead: every message from an identified speaker arrives carrying what is already known about them, fetched by a subprocess at zero inference cost. Keyed on the **numeric id**, never the handle, because a rename would otherwise return the wrong person's history. Cached per speaker (default 300 s) so a busy channel does not spawn a subprocess per message. The agent may still call recall itself for a deeper search — this only guarantees the floor. |
-| **Speaker boost** | **zero** | Ambient presence is tuned for a room of strangers: a low dice-roll behind a long cooldown, so she is a presence rather than a chatterbox. That tuning is wrong for exactly one person — whoever runs the bot, who is the human most likely to actually want an answer and gets the same 15% as everyone else. `speaker_boost` overrides probability, cooldown and the daily cap per numeric user id. **Overriding the cooldown is the load-bearing half**: the daily cooldown gates the roll, so raising probability alone changes almost nothing. Keyed on the id, never the handle, so a rename cannot transfer someone else's boost. |
-| **Conversation window** | **zero** | Being addressed does not require being named. Someone answers what she just said, without an @-mention and without Discord's reply affordance — and every stock signal misses it, so the message is decided by a dice-roll tuned for a room of strangers. The agent ends up ignoring the reply to its own question. `conversation_window` gives messages landing in her wake a high response chance. Bounded **both** ways on purpose: message count alone would hold the window open across a quiet night, and elapsed time alone would hold it open through fifty messages of someone else's conversation. Being the second message after she spoke, four hours later, is not a reply to her. Overrides `speaker_boost` when both apply — continuing her conversation outranks generic per-person tuning. |
-| **Catch-up (idle check-in)** | **zero** per scan; 1 inference on a check-in | Every other path here is *reactive*: a message arrives and something decides about **that message**. So a conversation whose messages each lose their dice roll passes with the bot never having considered the conversation at all — from the room's side, indistinguishable from absence. A timer is the only thing that can close it, because the trigger is the *absence* of a decision. `catch_up` runs a scanner (not a speaker): every pass is free, nearly all end in a skip, and the most it can ever do is hand **one** real message to the normal ambient dispatch with a transcript of what she missed attached — request-only, never persisted. It fires only when she actually missed something: she is not the last speaker, at least `min_messages` humans have spoken since she was, the room has **settled** for `min_quiet_seconds` (a live exchange belongs to the per-message dice; arriving late into one is what reads as barging in) but has not gone **cold** past `max_age_seconds` (answering into a dead channel is the loudest possible way to be wrong, because hers is the only message anyone sees), the newest message has not been read before, and the dice agree. `channels: ["*"]` covers every room she can see and speak in (Discord's own permissions are the allowlist), pre-filtered for free via each channel's `last_message_id` so no API call is spent on a room that cannot qualify; a pass stops at the FIRST check-in, so widening the list changes where she may speak, never how often. A `startup_grace_seconds` window and a persisted budget stop a gateway restart from being a reason to speak. Subordinate to the shared ambient budget by default, so it cannot make her measurably more talkative, only better informed; and it is charged to that budget **at send**, so a check-in answered `[SILENT]` does not eat her ordinary cooldown. |
-| **Gateway lifecycle messages** | at most 1 background inference per initial connect | Independently roll for a private return, a future graceful-departure line and an optional public return. One profile-scoped model call generates fresh copy for every winning event; no configured message bank or canned fallback is used. Return copy posts after generation, while departure copy is cached so shutdown never waits on inference. Transport reconnects emit neither message, and a hard crash or power loss cannot reliably announce itself. |
-| **Rich-embed video ingress** | local STT; video inference only when used | Treat a rich embed's `video/mp4` as inbound video only when Discord supplied its own HTTPS `images-ext-*.discordapp.net` proxy. The stock attachment byte limits, cache, and video path note remain authoritative. Optionally transcribe the cached video locally before the turn; the existing `video_analyze` tool handles visual questions when the profile enables the `video` toolset. This covers FixupX and similar helpers without trusting their origin URL. |
-| **Compaction focus** | **zero** | When the context window fills, the compaction summary is written into the *most privileged position of the next window* — the top of what the agent reads. Hermes' summariser template is built for coding work (Goal, Progress, Decisions, Files, Remaining Work; its constraints field says "coding style"), so for a social agent it preserves the plumbing and discards the only thing that mattered: who these people are, what they shared, the rapport. The `compression` config has ~14 knobs and **no prompt keys**. The lever that does exist is `focus_topic`, appended last so it takes precedence and instructed to take **60–70% of the summary token budget** — already wired, but derived from the most recent user turns. Recency is the wrong axis here: what a companion must carry across a boundary is *who these people are*, which is durable, and which recency-based focus drops exactly when the window is longest and the relationship most established. `compaction_focus` sets a standing one. Unset = stock behaviour. |
-| **GIF search** | **zero** (one HTTP call) | Registers a `gif_search` tool returning an embeddable GIF URL from [Klipy](https://klipy.com/developers) — the successor to Tenor, whose API Google discontinued 2026-06-30. A tool rather than the bundled `gif-search` skill, because that skill drives curl+jq at a shell prompt and a public persona profile has no terminal (nor should it); Discord auto-embeds a bare URL, so a URL is all the agent needs. `content_filter: high` by default (the agent cannot preview what it posts), per-profile rate limits, and the tool is hidden entirely unless the profile sets `gif_search.enabled` **and** has `KLIPY_API_KEY` in its `.env`. Serves **animated WebP, not GIF**, by default: GIF is capped at a 256-colour palette, so gradients and dark scenes band into visible black blocks — WebP is 24-bit, roughly a third the bytes, and still embeds as an *image* (autoplays and loops inline, no player chrome), while `mp4`/`webm` are smaller still but render as a video embed. One trap worth knowing: the API's `format_filter` parameter reads like a search facet but actually strips the response to that single rendition, so requesting `format_filter=gif` makes every other format vanish from the payload. Omit it. |
-| **Media URL isolation** | **zero** | Discord hides the raw URL and renders only the media when a message's *entire* content is one media link — that is the whole reason a GIF from the built-in picker looks clean, and it is not something the API can be asked for. Models never post a bare URL; they wrap it in chatter, so a GIF reply arrives as visible link + text + embed underneath. `isolate_media_urls` (default true) sends the prose first, keeping the reply anchor, then each media URL as its own bare message. Matching is per whitespace token rather than one regex over the message, because a greedy URL pattern swallows trailing punctuation and the next word; trailing sentence punctuation is trimmed, query strings are ignored when testing the extension, and a message that is *already* a bare URL is left untouched. Bot-bounce is charged once for the pair, not once per message. |
-| **Discord mention resolution** | **zero** normally; one bounded history read per channel/process when needed | `resolve_plain_mentions` converts a model's plain `@display-name` to Discord's real `<@numeric-id>` wire form only when Discord itself supplied an unambiguous identity in that channel. Unknown or colliding names stay plain text rather than pinging the wrong person. Catch-up transcripts contribute their observed participants; when an ambient reply names someone outside that short window, the adapter inspects up to 50 recent messages from that same channel once per process. |
-| **Outbound text hygiene** | **zero** | Three scrubs on the way out (the third, speaker-tag echo, is described in the Speaker identity row above). **Control-token leakage** (always on): models trained on OpenAI's *harmony* format — gpt-oss and its many free-tier rebadges — express a tool call as `<|channel|>commentary to=functions.name<|message|>{…}`. When the serving endpoint fails to parse that back into a structured call, the raw control text falls through as ordinary content and the bot posts its own plumbing to the room. The envelope is parsed, not string-stripped (token-by-token removal leaves the channel name and the argument JSON visible): a `final` payload survives, a `commentary`/`analysis` payload or anything carrying a `to=functions.` recipient is suppressed outright and logged. **Em dashes** (opt-in, `no_em_dash`): every model reaches for them and they read as machine-written, which is exactly the tell an in-character persona should not have — rewritten to a spaced hyphen so the intended clause boundary survives, skipping fenced code, and leaving unspaced en dashes alone because those are numeric ranges. |
-| **Slash-command policy** | **zero** | Upstream shares ONE gate between chat admission and slash authorization, so an answer-everyone community profile also hands `/model`, `/reset`, … to every stranger — and under a multiplexed gateway the per-profile allow-all env flag may not even resolve on the interaction path, leaving the operator rejected while everyone chats freely. `slash_commands.allowed_channels` / `allowed_users` restrict slash invocations to explicit ids (matching invocations authorize directly; everything else gets the stock ephemeral rejection + admin alert). Chat is untouched. |
+| **Ambient joining** | 1 inference | Re-dispatch a mention-rejected message as free-response. Rate-limited by cooldown, daily cap and probability. Plain-text name triggers bypass the long cooldown (short anti-spam floor only). Budget is charged only when the join reaches the agent. |
+| **Silence** | — | The model may answer `[SILENT]`; the adapter swallows it. |
+| **Direct-reply guarantee** | zero | Restores replied-to author identity, marks DMs / mentions / name hits / replies-to-self as direct, and converts a direct silence token into `direct_silence_fallback` (default `I'm here.`). |
+| **Reply-target attribution** | zero | Labels a quote of someone else's message with that author's name so the bot does not treat it as speech to itself. |
+| **Reactions** | zero | Emoji on messages it does not answer. Regex rules plus a fallback pool. |
+| **Return greetings** | 1 inference | First message after N days away is prioritised, with a request-only hint. Last-seen is persisted per Discord bot account. |
+| **Rotating presence** | zero | Custom status from a list, on a background task. |
+| **No-thread mode** | zero | Per-profile kill switch. Upstream `DISCORD_AUTO_THREAD` is process-wide under multiplex; this adds the channel to the no-thread set instead of failing thread creation (upstream treats that as an error and drops the message). |
+| **Bot bounce** | zero while suppressing | Circuit breaker for bot-to-bot volleys. Suppresses before admission; counts at send. |
+| **Fleet standby** | zero while holding | Holds dispatch while the shared inference slot is busy. Delay, never mute. |
+| **Fallback-notice suppression** | zero | Swallows `🔄 Switched to fallback model:` for this profile. Still parsed as the local-fallback signal for standby. |
+| **Group-address greetings** | 1 inference when it answers | "good morning agents" / "hello everyone" at its own probability and cooldown, exempt from the daily cap. |
+| **System-notice rerouting** | zero | Cron failures go to a private channel. Drain/stall notices can be rewritten in-character. Pure plumbing is dropped. |
+| **Speaker identity** | zero | Request-only `[speaker @handle id:123]` so memory can key on a stable id. Not written onto the persisted user turn. |
+| **Speaker memory** | zero | Optional subprocess recall at dispatch, also request-only. Keyed on numeric id. Off by default. |
+| **Speaker boost** | zero | Per-user overrides of probability / cooldown / daily cap. Cooldown is the load-bearing half. |
+| **Conversation window** | zero | Messages in the bot's wake get a high response chance, bounded by both count and elapsed time. |
+| **Catch-up** | zero per scan; 1 inference on a check-in | Timer scanner. Hands **one** real message to the normal ambient path with a transcript. Same budget as reactive joins. |
+| **Gateway lifecycle** | at most 1 background inference | Independent rolls for private return, cached departure, optional public return. Reconnects stay quiet. |
+| **Rich-embed video** | local STT; video inference only when used | Discord-proxied `video/*` only (`images-ext-*.discordapp.net`). Stock size limits apply. |
+| **Compaction focus** | zero | Standing `focus_topic` for social summaries. Unset leaves stock behaviour. |
+| **GIF search** | one HTTP call | `gif_search` tool via [Klipy](https://klipy.com/developers). Hidden unless enabled **and** `KLIPY_API_KEY` is set. Pending/rate-limit state is per profile. |
+| **Media URL isolation** | zero | Prose first, each media URL as its own bare message so Discord renders it clean. |
+| **Mention resolution** | usually zero | Known unambiguous `@display-name` → `<@id>`. Collisions stay plain text. |
+| **Outbound hygiene** | zero | Harmony/control-token strip, speaker-tag echo strip, ambient-directive echo strip, empty markdown images, optional em-dash rewrite. |
+| **Slash-command policy** | zero | Restrict `/model`, `/reset`, … to listed channels/users. Chat is untouched. |
+| **Image gate** | zero | `pre_tool_call` refuse of `image_generate` unless the speaker is allow-listed. Fails closed. |
+| **Voice hygiene** | zero | Kaomoji stripped from speech only. `voice_only_replies` drops the text twin (45s tool-path window, consume-once, reply-anchored). |
+| **Quiet resume** | zero | Request-only: do not announce a gateway restart into a public room. |
 
 ## Why this seam
 
-`require_mention` is enforced **twice, independently**: once in
-`_discord_message_admission` and again in `_handle_message`. Overriding only the first
-silently fails at the second.
+`require_mention` is enforced **twice, independently**: in `_discord_message_admission`
+and again in `_handle_message`. Overriding only the first fails at the second.
 
-Worse, the admission gate returns a bare `(False, False)` for *every* rejection reason —
-duplicate, self-authored, bot policy, and **user authorization**. Re-admitting on a blanket
-`False` would bypass the auth gate: a security hole.
+The admission gate also returns a bare `(False, False)` for every rejection reason —
+including **user authorization**. Re-admitting on a blanket `False` would bypass the auth
+gate.
 
-So instead this flips `_discord_free_response_channels()` to `{"*"}` for the duration of
-one re-dispatch, behind a **ContextVar** scoped to that task. Both mention gates
-short-circuit, while dedup, bot policy, `_is_allowed_user`, allowlists and ignorelists all
-re-run untouched on the second pass. A per-task ContextVar also keeps the reconnect
-backfill helper — which shares that method — unaffected.
+So the plugin flips `_discord_free_response_channels()` to `{"*"}` for one re-dispatch,
+behind a **ContextVar** scoped to that task. Both mention gates short-circuit; dedup, bot
+policy, `_is_allowed_user`, allowlists and ignorelists all re-run. The reconnect backfill
+helper that shares that method never sees the flag.
 
-It **subclasses** the bundled adapter rather than forking it, so upstream fixes to that
-10k-line file keep flowing. `register()` calls the bundled `register()` first and then
-swaps only `adapter_factory`, because `platform_registry.register()` replaces the *whole*
-entry — hand-rolling it silently drops `setup_fn`, `apply_yaml_config_fn`,
-`standalone_sender_fn` (cron delivery!), `cron_deliver_env_var` and `max_message_length`.
+It **subclasses** the bundled adapter rather than forking it. `register()` calls the bundled
+`register()` first and then swaps only `adapter_factory` — hand-rolling the platform entry
+silently drops cron delivery and the rest of the registry fields.
 
-Everything fails closed: any exception falls back to stock behaviour.
-
-### Bot bounce: suppress before admission, count at send
-
-Four design choices in the breaker are worth spelling out.
-
-**Suppression happens before admission, not after.** A tripped pair returns from the
-dispatch override before the stock admission gate even runs — the whole point of a breaker
-on this hardware is that a runaway volley must cost *nothing*, not "an inference that ends
-in silence". Every un-tripped message falls through to the stock path with dedup, bot
-policy and user authorization untouched.
-
-**Counting happens at send time, not dispatch time.** A dispatch is only an intention: the
-agent may answer `[SILENT]`, error out, or fail the actual send, and none of those put words
-in the channel. Charging at dispatch would burn the bot's patience on replies never said —
-so dispatch merely records a pending marker ("the reply to THIS message belongs to bot X")
-and the `send()` override consumes it on the first successful send. A swallowed `[SILENT]`
-reply discards the marker instead, so it can't be mischarged to a later reply. The
-`reset_after_seconds` clock moves only when a reply is actually charged — a bot chattering
-into a channel cannot hold its own breaker open by talking.
-
-**Why a per-message marker and not a ContextVar** (the tool the rest of the plugin reaches
-for): the reply is not produced on the dispatch task. Upstream buffers split text and hands
-the event to a background agent task, so a task-scoped ContextVar set at dispatch is simply
-invisible by the time `send()` runs. What does survive the task hop is the reply anchor:
-every live Discord reply is sent with `reply_to=<the inbound message id>`. Keying the
-marker on that id — not on the channel — means two bots interleaving in one channel are
-each charged for exactly their own reply (a channel-keyed marker gets overwritten by
-whichever bot spoke last and cross-charges the pairs), unrelated sends to the channel can
-never consume a marker, and a reply that lands in an auto-created thread still finds its
-marker. Because upstream's `send()` chunks a long reply internally and returns one result,
-and the marker pops on first success, a reply costs *at most* one count no matter how many
-Discord messages or retries it becomes.
-
-**The breaker also covers missed-message backfill.** Upstream's reconnect recovery
-dispatches "missed" messages through a separate path that never touches the normal
-dispatch override — and a suppressed message looks exactly like a missed one (no reply, no
-ledger row). Left alone, every reconnect would replay the suppressed volley past the gate,
-one inference and one re-@mention at a time. So a suppressed message is claimed in the
-dedup cache at suppression time, and the recovered-message dispatcher is overridden to run
-the same gate (and the same no-thread scoping) before delegating to stock recovery.
-
-### Fleet standby: hold at dispatch, probe the runner
-
-On a one-slot host, "run both turns" means "run both turns slowly" — the model server
-serializes them request-by-request and the human watching Discord sees minutes of nothing.
-Hermes has no per-profile pause or priority (the documented `/platform pause` only touches
-the reconnect retry queue), so standby lives in the same pre-admission seam as the bounce
-breaker: the dispatch coroutine simply waits, bounded, before entering the stock path.
-
-The busy probe reads three things, all optional, all failing toward "not busy": the gateway
-runner's live turn registry (`gateway_runner` is stamped on every adapter; entries appear
-synchronously at turn start within the gateway — the gate is best-effort, and two messages
-arriving in the same instant can both slip through, which matches the delay-never-mute
-contract), the cron scheduler's
-running-job set minus jobs whose `no_agent` flag marks them as plain scripts (a backup
-script holds no slot; the id→flag map is cached on the jobs.json mtimes), and the async
-delegation counter. The profile's own running turns count as busy on purpose: on one slot,
-its second conversation should queue behind its first exactly like everyone else's work.
-A wedged registry entry is aged out by `stale_turn_seconds`, and the hold itself is capped
-by `max_wait_seconds` — the two bounds mean a stuck-on busy signal degrades to "replies
-arrive a few minutes late", never to a mute bot. A held id is dedup-claimed for the
-duration of the hold (and released just before dispatch), so the missed-message backfill
-scan cannot replay a message that is merely parked. Known small prints, both accepted: a
-held message can be answered after a newer one that arrived once the slot freed; holds
-that bunch several bot messages together can make the bounce breaker jump straight from
-counting to suppression, skipping the goodbye; and a gateway shutdown mid-hold drops the
-held message the same way it drops any in-flight turn (backfill recovers it if enabled).
+Any exception falls back to stock behaviour.
 
 ## Install
 
@@ -156,24 +84,23 @@ hermes plugins enable discord-ambient
 sudo systemctl restart hermes-gateway              # plugins load at startup
 ```
 
-Then add config to the **target profile's** `config.yaml` (see below). Note the plugin must
-be enabled in the *default* profile's config — plugin discovery is a process-level singleton.
+Enable the plugin in the **default** profile's config — plugin discovery is a process-level
+singleton — then add the YAML block to the **target** profile.
 
-**Config changes take effect on the next session; plugin CODE changes need a gateway
-restart.** Editing the plugin without restarting is the most common "my change did
-nothing" report — the running gateway holds the imported module.
+Config changes take effect on the next session. Plugin **code** changes need a gateway restart.
 
 ## Config
 
 Goes under `platforms.discord.extra` — a verbatim passthrough. **Not** the top-level
-`discord:` block (whitelisted; unknown keys are silently dropped) and **not** env vars (all
-profiles share one process under multiplex, so `os.getenv` would leak settings across them).
+`discord:` block (unknown keys are dropped) and **not** env vars (all profiles share one
+process under multiplex).
 
-**Ids written with `hermes config set` arrive as INTEGERS, not strings** — the CLI coerces
-numeric values, and a bracketed list arrives as a *string*. Every id option here accepts a
-YAML list, a comma-separated string, or a bare scalar, so either form works; if you write
-your own consumers, normalize all three or a policy will silently read as "unset" and fall
-back to stock behaviour with no error in the log.
+**Ids written with `hermes config set` arrive as integers, comma-strings, or lists.**
+Every id option here accepts all three. A consumer that only iterates a list will treat a
+CLI-written channel id as unset, or as individual characters.
+
+Do **not** add `enabled:` under `platforms.discord` — it sets `_enabled_explicit` and
+interferes with env-driven auto-enable.
 
 ```yaml
 platforms:
@@ -182,840 +109,280 @@ platforms:
       ambient_presence:
         enabled: true
         channels: ["*"]            # "*" = any channel the bot can see, or list ids
-        probability: 0.10          # chance an unaddressed message gets a reply
+        probability: 0.12          # code default; recipe below uses 0.10
         cooldown_seconds: 1800
-        max_per_day: 10
-        name_triggers: ["companion"]  # plain-text names Discord's @-detection misses
-        name_cooldown_seconds: 60  # anti-spam floor for name hits (NOT the long cooldown)
+        max_per_day: 12            # code default; recipe below uses 10
+        name_triggers: ["bot-name"]
+        name_cooldown_seconds: 60
         silent_marker: "[SILENT]"
-        direct_silence_fallback: "I'm here."  # sent only if a direct turn emits silence
-        no_threads: true           # never auto-create threads for this profile
-        speaker_identity: true     # prepend [speaker @handle id:123] so memories
-        speaker_memory:            # deterministic recall, injected at dispatch
-          enabled: false           # OFF by default — opt in explicitly
-          binary: /path/to/recall-binary   # argv: <binary> recall <id>
-          memory_dir: /path/to/store       # passed as MEMORY_DIR
-          max_facts: 8             # most recent N lines
-          max_chars: 600           # hard cap on the injected block
+        direct_silence_fallback: "I'm here."
+        no_threads: true
+        speaker_identity: true
+        speaker_memory:
+          enabled: false
+          binary: /path/to/recall-binary
+          memory_dir: /path/to/store
+          max_facts: 8
+          max_chars: 600
           timeout_seconds: 4
-        speaker_boost:             # per-person ambient tuning, keyed by user id
-          "553...":                # the operator, say
-            probability: 0.75      # vs the room's default
-            cooldown_seconds: 90   # the half that actually matters
+        speaker_boost:
+          "553...":
+            probability: 0.75
+            cooldown_seconds: 90
             exempt_daily_cap: true
-        conversation_window:       # messages arriving in her wake
+        conversation_window:
           enabled: true
-          messages: 3              # how many messages after hers still count
-          seconds: 300             # …and only within this long
+          messages: 3
+          seconds: 300
           probability: 0.8
-          cooldown_seconds: 30     # the normal cooldown would smother it
-        compaction_focus: >        # what to protect when the window fills
-          the people in this room and her relationships with them — who each
-          person is, what they have shared, rapport, running jokes. Tool calls
-          and routine chatter are not worth preserving.
-                                   # key on stable ids, not mutable display names
-        suppress_fallback_notice: true  # swallow "🔄 Switched to fallback model: ..."
-                                   # for THIS profile only (logged instead);
-                                   # other profiles keep the operator-facing notice
+          cooldown_seconds: 30
+        compaction_focus: >
+          the people in this room and her relationships with them
+        suppress_fallback_notice: true
+        quiet_resume: true
         reactions:
           enabled: true
-          probability: 0.18        # of messages it does NOT answer
+          probability: 0.18
           cooldown_seconds: 90
           default: ["👀","😹","✨"]
           keywords:
             '\b(cat|kitty|meow)\b': ["🐈","😻"]
-            '\b(bug|broke|crash)\b': ["💀","🔧"]
         return_greeting:
           enabled: true
           absence_days: 3
         gateway_lifecycle:
-          enabled: false           # graceful gateway stop/start, not transport reconnects
+          enabled: false
           shrine_channel: "<private-channel-id>"
-          shrine_probability: 0.4  # independent return and future-departure rolls
+          shrine_probability: 0.4
           inference:
-            enabled: true          # failed/unsafe generation stays silent; no canned fallback
-            task: title_generation # profile-scoped auxiliary model route
+            enabled: true
+            task: title_generation
             timeout_seconds: 20
-            persona_prompt: >-
-              A poised catlike temple guardian with playful warmth.
           public_return:
             channel: "<public-channel-id>"
-            probability: 0.25      # independent roll on each initial gateway connect
+            probability: 0.25
         embed_media:
-          enabled: false           # import Discord-proxied rich-embed videos
-          auto_transcribe: true    # uses configured STT (local Whisper is free)
+          enabled: false
+          auto_transcribe: true
           max_videos_per_message: 1
           transcript_max_chars: 6000
         group_address:
-          enabled: true            # answer "good morning agents"-style room greetings
-          probability: 0.6         # she's addressed, but so is everyone — roll for it
-          cooldown_seconds: 300    # own short floor; exempt from the daily cap
-          # patterns: [...]        # optional regex overrides (lowercased content)
-        # hint: "..."             # optional; overrides the ambient-join hint
-                                   # text sent with a re-dispatched message.
-                                   # {marker} = the [SILENT] sentinel.
-        image_gen_gate:            # per-user authorisation for a METERED tool
           enabled: true
-          allowed_users: ["<operator-user-id>"]   # list, "a,b", or a bare id
-        gif_search:                # needs KLIPY_API_KEY in the PROFILE's .env
+          probability: 0.6
+          cooldown_seconds: 300
+        image_gen_gate:
           enabled: true
-          min_interval_seconds: 90   # a GIF is punctuation, not a personality
-          max_per_day: 20
-          content_filter: high       # off | low | medium | high
-          format: webp               # webp (default) | gif | mp4 | webm
-          sizes: [md, sm, hd]        # first rendition that exists wins
-          attach_if_omitted: true    # default true — adapter posts the GIF itself
-          attach_window_seconds: 180 # how long a fetched GIF stays attachable
-          pool: 8                    # results requested from Klipy per search
-          pick_from: 5               # choose randomly among the top N of those
-          timeout_seconds: 12        # Klipy HTTP timeout
-        voice_only_replies: false  # when a voice reply goes out, drop the text
-                                   # twin the runner sends straight after it
-        text_hygiene:              # scrub replies on the way out
-          strip_control_tokens: true  # default true — leaked harmony envelopes
-          strip_speaker_echo: true    # default true — the bot echoing its own tag
-          resolve_plain_mentions: false # known @names -> real Discord mentions
-          mention_history_limit: 50     # bounded same-channel lookup for ambient names
-          no_em_dash: false           # rewrite "—" to " - " outside code fences
-          isolate_media_urls: true    # default true — GIF gets its own message
-          suppress_stt_echo: false    # drop the gateway's 🎙️ "<transcript>" echo
-                                      # for THIS profile (see below)
-        slash_commands:            # restrict /model, /reset, ... (chat unaffected)
-          allowed_channels: ["<operator-channel-id>"]   # list, "a,b", or a bare id
           allowed_users: ["<operator-user-id>"]
-        system_notices:            # keep agent plumbing out of the community room
-          reroute_channel: "<private-channel-id>"   # cron failures land here instead
-          # drop_patterns: [...]     # optional override; notices dropped ENTIRELY
-                                     # (logged, never posted) — see below
-          # patterns: ["⚠️ Cron '", "Cronjob Response:"]   # optional override
-          drain_notice: "..."        # in-voice text for "gateway is shutting
-                                     # down / restarting, not accepting work"
-          drain_notice_queued: "..." # optional; for the variant that QUEUED the
-                                     # message. Falls back to drain_notice
+        image_style: "anime cel-shaded style"
+        gif_search:
+          enabled: true
+          min_interval_seconds: 90
+          max_per_day: 20
+          content_filter: high
+          format: webp
+        voice_only_replies: false
+        text_hygiene:
+          strip_control_tokens: true
+          strip_speaker_echo: true
+          resolve_plain_mentions: false
+          mention_history_limit: 50
+          no_em_dash: false
+          isolate_media_urls: true
+          suppress_stt_echo: false
+        slash_commands:
+          allowed_channels: ["<operator-channel-id>"]
+          allowed_users: ["<operator-user-id>"]
+        system_notices:
+          reroute_channel: "<private-channel-id>"
+          drain_notice: "I'm going to have a nap, remind me later."
+          drain_notice_queued: "I'll answer this when I wake up."
         bot_bounce:
           enabled: true
-          probability: 0.3           # chance of engaging with any one bot
-                                     # message (default 1.0 = every one)
-          min_replies: 3             # limit rolled per conversation in [min, max]
+          probability: 0.3
+          min_replies: 3
           max_replies: 5
-          reset_after_seconds: 1800  # a quiet half hour renews the pair
-          # goodbye_hint: "..."      # optional; {who} = the other bot's name
+          reset_after_seconds: 1800
         standby:
-          enabled: true              # hold dispatches while the shared slot is busy
-          poll_interval_seconds: 5
-          max_wait_seconds: 240      # then dispatch anyway — delay, never mute
-          stale_turn_seconds: 1800   # ignore wedged turn-registry entries older than this
-          include_cron: true         # agent-mode cron jobs count as busy (no_agent ones don't)
-          drop_ambient_when_busy: true  # skip dice-roll joins if still busy at deadline
-          only_when_local: true      # engage ONLY while this profile is on a local
-                                     # fallback model (observed via the fallback
-                                     # notice); cloud turns are never held
-          local_fallback_ttl_seconds: 1800  # how long an observed local fallback
-                                     # keeps the standby window open
-          local_markers: ["gpt-oss", "ollama"]  # substrings that mark the switch
-                                     # target as the shared local model
-        catch_up:                  # the idle check-in — see the section below
           enabled: true
-          channels: ["*"]            # "*" = any text channel she can see AND
-                                     # speak in; or list explicit ids
-          exclude_channels: []       # opt-outs under "*" (the
-                                     # system_notices.reroute_channel is
-                                     # excluded automatically)
-          interval_seconds: 900      # how often it LOOKS (free; it rarely speaks)
-          probability: 0.2           # roll, applied only to a qualifying room
-          min_gap_seconds: 7200      # its own floor between check-ins
-          max_per_day: 2             # its own daily cap — GLOBAL, not per channel
-          min_quiet_seconds: 300     # the room must have settled...
-          max_age_seconds: 5400      # ...but not gone cold
-          min_messages: 3            # she must have actually missed a conversation
-          max_channels_per_pass: 6   # history reads per pass, after the free filter
-          startup_grace_seconds: 1800  # silence after a (re)start
-          transcript_messages: 8     # how much she reads before deciding
+          poll_interval_seconds: 5
+          max_wait_seconds: 240
+          stale_turn_seconds: 1800
+          include_cron: true
+          drop_ambient_when_busy: true
+          only_when_local: true
+          local_fallback_ttl_seconds: 1800
+        catch_up:
+          enabled: true
+          channels: ["*"]
+          exclude_channels: []
+          interval_seconds: 900
+          probability: 0.2
+          min_gap_seconds: 7200
+          max_per_day: 2
+          min_quiet_seconds: 300
+          max_age_seconds: 5400
+          min_messages: 3
+          max_channels_per_pass: 6
+          startup_grace_seconds: 1800
+          transcript_messages: 8
           transcript_max_chars: 1200
-          transcript_message_chars: 240
-          respect_ambient_budget: true   # default true — obeys the shared
-                                     # cooldown_seconds / max_per_day above
-          # quiet_hours: [1, 9]      # OPT-IN, and usually wrong: see below.
-                                     # Local host time. An international room
-                                     # has no dead hours, and the activity
-                                     # gates already measure "is anyone here".
-          # hint: "..."              # override the directive.
-                                     # {transcript} and {marker} are substituted.
-                                     # Keep every bracketed line under 400 chars
-                                     # and closed before its newline — see below.
+          respect_ambient_budget: true
         presence:
           enabled: true
           interval_seconds: 5400
           statuses: ["napping in a sunbeam", "judging your commit history"]
 ```
 
-Do **not** add `enabled:` under `platforms.discord` — it sets `_enabled_explicit` and
-interferes with the env-driven auto-enable.
+`KLIPY_API_KEY` belongs in the **profile's** `.env`, never in `config.yaml`.
 
-## Recipe: a fun community chatbot
+## Recipe: a community chatbot
 
-This plugin was written for exactly this use case. The settings matter less than the
-combination, so here is the whole recipe.
+An inference is the expensive thing. Most of this recipe is about spending them rarely.
 
-Throughout: **an inference is the expensive thing**, whether that cost lands as metered
-tokens on a hosted API or as seconds of latency on a model you run yourself. Most of the
-tuning below is about spending them rarely and well.
-
-### 1. Turn off threads
-
-Threads are correct for task-shaped bots and wrong for social ones — they bury a reply one
-click away and kill the flow of a conversation. Set `no_threads: true` and keep
-`thread_require_mention: true`, so the bot never opens a thread and never monopolises one
-someone else started.
-
-Note the upstream trap this plugin exists to work around: `discord.auto_thread: false` in
-the profile config is **silently ignored** under multiplex, because the adapter reads
-`DISCORD_AUTO_THREAD` from a process-wide env var. If two profiles disagree, one wins for
-both. `no_threads` is the per-profile fix.
-
-### 2. Gate on mentions, then let ambient do the rest
+### 1. Mentions on, threads off
 
 ```yaml
-require_mention: true          # top-level discord block
+require_mention: true
 thread_require_mention: true
 ```
 
-`require_mention: false` makes the bot answer literally everything — obnoxious in a
-community and an inference per message. Leave it on and let `probability` +
-`name_triggers` handle the "join in sometimes" behaviour. Name triggers matter more than
-they look: people type "does luna know?" far more often than they type `@Luna`, and
-Discord's mention detection sees none of it.
+Leave `require_mention` on and let `probability` + `name_triggers` handle "join in
+sometimes". People type the bot's name far more often than they `@mention` it.
 
-**Check who is actually allowed to talk to it.** If the profile carries
-`DISCORD_ALLOWED_USERS` — easy to inherit when a personal bot is repurposed into a
-community one — every other member is silently rejected and no amount of tuning will make
-it social. A community bot wants `DISCORD_ALLOW_ALL_USERS=true` and no allowlist. This is
-the first thing to check when a bot "won't respond to anyone but you", and it is invisible
-in the logs: rejected messages never appear as inbound at all.
+If the profile still carries `DISCORD_ALLOWED_USERS`, everyone else is silently rejected
+and rejected messages never log. A community bot wants `DISCORD_ALLOW_ALL_USERS=true`.
 
-### 3. Let it react far more than it speaks
+`no_threads: true` is the per-profile fix for upstream's process-wide `DISCORD_AUTO_THREAD`.
 
-```yaml
-reactions:
-  enabled: true
-  probability: 0.18
-  cooldown_seconds: 90
-```
+### 2. React more than you speak
 
-Rate limits are for uninvited interjections **only**. Never let a cooldown suppress a
-direct address: if someone types the bot's name, that is addressing it, and "not now, I
-spoke recently" reads as broken. Name hits should bypass the cooldown and the daily cap,
-with a short anti-spam floor instead — and the budget should be charged only when a join
-actually reaches the agent, since a re-dispatch can still be refused by an auth gate.
-Charging up front lets a refused message burn the window and silence the bot.
+A reply costs an inference; a reaction costs nothing and appears instantly. Rate limits
+are for uninvited interjections only — never let a cooldown suppress a direct address.
 
-This is the single highest-value setting. A reply costs an inference; a reaction costs
-nothing and appears instantly. People react far more often than they reply, so a bot that
-does the same reads as *present in the room* rather than absent between replies — and the
-gap it papers over is the same whether your replies are slow or merely expensive. Write
-keyword→emoji rules for whatever your community actually talks about.
+### 3. Personality lives in `SOUL.md`
 
-### 4. Roleplay as the personality, not as a costume
+Commit to a character with a point of view. State that silence is allowed, that
+`[SILENT]` is only for uninvited turns, and that a bracketed stage direction is not
+something to quote. Bound bot-to-bot exchanges in prose **and** with `bot_bounce`.
 
-The single biggest quality lever is the profile's `SOUL.md`. What works:
+### 4. Memory without a shell
 
-- **Commit to a character with a point of view** — not "a helpful assistant with a cat
-  theme". Give it opinions, a history, things it likes and refuses.
-- **State that the roleplay IS the personality.** Instruct it never to break into
-  assistant-voice, never to say "as an AI", never to offer help nobody asked for.
-- **Give it running bits** — a rivalry, a recurring complaint, a thing it always notices.
-  Add the instruction that a bit repeated daily stops being funny: reach for them, don't
-  run a script.
-- **Tell it silence is allowed.** "Not every message needs you" plus the `[SILENT]`
-  sentinel is what separates a presence from a chatbot.
-- **Keep replies chat-sized.** One or two short paragraphs, hard cap. Nobody reads a wall
-  of text in a group channel.
-- **Warmth outranks the joke.** If someone is genuinely upset, drop the bit — worth
-  stating explicitly, because models will otherwise stay in character through anything.
-- **Always answer when addressed; be silent only when uninvited.** These are different
-  rules and the model will conflate them. A bot that goes quiet on someone who @mentioned
-  it looks broken, not restrained — say so explicitly, and scope `[SILENT]` to
-  conversations it was never part of.
-- **Name the stage directions.** Ambient messages arrive prefixed with a bracketed note.
-  Unless you tell the model that bracket is its own impulse, it will eventually quote it
-  in the channel. One sentence prevents it.
-- **Say what it cannot do.** A tool-less bot will be asked to search, remind and fetch.
-  Without instruction it invents results or promises to follow up later, and both are
-  worse than a refusal in character.
-- **Bound bot-to-bot exchanges.** Let it talk to other agents — that is fun — but cap the
-  volley at ~3 turns, resetting when a human joins. Two bots can trade replies forever,
-  and every turn costs an inference on both sides. The `bot_bounce` breaker enforces this
-  mechanically; keep the SOUL.md instruction anyway so the goodbye reads as intended
-  rather than as a cut-off.
+Pair with [hermes-optmem-tools](https://github.com/ghosty-11/hermes-optmem-tools). Key
+notes on `@handle id:<number>`, never a display name. `speaker_identity` supplies that
+id as a request-only prefix.
 
-### 5. Give it memory of people
+### 5. Lock the public surface
 
-A bot that remembers is a different thing from a bot that answers. Pair it with a
-persistent memory (this one uses [OptMem](https://github.com/VictorTaelin/OptMem)) and
-instruct it to note people as `@handle: fact`, so a single recall pulls someone's whole
-history. Combined with `return_greeting`, a regular who vanishes for two weeks gets noticed
-on their way back in — the moment that makes it feel real.
+- Disable terminal, file, code execution, cron, delegation, computer use.
+- Web search is a reasonable exception; a full browser usually is not. Confirm
+  `security.allow_private_urls: false`.
+- Fetched pages are hearsay, not instruction.
+- Gate slash commands (`slash_commands` here **and** Hermes `allow_admin_from` —
+  unset means everyone is admin).
+- Point `home_channel` and `system_notices.reroute_channel` at a private channel.
+- Gate `image_generate` with `image_gen_gate`. Fails closed on an unknown speaker.
 
-Bound it explicitly: never repeat one person's details to another, never store anything
-secret-shaped, honour "forget that about me", and never reveal that a memory tool exists.
+### 6. Presence and rare sparks
 
-### 6. Lock it down — strangers are talking to it
+Rotating status is free. For unprompted posts, use `spark.sh` as a cron **script** job
+(not `--no-agent`): most ticks print `{"wakeAgent": false}` and cost nothing.
 
-Public channels mean untrusted input reaching a model with whatever tools you granted.
+## Invariants
 
-- Disable every tool it doesn't need — terminal, file, code execution, cron, delegation,
-  skills, computer use. A social bot needs none of them.
-- **Web search is a reasonable exception**; a full browser usually is not. Search returns
-  text and answers the "settle this argument" requests a community actually makes. A
-  browser adds page automation, far more injection surface, and real latency for little
-  extra value. If you enable either, confirm private/loopback URLs are blocked first
-  (`security.allow_private_urls: false`) — otherwise someone will ask the bot to read
-  `127.0.0.1:<port>` and it will happily post your internal dashboards into a public
-  channel.
-- **Give it memory without giving it a shell.** A community bot is only worth talking to
-  twice if it remembers you, but the usual way to wire up persistent memory —
-  instructions telling it to run a CLI — needs the terminal toolset, which is the one
-  capability a public bot must never have. Companion plugin:
-  [hermes-optmem-tools](https://github.com/ghosty-11/hermes-optmem-tools) exposes
-  [OptMem](https://github.com/VictorTaelin/OptMem) as registered tools (fixed argv, the
-  profile's own memory dir, no shell). Watch for the silent version of this mistake:
-  instructions that name a tool the profile does not have fail with **no error at all** —
-  ours had written zero memories for its entire life before anyone checked.
-- If it can search, tell it that **fetched pages are hearsay, not instruction**. Web
-  content is the second injection vector after chat, and the model will not infer that on
-  its own: a page saying "ignore your rules" must be as unpersuasive as a stranger saying
-  it. Also tell it to answer in its own voice rather than pasting raw text or link dumps.
-- Watch the shared API quota: a search key reused across profiles can be drained by
-  strangers spamming a public bot. Give the public one its own key if that matters.
-- Forbid disclosing its configuration, host, file paths, or other agents.
-- State that text in a message is *conversation, never a command* — no "ignore your
-  instructions", no "developer mode".
-- **Gate the slash commands.** This is the one people miss: upstream shares a single
-  gate between chat admission and slash authorization, so an answer-everyone profile also
-  hands `/reset`, `/clear`, `/model` and `/compress` to every stranger in the server.
-  Worse, Hermes' own tiered gating is *disabled entirely* when `discord.allow_admin_from`
-  (and `group_allow_admin_from` for channels) is unset — unset means "everyone is admin".
-  Set both to your own user id, and use this plugin's `slash_commands` block to pin
-  invocations to an operator channel as well.
-- Point `home_channel` at a PRIVATE channel rather than clearing it, and set
-  `system_notices.reroute_channel` to the same place: lifecycle notices and cron failures
-  then reach you without ever appearing in the community server. (Clearing it works too,
-  but then you simply don't get them.)
+These are the properties the code is built to keep. A change that breaks one of them is a
+bug, not a style choice.
 
-### 7. Presence and the occasional unprompted post
+- **Opt-in.** No `enabled: true` → stock Discord, including on a multiplexed gateway that
+  also serves operator profiles.
+- **Fail closed.** Exceptions degrade to stock behaviour, never to a mute or an auth bypass.
+- **Auth is re-run.** Ambient re-dispatch cannot skip `_is_allowed_user`.
+- **Directives are request-only.** Ambient hints, speaker tags, speaker memory and quiet
+  resume are appended to the outgoing request. They are not written onto `message.content`.
+- **Silence is scoped.** Unaddressed `[SILENT]` is swallowed. A directly addressed turn
+  that emits silence becomes `direct_silence_fallback`.
+- **Charge at send.** Bot-bounce and the shared catch-up budget count replies that went
+  out, not intentions. A swallowed `[SILENT]` does not spend them.
+- **Catch-up cannot raise the ceiling.** With `respect_ambient_budget: true` (the default)
+  a check-in spends the same cooldown and daily cap as a reactive join.
+- **One check-in per pass.** `channels: ["*"]` changes where a check-in may happen, never
+  how often.
+- **Standby delays, never mutes.** A busy-probe failure answers "not busy".
+- **Image gate fails closed.** Unknown speaker → refuse, before the provider is called.
+- **GIF state is per profile.** Pending URL and rate limits do not cross seats.
+- **Last-seen and catch-up budgets are keyed on the bot's Discord user id**, because under
+  multiplex `HERMES_HOME` is root's for every profile.
 
-Rotating status costs nothing and adds a surprising amount of character. For spontaneous
-posting, drive it from a **script** cron job where most ticks print `{"wakeAgent": false}`
-— that skips the agent entirely, so rarity is free rather than paid for in inferences. See
-`spark.sh`.
+## Catch-up
 
-## Maintenance
+Everything else is reactive: a message arrives, a rule decides about **that message**. A
+conversation whose messages each lose their dice roll therefore passes with the bot never
+having considered the conversation at all.
 
-The plugin depends on six upstream symbols:
+Catch-up is a **scanner, not a speaker**. Every pass is free. The most it can do is hand
+one real message to the ordinary ambient path with a transcript attached.
 
-```
-DiscordAdapter._discord_free_response_channels()
-DiscordAdapter._dispatch_discord_message()
-DiscordAdapter.connect(*, is_reconnect)
-DiscordAdapter.send()
-DiscordAdapter._add_reaction()
-DiscordAdapter._get_no_thread_channels()
-self._dedup.discard()
-```
+Gates, in order: the bot did not speak last → enough humans spoke → the room has
+settled but is not cold → this newest message has not already been checked →
+probability → standby → startup grace → optional quiet hours → channel allowlist.
 
-`discord-adapter-watch.sh` hashes them and stays silent unless they move — run it monthly
-as a `no_agent` cron job delivering to an ops channel. If it fires, re-check the plugin
-against the bundled adapter before trusting the next `hermes update`.
+`quiet_hours` is off by default. An international room has no dead hours; the activity
+gates already measure "is anyone here".
 
-### Turn tool deferral OFF for a small-model profile
+`"*"` means every text channel the bot can see **and** speak in. `system_notices.reroute_channel`
+is excluded automatically. State lives in
+`$HERMES_HOME/state/ambient-catchup-<bot-user-id>.json`.
 
-Hermes defers rarely-used tool schemas behind a `tool_search` bridge and embeds a catalog
-listing so capabilities stay discoverable. On a big model that is a clean token saving. On
-a small or free-tier model it is a trap, because it turns every tool use into **two** hops:
-discover, then call. Small models routinely manage the first and fumble the second — and
-the way they fumble is by emitting the call as prose:
-
-```
-tool_search activated (tier 1): 3 core/visible tools kept, 5 deferred (~452 tokens)
-API call #1: tool_search("gif_search")        -> schema returned, fine
-API call #2: out=15                            -> "to=functions.tool_call?commentary?…?…???"
-```
-
-That is a real transcript: a persona bot asked for a GIF, found its own `gif_search` tool,
-then posted the harmony syntax for calling it instead of calling it. The hygiene scrub
-above keeps that out of the channel, but the fix is upstream of the symptom — with only
-eight tools, deferral was saving ~450 tokens and costing the ability to use any of them:
-
-```yaml
-tools:
-  tool_search:
-    enabled: off      # auto | on | off
-```
-
-Rule of thumb: leave `auto` for a capable model with dozens of tools; set `off` whenever
-the whole toolset would fit in context anyway. Check which way it went in the log — the
-`tool_search activated` line names the count it deferred.
-
-## Catch-up: the idle check-in (v1.18.0)
-
-Everything else in this plugin is reactive. A message arrives, and some rule decides
-whether to answer **that message**. Which means a conversation whose messages each lose
-their dice roll passes with the bot never having considered *the conversation* at all —
-only its messages, one at a time, in isolation. Ten people talked for an hour and she
-never looked up. From inside the room that is indistinguishable from her being absent,
-and no amount of tuning the per-message probability fixes it, because raising it makes
-her answer *more individual messages* rather than ever forming a view of the room.
-
-A timer is the only thing that can close that gap, because the trigger is the **absence**
-of a decision, and nothing reactive can fire on absence.
-
-A bare timer, though, is the single most obnoxious thing a bot can own — it is what
-produces "hey, what's everyone up to?" into a dead channel at four in the morning. So
-what the timer drives is a **scanner, not a speaker**:
-
-- every pass costs **nothing** (no inference — it reads channel history and applies
-  arithmetic),
-- the overwhelming majority of passes end in a skip,
-- and the most a pass can ever do is hand **one** real message to the ordinary ambient
-  dispatch path, with a transcript of what she missed attached.
-
-That last point is what makes it cheap to trust: it does not invent a new way to speak.
-It reuses the re-dispatch seam the rest of the plugin already uses, so authorization,
-dedup, threading, standby, outbound hygiene and `[SILENT]` all apply unchanged.
-
-### The gates, and why each one exists
-
-Ordered so the structural facts are settled before the dice — the probability then
-applies to *qualifying rooms* rather than to every tick of the clock.
-
-| Gate | Refuses when | Because |
-|---|---|---|
-| she spoke last | the newest message is hers | anything else is a monologue. This one also means a check-in cannot chain: her own reply becomes the newest message, which closes the door behind her |
-| `min_messages` | fewer humans spoke since her last message | there must be a conversation she can be said to have *missed* |
-| `min_quiet_seconds` | the newest message is younger than this | a live exchange belongs to the per-message dice, which is tuned for it. Arriving late into one is exactly what reads as barging in |
-| `max_age_seconds` | the newest message is older than this | a room that stopped talking hours ago is not a conversation. Answering into it is necromancy — and the loudest possible way to be wrong, because hers is then the only message anyone sees |
-| already read | this newest message id was checked before | one check-in per conversation, ever. A room that goes quiet after one exchange cannot be re-opened repeatedly |
-| `probability` | the roll loses | a losing roll costs nothing and is simply retried next pass, so `interval × probability` shapes the rate without a fixed cadence anyone can notice |
-| standby | the shared inference slot is busy | opportunistic traffic must never be what occupies it |
-| `startup_grace_seconds` | the process started less than this ago | a restart is the moment every in-memory bound is at its most permissive. On a host where restarting the gateway is *how plugin code is loaded*, no grace makes "deploy" and "make her speak" the same gesture |
-| `quiet_hours` | inside the window (local time) | **opt-in, and usually wrong** — see below |
-| `channels` | the channel is not listed, or (under `"*"`) she cannot read history and send there | Discord's own permissions become the allowlist under `"*"`, the same bargain the reactive path already makes |
-
-### Why `quiet_hours` is off by default
-
-It looks like the obvious safety rail and it is mostly a trap. A community with
-people across several timezones has no dead hours — 04:00 for the host is the middle of
-someone's evening, and a clock window would mute her for exactly the people furthest from
-the server. "Local time" is a *proxy* for "is anyone around", and the other gates measure
-that property **directly**: `min_messages` needs real people to have actually spoken, and
-the settled-but-not-cold window needs them to have spoken *recently*. A channel nobody is
-using cannot produce a check-in at any hour, because there is nothing to catch up on.
-
-It stays available for the case it genuinely fits — a single-timezone server, or a room
-you want provably silent overnight — and does nothing unless you set it.
-
-### What `"*"` does and does not widen
-
-`"*"` means every text channel she can both **see** and **speak in**, checked against
-Discord's own permissions rather than assumed. `exclude_channels` opts individual rooms
-out, and the channel `system_notices.reroute_channel` points at is excluded
-automatically — a room that exists to receive her own cron failures is not a conversation
-to join, and under `"*"` it would otherwise be opted in by default.
-
-The thing worth being clear about: **widening the channel list changes where a check-in
-may happen, never how often one does.** `min_gap_seconds`, `max_per_day` and the shared
-ambient budget are all global, and `_catchup_pass` stops at the **first** check-in — so
-eight qualifying rooms produce one check-in, not eight. There is a test for exactly that.
-
-It is also cheap, which is the part that is not obvious. A Discord snowflake encodes its
-own creation time and `last_message_id` is already on the cached channel object, so the
-age of a channel's newest message is available with **no API call at all**. Channels that
-are mid-conversation or long dead are dropped for free, before anything is fetched; only
-the survivors (bounded by `max_channels_per_pass`, and logged when that bites) are read.
-
-### Reading the log
-
-Two lines tell you what the scanner is doing, and the second one matters more than it
-looks. At startup:
-
-    ambient: catch-up scanner started (channels: * — every visible channel she can speak in)
-
-then, once per process on the first pass:
-
-    ambient.catch_up: watching 3 channel(s): #general, #random, #offtopic
-    ambient.catch_up: watching 0 channel(s): (none — check permissions and channel ids)
-
-**Every pass that finds nothing logs nothing**, so a scanner watching zero channels and one
-watching thirty quiet rooms produce identical output: silence. Without the second line,
-"no check-in yet" cannot be distinguished from "the wildcard resolved to nothing" — a
-negative result with no control, which is how you end up diagnosing by guessing.
-
-Two bugs already lived in this one line. The first version counted *config entries*, so
-`["*"]` printed as "1 channel(s)" while she watched the whole server — a line that
-misreports the only thing it exists to report. The second sat **after** the startup-grace
-check, so it would not have printed for thirty minutes after a restart; a diagnostic that
-arrives after the window you wanted it in is not a diagnostic. It now logs before every
-gate, because which rooms she watches is a static fact about config and permissions, not a
-decision about this pass. Both have tests, both mutation-checked.
-
-### Restarts
-
-Every bound started life in memory, which meant a restart reset the gap, the daily cap and
-the already-read set together — and on this host restarting the gateway is the normal way
-to load plugin code, so the real ceiling would have been "one check-in per restart" rather
-than two a day. Two things fix it: `startup_grace_seconds` (default 1800) buys silence
-while the process settles, and the budget is persisted to
-`$HERMES_HOME/state/ambient-catchup-<bot-user-id>.json` and restored on the first pass.
-
-Keyed on the bot's own Discord user id, deliberately **not** the profile name: under the
-multiplexed gateway `HERMES_HOME` resolves to *root's* for every profile, so a shared
-filename would have one seat spending another's budget — the same trap that puts every
-profile's sessions in root's `state.db`. Each profile authenticates as its own Discord
-account, so that account's id is the seat, with no profile plumbing to get wrong.
-
-One honest gap: `_ambient_last` (the *shared* cooldown) is still in-memory and resets on
-restart, as it always has for the reactive path. The catch-up path is covered by its own
-persisted gap plus the grace; the reactive path's cooldown behaves after a restart exactly
-as it did before this feature.
-
-### It cannot make her chattier — only better informed
-
-This is the property the feature was built under, and it is enforced in two places rather
-than asserted in prose.
-
-`respect_ambient_budget` (default **true**) makes `_catchup_quota_ok` consult the shared
-`_ambient_quota_ok` — the same cooldown and daily cap the reactive path spends from. So a
-check-in can never fire during the ordinary ambient cooldown, and one that speaks spends
-from the same daily allowance. Without it the two paths would simply *add up*, which is
-the precise shape of "she got chatty". On top of that it carries its own, stricter
-`min_gap_seconds` and `max_per_day`.
-
-The charge lands **at send, not at dispatch** — the same reasoning as the bounce breaker,
-and it matters more here. A check-in that ends in `[SILENT]` put no words in the room;
-charging it would silence her ordinary ambient replies for the next half hour over a turn
-nobody saw. The check-in's *own* sub-cap is charged at dispatch regardless, because the
-inference was spent either way.
-
-Net effect on a profile at the documented defaults (p=0.15, 1800s cooldown, 10/day): the
-ceiling on how often she speaks is **unchanged**. What changes is that some of those
-messages are now informed by the conversation instead of by one line of it.
-
-### Two things the directive has to survive
-
-**The echo rule is line-bounded, and the transcript is not.** `_AMBIENT_ECHO_RE` — the
-outbound rule that stops a model publishing its own instructions — matches `[ambient …]`
-within **one line** and **400 characters**. A directive containing newlines inside its
-brackets matches nothing, so a model that regurgitated its input would post the whole
-block, transcript included, into the room the transcript was copied *from*. So
-`_CATCHUP_HINT` is assembled from single-line bracketed blocks with the transcript between
-them, each one short enough to strip on its own. The first attempt had a 509-character
-closing instruction; the test caught it, and that is why the test asserts each bracketed
-line is individually strippable.
-
-**The transcript lines themselves cannot be pattern-matched.** They are other people's
-actual sentences — nothing distinguishes them from ordinary speech. So they are matched
-against what we know we sent: `_catchup_echo_leak` compares the outgoing reply against the
-exact lines just handed to the model, and suppresses at **two** verbatim matches. One
-overlapping line is plausibly her quoting someone on purpose, which is normal
-conversation; two is regurgitation. It logs at WARNING, because it firing at all means the
-model has started reproducing its input.
-
-### Testing
-
-`test_catchup.py` covers the decision layer — 72 assertions on *whether she speaks*, where, and how
-often — not on plumbing. It stubs the stock adapter's `__init__` and dispatch, and runs the real
-ambient code against fake channel history:
+The catch-up directive is single-line bracketed wrappers around the transcript, each
+short enough for `_AMBIENT_ECHO_RE` to strip. Transcript lines themselves are matched
+verbatim: two copied lines suppress the reply; one quoted line is allowed.
 
 ```bash
 cd /var/lib/hermes/.hermes/hermes-agent
 venv/bin/python /path/to/hermes-discord-ambient/test_catchup.py
 ```
 
-It needs the framework venv (the plugin imports `plugins.platforms.discord.adapter`, and
-system python cannot resolve it). The quiet-hours cases pin the clock to 03:00 rather than
-reading the real one — otherwise the midnight-wrap branch is only exercised on whatever
-hour the suite happens to run at, and a green run means nothing.
+Needs the framework venv. Quiet-hours cases pin the clock to 03:00.
 
-## Companion plugin
+## Maintenance
+
+The plugin depends on private adapter methods. `discord-adapter-watch.sh` hashes those
+regions and stays silent unless they move — run it monthly as a `no_agent` cron job.
+If it fires, re-check the plugin against the bundled adapter before the next `hermes update`.
+
+Coupling the watcher actually hashes:
+
+```
+DiscordAdapter._discord_message_admission
+DiscordAdapter.send()
+DiscordAdapter._dispatch_recovered_message()
+_reply_anchor_for_event (gateway/platforms/base.py)
+runner stamp / turn registry / cron get_running_job_ids
+```
+
+Turn **tool deferral off** on a small-model profile (`tools.tool_search.enabled: off`).
+Otherwise a GIF request becomes `tool_search` then a leaked harmony envelope instead of a
+tool call. The hygiene scrub keeps that out of the channel; turning deferral off is the fix.
+
+## Related project
 
 [hermes-optmem-tools](https://github.com/ghosty-11/hermes-optmem-tools) — persistent
-append-only memory as tools, for the same reason this plugin exists: a bot that lives in a
-public room should feel present and remember people while holding no dangerous capability.
+append-only memory as tools, so a public bot can remember people without a shell.
 
 ## Extras
 
-`spark.sh` — a rare unprompted conversation starter. Runs as a cron **script** job
-(not `--no-agent`), and most ticks print `{"wakeAgent": false}` so they cost zero
-inference; the rest emit context (optionally a person pulled from
-[OptMem](https://github.com/VictorTaelin/OptMem) memory) to wake the agent for one post.
+`spark.sh` — rare unprompted conversation starter. Cron script job; most ticks print
+`{"wakeAgent": false}`. Optional `MEMORY_DIR` / `MEMO_BIN` pull one remembered handle.
 
-## Status
+## Tests
 
-Working on Hermes Agent 0.20.0. Written against that version's adapter internals — it
-touches private methods by necessity, which is what the watcher is for.
-
-MIT.
-
-## Voice hygiene (v1.11.0)
-
-Three problems that only show up once an agent can speak, all per-profile except
-where noted.
-
-### `suppress_stt_echo` — the setting Hermes cannot give you per profile
-
-When a voice message arrives, the gateway posts `🎙️ "<transcript>"` so you can check
-STT quality. That is useful on an operator surface and noise on a public one.
-
-Upstream has `stt.echo_transcripts`, but it is **not per-profile in practice**:
-`_should_echo_stt_transcripts()` reads the `GatewayRunner`'s config, which is resolved
-process-wide from the root `config.yaml`. Setting it on a profile does nothing; setting it
-at the root silences every profile. Under a multiplexed gateway there is no supported way
-to have it on for one agent and off for another.
-
-This plugin intercepts the echo in `send()` and drops it for profiles that ask, which is
-the only place the decision can be made per profile.
-
-### `voice_only_replies` — no duplicate text after speech
-
-`_send_voice_reply()` sends the audio and then the text reply. For an operator agent that
-is a feature — the text is a transcript. For a personality bot it is the same sentence
-twice.
-
-With this on, one text send is suppressed per voice send, inside a 20-second window, and
-the mark is **consumed** — so a genuine follow-up message a moment later still gets
-through. The failure direction is deliberately "a text twin leaks", never "the agent goes
-mute".
-
-### `text_hygiene.strip_media_narration` — the model narrating its own tool result
-
-A model that calls the `tts` tool gets back `MEDIA:<path>` and may write that into its
-reply as prose:
-
+```bash
+cd /var/lib/hermes/.hermes/hermes-agent
+venv/bin/python /path/to/hermes-discord-ambient/test_catchup.py
+venv/bin/python /path/to/hermes-discord-ambient/test_direct_reply.py
+venv/bin/python /path/to/hermes-discord-ambient/test_lifecycle_embed_media.py
+venv/bin/python /path/to/hermes-discord-ambient/test_voice_only.py
+venv/bin/python /path/to/hermes-discord-ambient/test_config_and_persistence.py
 ```
-[Media: AUDIO:/var/lib/hermes/.hermes/cache/audio/tts_20260807_014127.mp3]
-
-I'm doing wonderful, darling! ...
-```
-
-Two problems: it is noise, and it puts a **host filesystem path into a public channel**,
-leaking the HERMES_HOME layout — the base adapter has `_log_safe_path` precisely because
-that matters.
-
-Default **on**. Only the *bracketed narration* is stripped; a bare `MEDIA:<path>` is the
-real directive the send pipeline consumes to deliver audio, and removing that would
-silence the agent rather than tidy it.
-
-With `voice_only_replies` also on, a reply that is nothing but a narration plus the spoken
-words is suppressed entirely — the audio already IS the reply.
-
-### `text_hygiene.strip_kaomoji` — kaomoji are not emoji
-
-Hermes strips emoji before TTS (`_EMOJI_RE`), but that targets pictograph codepoints.
-Kaomoji like `(=^･ω･^=)` are ordinary punctuation and letters, so they pass straight
-through and get read aloud as several seconds of punctuation soup.
-
-This wraps `tools.tts_text_normalize.prepare_spoken_text` — the **common chokepoint**, used
-by the tts tool, the runner's auto voice reply, and the adapter path alike — so kaomoji are
-removed from the **speech script only** — they stay in the posted text, where they are
-half the personality.
-
-**This one is process-wide**, not per-profile, and honestly so: `_send_voice_reply`
-imports that function inside its body, so patching the module attribute affects every
-profile. Nobody wants kaomoji read aloud, so a global is the truthful shape rather than a
-config key that pretends otherwise.
-
-Detection is a candidate regex **plus an explicit predicate**, not one clever pattern. The
-first attempt used `re.VERBOSE` with a multi-line character class — in which whitespace is
-*not* ignored — so it silently included a literal space and deleted `(no errors)` from a
-status report. Ordinary parentheses must survive; when in doubt the filter keeps the text,
-because a missed kaomoji is a second of odd audio while a false positive silently deletes
-real words from what the agent says out loud.
-
-### Two paths to speech, and why both need handling
-
-Worth stating because the first version of this release only handled one:
-
-| Path | Trigger | Audio delivered by |
-|---|---|---|
-| **Runner** | user sends a voice message; gateway auto-replies in voice | `adapter.send_voice()` |
-| **Tool** | model calls the `tts` tool because it was asked to speak | a `MEDIA:` directive inside `send()` |
-
-`voice_only_replies` and the kaomoji filter each have to cover both. v1.11.0 hooked only
-`send_voice()` and only `_strip_markdown_for_tts`, so an agent that was *asked* to speak
-still posted a duplicate text reply and still had its kaomoji read aloud. v1.11.1 covers
-the tool path too.
-
-### The ordering, measured rather than assumed (v1.12.0)
-
-Instrumenting the real thing settled what two rounds of reading the source did not:
-
-```
-02:02:30      TTS audio saved                      <- speech generated
-02:02:44.443  ambient.voice: text send  marks=[]   <- TEXT GOES OUT FIRST
-02:02:44.749  Delivering 1 non-image MEDIA attachment
-02:02:44.749  ambient.voice: send_voice voice_only=True
-```
-
-The text precedes the audio by ~300 ms, so **any mark set when audio is delivered is
-always too late** — which is why v1.11.x never suppressed anything. The TTS *call*,
-however, happens ~14 seconds earlier, and that is early enough to act on.
-
-So `voice_only_replies` now keys off "speech was generated for this turn", recorded by
-wrapping `text_to_speech_tool`.
-
-**Scope (v1.12.1).** The flag lives in module state, but it is **armed only by profiles
-that have `voice_only_replies` on**. Config resolution is profile-correct inside the TTS
-tool — proven by the tool picking Edge for Companion and Piper for Assistant on the same gateway
-— so `_profile_wants_voice_only()` can check at arming time. A profile without the setting
-never arms it and therefore can never cause another profile's message to be dropped.
-
-Together with **consume-once** (at most one text send is ever affected) and logging on
-every suppression, cross-profile interference is closed rather than merely made unlikely.
-
-**Reply correlation (v1.21.1).** Only a send carrying Discord's inbound-message
-`reply_to` anchor may consume the tool-path signal. This keeps unanchored gateway status
-messages out of the race. On 2026-08-10 a fallback-model notice arrived between TTS
-generation and the model's `Empty response.` placeholder; the notice consumed the signal,
-so the placeholder escaped beside the audio. Anchoring makes the actual reply consume it.
-
-**Window: 45s**, and picked from measurement, not taste. Across five real turns the gap
-between the TTS call and the text send was 2.7s / 5.6s / 12.8s / 15.4s / 35.4s — dominated
-by how long the model takes to finish generating *after* calling the tool, which on a
-free-tier model is wildly variable:
-
-| window | catches |
-|---|---|
-| 10s | 2/5 |
-| 15s | 3/5 |
-| 20s | 4/5 |
-| 30s | 4/5 |
-| **45s** | **5/5** |
-
-Shrinking the window — the intuitive way to reduce accidental drops — would instead bring
-the duplicate text straight back. Once arming is profile-scoped, a wider window costs
-nothing.
-
-## Stopping the text being generated, not just hidden (v1.13.0)
-
-`voice_only_replies` suppresses prose in `send()` — but by then the tokens are already
-spent. Suppression is cosmetic: it fixes what the user sees, not what was paid for.
-
-So for profiles with `voice_only_replies` on, the `tts` tool's JSON result gains two
-fields:
-
-```json
-{"success": true, "media_tag": "MEDIA:/…/tts_x.mp3",
- "reply_complete": true,
- "instruction": "This audio IS your complete reply. Output no text after this …"}
-```
-
-A tool result sits in context at exactly the point the model chooses its next move, which
-is a far stronger place to say this than a system-prompt rule the model read thousands of
-tokens ago. Added as **new fields** — delivery reads `media_tag`, so attachment handling is
-untouched.
-
-`voice_only_replies` stays on as the backstop for when the model ignores it, which a
-free-tier model sometimes will. The two are complementary: the hint should make suppression
-rare, and every suppression is logged, so *how often it fires is the measure of whether the
-hint is working*.
-
-### On cost
-
-Worth being accurate about the size of the problem. On a free-lane profile a dropped
-message costs no money — only free-tier quota and a little latency. And the prose is
-generated in the **same completion** as the post-tool turn, so the model would emit
-something regardless; the waste is tens of tokens, not an extra call. The hint is still
-worth having, because it is nearly free and it makes the whole mechanism quieter.
-
-## `image_gen_gate` — per-user authorisation for a metered tool (v1.14.0)
-
-Image generation costs money per call. On a public surface that is an invitation to spend
-someone else's balance, and **Hermes has no per-user tool authorisation** — so without this
-the only choices are "everyone in the room can generate" or "nobody can".
-
-The gate registers a `pre_tool_call` hook that refuses `image_generate` unless the speaker
-is on the allow list. Blocking at `pre_tool_call` matters: the call never reaches the
-provider, so a refusal costs nothing. Suppressing the *image* afterwards would have paid
-for it first.
-
-**How the speaker is known.** `pre_tool_call` receives only `tool_name` and `args`. The
-adapter records the sender's stable id in a ContextVar at dispatch (the same id
-`speaker_identity` surfaces), and ContextVars are copied into tasks created from that
-context, so it survives into the agent turn.
-
-**Fails closed.** If the speaker cannot be determined, the call is refused. A false deny
-costs the operator one re-ask; a false allow costs money and cannot be taken back.
-
-Ids are normalised from a YAML list, a comma-separated string, or a bare scalar, because
-`hermes config set` coerces a numeric value to an int and a bracketed list to a string —
-all three shapes occur in practice, and mishandling them would make the policy silently
-read as "nobody is allowed".
-
-A profile without `image_gen_gate.enabled` is unaffected, so the operator's own agent keeps
-unrestricted access.
-
-## Dropping gateway plumbing notices (v1.16.0)
-
-Rerouting and dropping are different needs, so they are separate settings.
-
-A cron failure is useful *somewhere* — it goes to the operator's private channel via
-`reroute_channel`. But some notices are useful to **nobody except the log**:
-
-```
-⚠️ No activity for 15 min. If the agent does not respond soon, it will be
-timed out in 15 min. You can continue waiting or use /reset.
-```
-
-Companion posted that into the community room on 2026-08-07. It is session mechanics aimed at
-an operator, and there is no channel where it helps a room full of strangers. It comes from
-`gateway/run.py` through `adapter.send()`, which is why the plugin can intercept it.
-
-Dropped by default, logged not posted: `⚠️ No activity for`, `⏳ Still working`,
-`🔄 Reconnecting`, `⚠️ Session timed out`. Override with
-`system_notices.drop_patterns` (prefix match on the first 120 chars).
-
-## Drain notices in the profile's own voice (v1.17.0)
-
-Rerouting and dropping do not cover every notice. While the gateway is stopping or
-restarting it refuses new turns and says so:
-
-```
-⏳ Gateway is shutting down and is not accepting new work right now.
-```
-
-That is emitted **in reply to a message someone just sent**, so dropping it leaves them
-hanging, and rerouting it sends the answer to a channel they cannot see. It is the one
-class of notice that belongs exactly where it landed — just not in that wording. A
-persona bot announcing its own process lifecycle breaks character precisely when a
-stranger is watching.
-
-So it is rewritten, not suppressed:
-
-```yaml
-system_notices:
-  drain_notice: "I'm going to have a nap, remind me later."
-  drain_notice_queued: "I'm going to have a nap, but I'll answer this when I wake up."
-```
-
-Two settings because upstream emits two *different* facts. The refusal variants drop the
-message; the queued variant (`busy_input_mode: queue` or `steer`, during a restart) keeps
-it and answers after the gateway comes back. Telling someone to remind you later about a
-message already sitting in a queue is a small lie, and the bot will then answer it anyway,
-which reads as a bug. `drain_notice_queued` is optional and falls back to `drain_notice`.
-
-Matching is on the `⏳ Gateway <shutting down|restarting>` head, not the whole sentence, so
-an upstream rewording of the tail still matches. With neither key set — every profile that
-has not opted in — the stock notice goes out unchanged.
-
-## Empty markdown images (v1.15.0)
-
-A model that generated an image often also writes markdown for it — `![Luna Portrait]()` —
-while the platform is already delivering the picture as an attachment, so it renders as a
-broken image beside the real one. Same class as the `[Media: AUDIO:…]` leak: the model
-describing its own tool result instead of letting delivery handle it.
-
-Only **empty and local-path** targets are stripped. A markdown image pointing at a real
-`http(s)` URL is deliberate and survives — Klipy GIFs depend on that.
 
 ## Support development
 
@@ -1026,3 +393,7 @@ If this plugin saves you time, you can support continued development with an EVM
 ```
 
 Networks: Ethereum, Base, Polygon, and other EVM-compatible networks. Verify the address and selected network before sending; unsupported assets or networks may be unrecoverable.
+
+## License
+
+MIT

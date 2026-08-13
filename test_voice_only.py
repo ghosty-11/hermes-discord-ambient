@@ -68,7 +68,7 @@ async def main():
     # This is the observed 2026-08-10 ordering: TTS succeeds, a fallback
     # status races through send(), the model emits its placeholder, then the
     # MEDIA attachment is delivered. The internal notice must not consume the
-    # one text-suppression claim intended for the model's companion output.
+    # one text-suppression claim intended for the model's transcript.
     ambient._profile_wants_voice_only = lambda: True
     ambient._note_tts_generated()
 
@@ -87,7 +87,7 @@ async def main():
         getattr(fallback_result, "success", False) is True,
     )
     check(
-        "voice companion text is suppressed after the notice",
+        "voice transcript is suppressed after the notice",
         getattr(placeholder_result, "success", False) is True and not sent,
         repr(sent),
     )

@@ -77,10 +77,10 @@ to that 10k-line file keep flowing — and adds profile-scoped behaviours:
    DISPLAY NAME (adapter.py:7837, hardcoded). Display names are per-guild,
    user-editable and freely reused, so durable notes keyed on one merge two
    people or lose someone the day they rename — and an agent told to "record
-   the user id" cannot comply, because the id never reaches the model. With
-   `speaker_identity: true` a compact `[speaker @handle id:123]` prefix is
-   prepended once to the dispatched text, giving the agent the stable
-   account handle and numeric id to key memories on.
+   the user id" cannot comply, because the id never reaches the model. Setting
+   `speaker_identity: true` appends a compact `[speaker @handle id:123]`
+   request-only row, giving the agent the stable account handle and numeric id
+   without modifying the persisted user turn.
 11. SLASH-COMMAND POLICY — chat admission and slash auth share one gate
    upstream, so an answer-everyone community profile also hands /model,
    /reset, ... to everyone (and the per-profile allow-all env flag is not
@@ -243,11 +243,11 @@ _TTS_PATCHED = False
 # (the same process-global resolution that misfiles audio into another profile's
 # cache dir is the only signal available at TTS time), so this flag is
 # process-wide. Three things keep it safe:
-#   1. only profiles with voice_only_replies ever CONSULT it — today just Companion;
+#   1. only profiles with voice_only_replies consult it;
 #   2. it is consume-once, so at most one text send is ever affected;
 #   3. a short window, and every suppression is logged.
-# Residual risk: another profile generates speech and Companion sends unrelated
-# text inside the window — one message dropped, logged, never silence.
+# Residual risk: another profile generates speech and a voice-only profile sends
+# unrelated text inside the window — one message dropped, logged, never silence.
 # Measured over five real turns (2026-08-07): the gap between the TTS call and
 # the text send is 2.7s / 5.6s / 12.8s / 15.4s / 35.4s — dominated by how long
 # the model takes to FINISH generating after calling the tool, which on a
@@ -261,11 +261,10 @@ _last_tts_claimed: bool = True
 def _profile_wants_voice_only() -> bool:
     """Does the profile that is generating this speech want voice-only replies?
 
-    This is what keeps a process-wide signal from crossing profiles. It works
-    because config resolution IS profile-correct inside the TTS tool — proven by
-    the tool itself picking Edge for Companion and Piper for Assistant on the same
-    gateway. So a profile without voice_only_replies never arms the signal, and
-    can never cause another profile's message to be dropped.
+    This is what keeps a process-wide signal from crossing profiles. Config
+    resolution is profile-correct inside the TTS tool, so a profile without
+    voice_only_replies never arms the signal and cannot cause another profile's
+    message to be dropped.
     """
     try:
         from hermes_cli.config import load_config  # type: ignore
@@ -416,11 +415,11 @@ _MEDIA_NARRATION_RE = re.compile(
     re.IGNORECASE,
 )
 
-# A model that generated an image often ALSO writes markdown image syntax for it —
-# observed 2026-08-07 after an image_generate call: "![Luna Portrait]()". The platform
-# already delivers the picture as an attachment, so this renders as a broken image or
-# bare punctuation next to the real thing. Same class as the media-narration leak: the
-# model describing its own tool result instead of letting delivery handle it.
+# A model that generated an image often also writes empty markdown image syntax
+# such as "![Portrait]()". The platform already delivers the picture as an
+# attachment, so this renders as a broken image or bare punctuation next to the
+# real thing. Same class as the media-narration leak: the model describing its
+# own tool result instead of letting delivery handle it.
 #
 # Only EMPTY or local-path targets are stripped. A markdown image pointing at a real
 # http(s) URL is a deliberate link and must survive — Klipy GIFs rely on that.
@@ -490,6 +489,16 @@ _current_speaker_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 _no_thread_keys: contextvars.ContextVar[set] = contextvars.ContextVar(
     "hermes_ambient_no_thread", default=frozenset()
 )
+_speaker_context: contextvars.ContextVar[tuple] = contextvars.ContextVar(
+    "hermes_ambient_speaker_context", default=("", None)
+)
+_quiet_resume_pending: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "hermes_ambient_quiet_resume", default=False
+)
+_gif_profile_context: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "hermes_ambient_gif_profile", default=""
+)
+
 
 _DEFAULT_HINT = (
     "[ambient: nobody addressed you — you are simply present in the room. "
@@ -564,9 +573,8 @@ _SYSTEM_NOTICE_PREFIXES = ["⚠️ Cron '", "Cronjob Response:"]
 # so they are dropped and logged instead.
 #
 # The inactivity warning (gateway/run.py: "⚠️ No activity for N min ... use
-# /reset") is the one that prompted this: Companion posted it into the community
-# room 2026-08-07. It is emitted through adapter.send(), which is why the plugin
-# can catch it at all.
+# /reset") can otherwise reach a community room. It is emitted through
+# adapter.send(), which is why the plugin can catch it at all.
 _SYSTEM_NOTICE_DROP = [
     "⚠️ No activity for",
     "⏳ Still working",
@@ -629,8 +637,8 @@ _STALL_NOTICE_RE = re.compile(r"^⏱️\s*Agent inactive for\b")
 # `<|channel|>commentary to=functions.name<|constrain|>json<|message|>{...}`.
 # When the serving endpoint does not parse that format back into a structured
 # tool call, the raw control text falls through as ordinary assistant content
-# and the bot posts its own plumbing to the channel. Observed 2026-08-06:
-# Companion answered a GIF request with the literal string
+# and the bot posts its own plumbing to the channel. A malformed GIF tool call,
+# for example, can surface as the literal string
 # `to=functions.tool_call?commentary?…?…???`.
 #
 # This is never intentional output, so stripping is always safe. What is NOT
@@ -673,18 +681,15 @@ _CODE_FENCE_RE = re.compile(r"(```)")
 # Matching is done per whitespace-separated token, not with one regex over the
 # whole message: a greedy URL pattern silently swallows trailing punctuation
 # and the neighbouring word.
-# SPEAKER-TAG ECHO. This plugin prefixes every INBOUND message with
-# `[speaker @handle id:123]` so the agent can key memories on stable identity.
-# Models routinely infer the wrong thing from that: "messages start with a
-# speaker tag, I am writing a message, therefore mine starts with one too", and
-# emit their own reply prefixed with a tag naming themselves. Observed
-# 2026-08-06: Companion opened a reply with `[speaker @companion id:123]` — the id
-# copied verbatim from the *example* in her own AGENTS.md.
+# SPEAKER-TAG ECHO. This plugin adds a request-only
+# `[speaker @handle id:123]` row so the agent can key memories on stable identity.
+# Models can infer the wrong thing from that structural pattern and emit a reply
+# prefixed with a tag naming themselves, sometimes copying the numeric id from
+# the prompt example.
 #
-# Her instructions say never to echo it, in two separate files. She did anyway,
-# because a strong structural pattern beats a prose prohibition on a small
-# model. The tag is ours, injected by us, so stripping it on the way out is
-# ours too: prompt guidance is necessary but demonstrably not sufficient.
+# Prompt guidance is not sufficient for a generated structural prefix. The tag
+# is plugin-owned context, so outbound stripping prevents it from becoming
+# visible chat content.
 _SPEAKER_ECHO_RE = re.compile(r"\[speaker\b[^\]\n]{0,120}\]", re.IGNORECASE)
 
 # The ambient DIRECTIVE echo — the same failure as the speaker tag above, in the
@@ -849,8 +854,10 @@ class AmbientDiscordAdapter(DiscordAdapter):
         self._ambient_last: float = 0.0
         self._react_last: float = 0.0
         self._presence_task: Any = None
-        self._seen_path = self._ambient_seen_path()
-        self._last_seen: dict[str, float] = self._load_seen()
+        self._seen_path = None
+        self._last_seen: dict[str, float] = {}
+        self._seen_loaded = False
+
         # Bot-bounce state, in-memory only (a restart resetting everyone's
         # patience is harmless). (channel_id, bot_id) -> count/limit/last.
         self._bounce_pairs: dict[tuple[str, str], dict[str, float]] = {}
@@ -1377,16 +1384,48 @@ class AmbientDiscordAdapter(DiscordAdapter):
         event.text = f"{note}\n\n{original}" if original else note
         logger.info("ambient.embed_media: injected local video transcript (%d chars)", len(joined))
 
+    def _bot_user_id(self) -> str:
+        try:
+            user = getattr(getattr(self, "_client", None), "user", None)
+            return str(getattr(user, "id", "") or "")
+        except Exception:
+            return ""
+
     # ---- last-seen persistence (survives gateway restarts) ---------------
-    def _ambient_seen_path(self) -> str:
+    def _ambient_seen_path(self) -> str | None:
+        """Keyed on the bot's Discord user id, same reason as catch-up state.
+
+        Under the multiplexed gateway HERMES_HOME is root's for every profile,
+        so a shared filename would merge two seats' last-seen maps.
+        """
+        uid = self._bot_user_id()
+        if not uid:
+            return None
         try:
             home = os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
-            return os.path.join(home, "state", "ambient-last-seen.json")
+            return os.path.join(home, "state", f"ambient-last-seen-{uid}.json")
         except Exception:
-            return "/tmp/ambient-last-seen.json"
+            return None
+
+    def _ensure_seen_loaded(self) -> None:
+        if getattr(self, "_seen_loaded", False):
+            return
+        path = self._ambient_seen_path()
+        if not path:
+            return
+        legacy_path = os.path.join(os.path.dirname(path), "ambient-last-seen.json")
+        migrate_legacy = not os.path.exists(path) and os.path.exists(legacy_path)
+        self._seen_path = legacy_path if migrate_legacy else path
+        self._last_seen = self._load_seen()
+        self._seen_path = path
+        self._seen_loaded = True
+        if migrate_legacy:
+            self._save_seen()
 
     def _load_seen(self) -> dict:
         try:
+            if not getattr(self, "_seen_path", None):
+                return {}
             with open(self._seen_path) as fh:
                 data = json.load(fh)
             return {str(k): float(v) for k, v in data.items()}
@@ -1395,6 +1434,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
 
     def _save_seen(self) -> None:
         try:
+            self._ensure_seen_loaded()
+            if not getattr(self, "_seen_path", None):
+                return
             os.makedirs(os.path.dirname(self._seen_path), exist_ok=True)
             trimmed = dict(sorted(self._last_seen.items(), key=lambda kv: kv[1])[-500:])
             tmp = f"{self._seen_path}.tmp"
@@ -1403,6 +1445,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             os.replace(tmp, self._seen_path)
         except Exception:
             logger.debug("ambient: could not persist last-seen", exc_info=True)
+
 
     # ---- the seam -------------------------------------------------------
     def _discord_free_response_channels(self) -> set:
@@ -1506,7 +1549,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
 
     def _channel_allowed(self, message: Any) -> bool:
         cfg = self._ambient_cfg()
-        allow = {str(c).strip().lower() for c in (cfg.get("channels") or []) if str(c).strip()}
+        allow = {c.lower() for c in _id_set(cfg.get("channels"))}
         if not allow:
             return False  # unset = ambient off; opt in explicitly
         if "*" in allow:
@@ -1519,6 +1562,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
         if parent:
             keys.add(str(parent))
         return bool(keys & allow)
+
 
     def _basic_ambient_eligible(self, message: Any) -> bool:
         """Shared safety floor. Auth/dedup/bot policy are NOT checked here —
@@ -1543,11 +1587,13 @@ class AmbientDiscordAdapter(DiscordAdapter):
         if not rc.get("enabled"):
             return 0.0
         try:
+            self._ensure_seen_loaded()
             uid = str(message.author.id)
             now = time.time()
             prev = self._last_seen.get(uid)
             self._last_seen[uid] = now
             self._save_seen()
+
             if prev is None:
                 return 0.0  # first sighting ever isn't a "return"
             days = (now - prev) / 86400.0
@@ -2086,12 +2132,17 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # ambient and the bot-bounce goodbye path set the hint somewhere inside,
         # and neither should be able to leak one into the NEXT message's turn.
         hint_token = _ambient_hint.set("")
+        speaker_token = _speaker_context.set(("", None))
+        gif_token = _gif_profile_context.set(self._bot_user_id())
         try:
             return await self._dispatch_inner(message)
         finally:
             _ambient_hint.reset(hint_token)
+            _speaker_context.reset(speaker_token)
+            _gif_profile_context.reset(gif_token)
             if token is not None:
                 _no_thread_keys.reset(token)
+
 
     async def _dispatch_recovered_message(self, message: Any) -> bool:
         """Missed-message backfill dispatches recovered messages through here
@@ -2102,6 +2153,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
         everything else runs the stock recovery gates untouched.
         """
         token = self._ambient_no_thread_token(message)
+        gif_token = _gif_profile_context.set(self._bot_user_id())
         try:
             verdict = self._bounce_pre_dispatch(message)
             if verdict == "suppress":
@@ -2112,6 +2164,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 self._bounce_note_dispatch(message)
             return handled
         finally:
+            _gif_profile_context.reset(gif_token)
             if token is not None:
                 _no_thread_keys.reset(token)
 
@@ -2348,20 +2401,21 @@ class AmbientDiscordAdapter(DiscordAdapter):
             return None
 
     def _apply_speaker_tag(self, message: Any) -> None:
-        """Prepend the speaker tag once, in place. Never raises."""
+        """Stage speaker identity for request-only delivery. Never raises.
+
+        The outgoing LLM request receives the tag and recall block without
+        modifying the user turn that Hermes persists.
+        """
         tag = self._speaker_tag(message)
         if not tag:
             return
         try:
-            content = getattr(message, "content", "") or ""
-            if content.startswith("[speaker "):
-                return  # already tagged (re-dispatch or backfill replay)
             author = getattr(message, "author", None)
             known = self._speaker_memory(str(getattr(author, "id", "") or ""))
-            prefix = f"{tag}\n{known}\n" if known else f"{tag}\n"
-            message.content = f"{prefix}{content}"
+            _speaker_context.set((tag, known))
         except Exception:
-            pass  # frozen message object; identity is a nicety, not a gate
+            pass
+
 
     def _remember_discord_identities(self, message: Any) -> None:
         """Remember unambiguous IDs for authors visibly present in a channel.
@@ -3018,16 +3072,20 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # release it so the check-in can claim it exactly once (same reasoning as
         # the ambient re-dispatch in _dispatch_inner).
         self._dedup.discard(str(getattr(target, "id", "")))
+        speaker_token = _speaker_context.set(("", None))
         self._apply_speaker_tag(target)
 
         hint_token = _ambient_hint.set(hint)
         thread_token = self._ambient_no_thread_token(target)
         open_token = _ambient_open.set(True)
+        gif_token = _gif_profile_context.set(self._bot_user_id())
         try:
             handled = await super()._dispatch_discord_message(target)
         finally:
             _ambient_open.reset(open_token)
             _ambient_hint.reset(hint_token)
+            _speaker_context.reset(speaker_token)
+            _gif_profile_context.reset(gif_token)
             if thread_token is not None:
                 _no_thread_keys.reset(thread_token)
 
@@ -3463,11 +3521,13 @@ class AmbientDiscordAdapter(DiscordAdapter):
         is a second guard for the case where a turn dies before sending at all
         and the next unrelated message would otherwise inherit the GIF.
         """
-        pending = _gif_state.get("pending")
+        state = _gif_bucket(self._bot_user_id() or None)
+        pending = state.get("pending")
         if not pending:
             return media
         url, ts = pending
-        _gif_state["pending"] = None
+        state["pending"] = None
+
         cfg = _gif_config()
         if not cfg.get("attach_if_omitted", True):
             return media
@@ -3772,7 +3832,27 @@ class AmbientDiscordAdapter(DiscordAdapter):
 # config.yaml is world-readable-ish and goes nowhere near a git remote).
 # "pending" holds (url, fetched_at) between the tool returning a URL and the
 # adapter sending the reply, so a model that forgets to paste it still posts it.
-_gif_state: dict = {"last": 0.0, "hits": deque(maxlen=256), "pending": None}
+# One bucket per profile: a process-wide dict would attach one seat's GIF to
+# another seat's next send under multiplex.
+_gif_buckets: dict = {}
+
+
+def _gif_profile_key() -> str:
+    active = _gif_profile_context.get("")
+    if active:
+        return active
+    home = os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    return os.path.basename(os.path.normpath(home)) or "default"
+
+
+def _gif_bucket(profile: str | None = None) -> dict:
+    key = str(profile or _gif_profile_key() or "default")
+    bucket = _gif_buckets.get(key)
+    if bucket is None:
+        bucket = {"last": 0.0, "hits": deque(maxlen=256), "pending": None}
+        _gif_buckets[key] = bucket
+    return bucket
+
 
 
 def _gif_config() -> dict:
@@ -3836,15 +3916,17 @@ def _gif_handle(args: dict, **_: Any) -> str:
     # does not disambiguate them either. Log which one, with the numbers: working
     # this out from timestamps alone cost a diagnosis on 2026-08-06.
     now = time.time()
+    state = _gif_bucket()
     _interval = float(cfg.get("min_interval_seconds", 60))
-    _since = now - float(_gif_state["last"])
+    _since = now - float(state["last"])
     if _since < _interval:
         logger.info(
             "gif_search: refused %r — cooldown, %.0fs since last of %.0fs",
             query, _since, _interval,
         )
         return "No GIF this time — you just posted one. Reply in words."
-    hits = _gif_state["hits"]
+    hits = state["hits"]
+
     cutoff = now - 86400
     while hits and hits[0] < cutoff:
         hits.popleft()
@@ -3870,7 +3952,7 @@ def _gif_handle(args: dict, **_: Any) -> str:
         # and the webp/mp4/webm we want are simply absent. Verified against the
         # live API 2026-08-06: dropping it returns the same 8 items, each with
         # all of gif/webp/jpg/mp4/webm. Do not "tidy" this back in.
-        "customer_id": str(args.get("customer_id") or "companion")[:64],
+        "customer_id": "hermes-discord-ambient",
     })
     url = f"https://api.klipy.com/api/v1/{key}/gifs/search?{params}"
     try:
@@ -3917,7 +3999,7 @@ def _gif_handle(args: dict, **_: Any) -> str:
         return f"gif_search: nothing found for {query!r}."
 
     chosen = _random.choice(urls[: max(1, int(cfg.get("pick_from", 5)))])
-    _gif_state["last"] = now
+    state["last"] = now
     hits.append(now)
     # Hand the URL to send() as well as to the model. A tool whose whole
     # contract is "echo this exact string back" is unreliable on a small model:
@@ -3927,7 +4009,8 @@ def _gif_handle(args: dict, **_: Any) -> str:
     # adapter attaches it if the reply omits it — delivery is ours, not the
     # model's. Consumed (or expired) in send(); [SILENT] returns earlier, so a
     # reply the agent chose to swallow never drags a GIF out with it.
-    _gif_state["pending"] = (chosen, now)
+    state["pending"] = (chosen, now)
+
     logger.info("gif_search: %r -> %s", query, chosen[:60])
     # The URL is deliberately NOT returned to the model. There must be exactly
     # ONE thing that posts a GIF, and it is send(). Handing the model a URL
@@ -3970,8 +4053,7 @@ _GATED_TOOLS = {"image_generate"}
 
 
 def _image_gate_cfg() -> dict:
-    """Read this profile's gate config. Profile-correct: proven by the TTS tool
-    resolving Edge for Companion and Piper for Assistant on the same gateway."""
+    """Read image-gate config from the profile active for this request."""
     try:
         from hermes_cli.config import load_config  # type: ignore
 
@@ -4294,35 +4376,26 @@ def _is_resume_turn(user_message: Any, history: Any, depth: int = 3) -> bool:
 
 
 def _on_llm_request_ambient_hint(**kwargs: Any):
-    """Deliver this turn's ambient/direct directive as a request-only message.
+    """Deliver this turn's directives as request-only user rows.
 
-    Returns ``{"request": ...}`` with the hint appended, or None to leave the
-    payload byte-identical — which is the case for every turn that is not an
-    ambient join, on every profile and platform, because `_ambient_hint` is only
-    ever set inside an ambient dispatch.
-
-    Appended at the END of the message list on purpose: the cached prefix stays
-    intact (AGENTS.md prompt-cache invariant), and a trailing instruction is the
-    position models weight most heavily — which is the whole point of a directive.
-
-    Appended as a USER row, not system: several OpenAI-compatible providers
-    enforce system-first message order and reject any non-leading system row
-    with HTTP 400 "System message must be at the beginning" (observed live
-    2026-08-11/12). A trailing system directive silently killed the primary
-    model lane on every ambient turn and pushed the seat onto its fallback.
-    The bracketed hint text keeps it reading as a directive.
-
-    Nothing here may raise. A failure returns None and the turn proceeds with the
-    stock payload; losing a hint costs one over-chatty reply, while raising would
-    cost the whole conversation.
+    Ambient/direct hints, speaker identity, speaker memory, and quiet-resume
+    all append here. Nothing is written onto the persisted user turn.
     """
     try:
-        hint = (
-            _DIRECT_REPLY_HINT
-            if _direct_address.get(False)
-            else _ambient_hint.get("")
-        )
-        if not hint:
+        extras: list[str] = []
+        if _direct_address.get(False):
+            extras.append(_DIRECT_REPLY_HINT)
+        else:
+            ambient_hint = _ambient_hint.get("")
+            if ambient_hint:
+                extras.append(ambient_hint)
+        tag, known = _speaker_context.get(("", None))
+        if tag:
+            extras.append(f"{tag}\n{known}" if known else tag)
+        if _quiet_resume_pending.get(False):
+            extras.append(_QUIET_RESUME_DIRECTIVE)
+            _quiet_resume_pending.set(False)
+        if not extras:
             return None
         request = kwargs.get("request")
         if not isinstance(request, dict):
@@ -4331,8 +4404,17 @@ def _on_llm_request_ambient_hint(**kwargs: Any):
         if not isinstance(messages, list) or not messages:
             return None
         patched = dict(request)
-        patched["messages"] = list(messages) + [{"role": "user", "content": hint}]
-        kind = "direct-address" if _direct_address.get(False) else "ambient"
+        patched["messages"] = list(messages) + [
+            {"role": "user", "content": block} for block in extras
+        ]
+        if _direct_address.get(False):
+            kind = "direct-address"
+        elif _ambient_hint.get(""):
+            kind = "ambient"
+        elif any("gateway restarted" in block.lower() for block in extras):
+            kind = "quiet-resume"
+        else:
+            kind = "speaker"
         logger.info(
             "ambient: %s directive delivered via llm_request middleware (request-only)",
             kind,
@@ -4343,6 +4425,7 @@ def _on_llm_request_ambient_hint(**kwargs: Any):
         return None
 
 
+
 def _on_pre_llm_call_quiet_resume(**kwargs: Any):
     try:
         if not _ambient_cfg("quiet_resume"):
@@ -4351,11 +4434,13 @@ def _on_pre_llm_call_quiet_resume(**kwargs: Any):
             kwargs.get("user_message"), kwargs.get("conversation_history")
         ):
             return None
-        logger.info("ambient.quiet_resume: suppressing restart acknowledgement")
-        return {"context": _QUIET_RESUME_DIRECTIVE}
+        _quiet_resume_pending.set(True)
+        logger.info("ambient.quiet_resume: resume notice staged for request-only delivery")
+        return None
     except Exception:  # noqa: BLE001 — a cosmetic hook must never break a turn
         logger.debug("ambient.quiet_resume: hook failed; turn proceeds", exc_info=True)
         return None
+
 
 
 # ---- compaction focus ------------------------------------------------------
@@ -4376,8 +4461,8 @@ def _on_pre_llm_call_quiet_resume(**kwargs: Any):
 # very end of its prompt so it takes precedence, with the instruction that the
 # focus should receive roughly 60-70% of the summary token budget. It is already
 # wired to `_derive_auto_focus_topic`, which infers one from the most recent user
-# turns. Recency is a sensible default and the wrong one here: what a companion
-# needs to carry across a boundary is not "what was just said" but "who these
+# turns. Recency is a sensible default and the wrong one here: what a social
+# agent needs to carry across a boundary is not "what was just said" but "who these
 # people are" — which is durable, and which recency-based focus discards exactly
 # when the window is longest and the relationship most established.
 #
