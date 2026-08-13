@@ -343,6 +343,15 @@ venv/bin/python /path/to/hermes-discord-ambient/test_catchup.py
 
 Needs the framework venv. Quiet-hours cases pin the clock to 03:00.
 
+## Known limitations
+
+- Voice-only TTS suppression is a process-global, consume-once signal. Concurrent voice
+  turns from multiplexed profiles can consume one another's 45-second suppression claim,
+  so avoid enabling `voice_only_replies` on profiles that may speak concurrently.
+- The test commands assume the Hermes framework checkout and virtualenv live at
+  `/var/lib/hermes/.hermes/hermes-agent`. On another installation, substitute that
+  checkout's `venv/bin/python` path.
+
 ## Maintenance
 
 The plugin depends on private adapter methods. `discord-adapter-watch.sh` hashes those

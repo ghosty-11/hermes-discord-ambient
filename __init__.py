@@ -1617,9 +1617,13 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 return None
             content = (getattr(message, "content", "") or "").lower()
             # A plain-text name reference is the case Discord's @-mention
-            # detection misses entirely.
-            triggers = [str(t).lower() for t in (cfg.get("name_triggers") or [])]
-            if triggers and any(t in content for t in triggers):
+            # detection misses entirely. Config may arrive as a scalar string;
+            # match complete name tokens so "cat" does not trigger "education".
+            triggers = [t.lower() for t in _as_list(cfg.get("name_triggers"))]
+            if any(
+                re.search(rf"(?<![\w-]){re.escape(trigger)}(?![\w-])", content)
+                for trigger in triggers
+            ):
                 floor = float(cfg.get("name_cooldown_seconds", 60))
                 if time.time() - self._ambient_last < floor:
                     return None
@@ -2128,6 +2132,12 @@ class AmbientDiscordAdapter(DiscordAdapter):
 
     async def _dispatch_discord_message(self, message: Any) -> bool:
         token = self._ambient_no_thread_token(message)
+        # Authorization is transport identity, not optional prompt decoration.
+        # Scope it at every dispatch entry so disabled speaker tags cannot cause
+        # false denies and a reused task cannot retain the previous author.
+        authorization_token = _current_speaker_id.set(
+            str(getattr(getattr(message, "author", None), "id", "") or "")
+        )
         # Open a fresh directive scope per dispatch and close it here. Both the
         # ambient and the bot-bounce goodbye path set the hint somewhere inside,
         # and neither should be able to leak one into the NEXT message's turn.
@@ -2140,6 +2150,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             _ambient_hint.reset(hint_token)
             _speaker_context.reset(speaker_token)
             _gif_profile_context.reset(gif_token)
+            _current_speaker_id.reset(authorization_token)
             if token is not None:
                 _no_thread_keys.reset(token)
 
@@ -2153,6 +2164,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
         everything else runs the stock recovery gates untouched.
         """
         token = self._ambient_no_thread_token(message)
+        authorization_token = _current_speaker_id.set(
+            str(getattr(getattr(message, "author", None), "id", "") or "")
+        )
         gif_token = _gif_profile_context.set(self._bot_user_id())
         try:
             verdict = self._bounce_pre_dispatch(message)
@@ -2165,6 +2179,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             return handled
         finally:
             _gif_profile_context.reset(gif_token)
+            _current_speaker_id.reset(authorization_token)
             if token is not None:
                 _no_thread_keys.reset(token)
 
@@ -2261,7 +2276,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
 
     # ---- stable speaker identity -----------------------------------------
     def _speaker_tag(self, message: Any) -> str | None:
-        """A compact `[speaker @name id:123]` prefix, or None when disabled.
+        """A compact `[speaker @name id:123]` request annotation, or None.
 
         WHY: upstream labels every inbound message with
         `user_name=message.author.display_name` (adapter.py:7837, hardcoded, no
@@ -2271,9 +2286,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
         are the stable identifiers, and neither reaches the model — so an agent
         told to "record the user id" cannot comply, however firmly it is asked.
 
-        This surfaces both, once, at the front of the dispatched text. The
-        agent's memory guidance keys notes on them and is told never to echo
-        the tag back into chat.
+        The outgoing LLM request receives both identifiers without modifying
+        the persisted user turn. Authorization identity is scoped separately at
+        dispatch entry and never depends on this optional presentation feature.
         """
         try:
             if not (self._ambient_enabled()
@@ -2286,12 +2301,6 @@ class AmbientDiscordAdapter(DiscordAdapter):
             # .name is the stable account handle; display_name is the mutable one.
             handle = str(getattr(author, "name", "")
                          or getattr(author, "display_name", "") or "").strip()
-            # Record the speaker for the duration of this dispatch so tool-level
-            # gates can authorise on a stable id rather than a display name.
-            try:
-                _current_speaker_id.set(uid)
-            except Exception:
-                pass
             return f"[speaker @{handle} id:{uid}]" if handle else f"[speaker id:{uid}]"
         except Exception:
             logger.debug("ambient: speaker tag failed", exc_info=True)
@@ -3072,6 +3081,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # release it so the check-in can claim it exactly once (same reasoning as
         # the ambient re-dispatch in _dispatch_inner).
         self._dedup.discard(str(getattr(target, "id", "")))
+        authorization_token = _current_speaker_id.set(
+            str(getattr(getattr(target, "author", None), "id", "") or "")
+        )
         speaker_token = _speaker_context.set(("", None))
         self._apply_speaker_tag(target)
 
@@ -3086,6 +3098,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             _ambient_hint.reset(hint_token)
             _speaker_context.reset(speaker_token)
             _gif_profile_context.reset(gif_token)
+            _current_speaker_id.reset(authorization_token)
             if thread_token is not None:
                 _no_thread_keys.reset(thread_token)
 

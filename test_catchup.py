@@ -194,6 +194,7 @@ def stub_dispatch():
         seen["hint"] = amb._ambient_hint.get("")
         seen["open"] = amb._ambient_open.get()
         seen["speaker"] = amb._speaker_context.get(("", None))
+        seen["authorized_speaker"] = amb._current_speaker_id.get("")
         return True
 
     _ad.DiscordAdapter._dispatch_discord_message = fake
@@ -235,6 +236,16 @@ async def main():
         "catch-up speaker identity is cleared after dispatch",
         amb._speaker_context.get(("", None)) == ("", None),
         repr(amb._speaker_context.get(("", None))),
+    )
+    check(
+        "catch-up authorization uses the current author",
+        d.get("authorized_speaker") == "2",
+        repr(d.get("authorized_speaker")),
+    )
+    check(
+        "catch-up authorization identity is cleared after dispatch",
+        amb._current_speaker_id.get("") == "",
+        repr(amb._current_speaker_id.get("")),
     )
 
     print("\n-- the echo rule must catch every bracketed line of that hint --")
