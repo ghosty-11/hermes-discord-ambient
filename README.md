@@ -1,5 +1,7 @@
 # hermes-discord-ambient
 
+[![Support this work](https://img.shields.io/badge/Support-EVM-6f42c1?logo=ethereum&logoColor=white)](#support-development)
+
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) user plugin that gives a
 Discord bot **ambient presence** — the ability to lurk in a community, react, occasionally
 join a conversation it wasn't addressed in, and decide *not* to speak.
@@ -1014,3 +1016,13 @@ describing its own tool result instead of letting delivery handle it.
 
 Only **empty and local-path** targets are stripped. A markdown image pointing at a real
 `http(s)` URL is deliberate and survives — Klipy GIFs depend on that.
+
+## Support development
+
+If this plugin saves you time, you can support continued development with an EVM donation:
+
+```text
+0x9600c9bc632175941608a1b551cb0f018f0f40b4
+```
+
+Networks: Ethereum, Base, Polygon, and other EVM-compatible networks. Verify the address and selected network before sending; unsupported assets or networks may be unrecoverable.
