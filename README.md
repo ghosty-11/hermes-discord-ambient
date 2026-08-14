@@ -406,3 +406,5 @@ Networks: Ethereum, Base, Polygon, and other EVM-compatible networks. Verify the
 ## License
 
 MIT
+
+<sub>Made with love, with help from AI agents.</sub>
