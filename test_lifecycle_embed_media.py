@@ -47,6 +47,13 @@ def make_adapter():
         extra={
             "ambient_presence": {
                 "enabled": True,
+                "probability": 0.15,
+                "no_threads": True,
+                "catch_up": {"enabled": False},
+                "reply_style": {
+                    "enabled": True,
+                    "standalone_marker": "[STANDALONE]",
+                },
                 "gateway_lifecycle": {
                     "enabled": True,
                     "shrine_channel": "shrine",
@@ -80,6 +87,7 @@ async def check_lifecycle():
     print("\n-- gateway lifecycle messages --")
     sent = []
     base_disconnects = []
+    activation_logs = []
 
     async def base_connect(self, *, is_reconnect=False):
         return True
@@ -105,6 +113,9 @@ async def check_lifecycle():
         if task is not None:
             await task
 
+    def capture_info(message, *args):
+        activation_logs.append(message % args if args else str(message))
+
     with (
         patch.object(discord_adapter.DiscordAdapter, "connect", base_connect),
         patch.object(discord_adapter.DiscordAdapter, "disconnect", base_disconnect),
@@ -116,9 +127,21 @@ async def check_lifecycle():
             create=True,
         ),
         patch.object(ambient.random, "random", side_effect=[0.39, 0.24, 0.39]),
+        patch.object(ambient.logger, "info", capture_info),
     ):
         adapter = make_adapter()
         await adapter.connect(is_reconnect=False)
+        check(
+            "connect reports the active ambient routing policy",
+            any(
+                "ambient: active" in line
+                and "probability=0.15" in line
+                and "no_threads=True" in line
+                and "reply_style=True" in line
+                for line in activation_logs
+            ),
+            repr(activation_logs),
+        )
         await finish_generation(adapter)
         check(
             "a roll below 0.4 sends a model-generated shrine return",

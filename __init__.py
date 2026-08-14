@@ -961,6 +961,29 @@ class AmbientDiscordAdapter(DiscordAdapter):
         ).strip()
         return fallback or "I'm here."
 
+    def _reply_style_cfg(self) -> dict:
+        return self._sub("reply_style")
+
+    def _standalone_marker(self) -> str:
+        marker = str(
+            self._reply_style_cfg().get("standalone_marker") or "[STANDALONE]"
+        ).strip()
+        return marker or "[STANDALONE]"
+
+    def _extract_standalone_reply(self, content: str) -> tuple[str, bool]:
+        """Remove an enabled room-wide marker from the start of model output."""
+        cfg = self._reply_style_cfg()
+        if not cfg.get("enabled"):
+            return content, False
+        marker = self._standalone_marker()
+        dressed = re.compile(
+            rf"^\s*(?:[*_~`]{{0,3}}\s*)?{re.escape(marker)}"
+            rf"(?:\s*[*_~`]{{0,3}})?(?:\s+|$)",
+            re.IGNORECASE,
+        )
+        cleaned, count = dressed.subn("", content, count=1)
+        return cleaned.lstrip(), bool(count)
+
     def _annotate_reply_context(self, event: Any) -> None:
         """Restore Discord reply-author fields omitted by the stock adapter."""
         try:
@@ -3289,6 +3312,17 @@ class AmbientDiscordAdapter(DiscordAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         ok = await super().connect(is_reconnect=is_reconnect)
+        if ok:
+            cfg = self._ambient_cfg()
+            logger.info(
+                "ambient: active enabled=%s probability=%s no_threads=%s "
+                "catch_up=%s reply_style=%s",
+                bool(cfg.get("enabled")),
+                cfg.get("probability", 0),
+                bool(cfg.get("no_threads")),
+                bool(self._sub("catch_up").get("enabled")),
+                bool(self._reply_style_cfg().get("enabled")),
+            )
         if ok and not is_reconnect and not self._lifecycle_return_sent:
             self._lifecycle_return_sent = True
             await self._announce_gateway_return()
@@ -3584,6 +3618,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
             pass
 
         reply_to = kwargs.get("reply_to", args[0] if args else None)
+        standalone = False
+        if self._ambient_enabled() and isinstance(content, str):
+            content, standalone = self._extract_standalone_reply(content)
 
         # Inbound-speech echo: the gateway posts 🎙️ "<transcript>" so a user can
         # verify STT quality. Useful on an operator surface, noise on a public
@@ -3746,7 +3783,11 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     fallback,
                 )
                 content = fallback
-            screened, n_echo = _screen_ambient_reply(content, marker)
+                standalone = False
+            if standalone and not content.strip():
+                screened, n_echo = None, 0
+            else:
+                screened, n_echo = _screen_ambient_reply(content, marker)
             if n_echo:
                 # WARNING, not info: the model just tried to publish an instruction
                 # we gave it. The rule caught it, but the frequency of this line is
@@ -3762,6 +3803,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
                         "ambient.direct: replaced an empty direct reply with fallback: %r",
                         screened,
                     )
+                    standalone = False
                 else:
                     logger.info(
                         "ambient: response suppressed (%s sentinel or bare directive echo)",
@@ -3785,6 +3827,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # 2026-08-08 leak reached the channel. A fully-suppressed reply is accounted
         # for exactly like a [SILENT] one: it never went out, so it must not be
         # charged to the bot-bounce pair.
+        send_args = args
+        send_kwargs = kwargs
         if isinstance(content, str):
             await self._refresh_plain_mention_history(content, chat_id)
             scrubbed = self._scrub_outbound(content, chat_id)
@@ -3798,6 +3842,19 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 except Exception:
                     return None
             content = scrubbed
+            if standalone:
+                send_kwargs = dict(kwargs)
+                if "reply_to" in send_kwargs:
+                    send_kwargs["reply_to"] = None
+                elif send_args:
+                    send_args = (None, *send_args[1:])
+                else:
+                    send_kwargs["reply_to"] = None
+                logger.info(
+                    "ambient: sending room-wide reply without Discord reference "
+                    "(anchor=%s)",
+                    reply_to,
+                )
 
             # Media isolation, after scrubbing so a suppressed reply never
             # reaches it. The prose keeps the reply anchor and any metadata;
@@ -3810,7 +3867,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 if media:
                     first = None
                     if rest:
-                        first = await super().send(chat_id, rest, *args, **kwargs)
+                        first = await super().send(
+                            chat_id, rest, *send_args, **send_kwargs
+                        )
                     for url in media:
                         sent = await super().send(chat_id, url)
                         if first is None:
@@ -3825,7 +3884,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     self._direct_count_sent(reply_to, first)
                     return first
 
-        result = await super().send(chat_id, content, *args, **kwargs)
+        result = await super().send(chat_id, content, *send_args, **send_kwargs)
         self._bounce_count_sent(reply_to, result)
         self._catchup_count_sent(reply_to, result)
         self._direct_count_sent(reply_to, result)
@@ -4396,6 +4455,21 @@ def _on_llm_request_ambient_hint(**kwargs: Any):
     """
     try:
         extras: list[str] = []
+        reply_style = _ambient_cfg("reply_style", {})
+        reply_style_enabled = bool(
+            isinstance(reply_style, dict) and reply_style.get("enabled")
+        )
+        if reply_style_enabled:
+            marker = str(
+                reply_style.get("standalone_marker") or "[STANDALONE]"
+            ).strip() or "[STANDALONE]"
+            extras.append(
+                "[ambient reply placement: Responses normally use Discord's reply "
+                f"feature. Begin a room-wide/general remark with exactly {marker} "
+                "only when its audience and addressee are already obvious. Do not "
+                "use it for a direct question, an older message, or ambiguous "
+                "attribution. The marker is removed before delivery.]"
+            )
         if _direct_address.get(False):
             extras.append(_DIRECT_REPLY_HINT)
         else:
@@ -4426,6 +4500,8 @@ def _on_llm_request_ambient_hint(**kwargs: Any):
             kind = "ambient"
         elif any("gateway restarted" in block.lower() for block in extras):
             kind = "quiet-resume"
+        elif reply_style_enabled:
+            kind = "reply-placement"
         else:
             kind = "speaker"
         logger.info(

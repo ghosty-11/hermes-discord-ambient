@@ -95,6 +95,10 @@ def make_adapter():
                 "silent_marker": "[SILENT]",
                 "direct_silence_fallback": "I'm here.",
                 "text_hygiene": {"resolve_plain_mentions": True},
+                "reply_style": {
+                    "enabled": True,
+                    "standalone_marker": "[STANDALONE]",
+                },
             }
         }
     )
@@ -193,6 +197,35 @@ async def main():
         ) is True,
     )
 
+    print("\n-- reply placement guidance is request-only --")
+    original_cfg = ambient._ambient_cfg
+    ambient._ambient_cfg = lambda key, default=None: (
+        {
+            "enabled": True,
+            "standalone_marker": "[STANDALONE]",
+        }
+        if key == "reply_style"
+        else default
+    )
+    try:
+        request = {"messages": [{"role": "user", "content": "hello"}]}
+        patched = ambient._on_llm_request_ambient_hint(request=request)
+        messages = ((patched or {}).get("request") or {}).get("messages", [])
+        check(
+            "the model receives standalone-placement guidance",
+            bool(messages)
+            and "[STANDALONE]" in messages[-1].get("content", "")
+            and "room-wide" in messages[-1].get("content", "").lower(),
+            repr(messages),
+        )
+        check(
+            "reply-placement guidance does not mutate the persisted request",
+            len(request["messages"]) == 1,
+            repr(request["messages"]),
+        )
+    finally:
+        ambient._ambient_cfg = original_cfg
+
     print("\n-- outbound direct silence becomes an acknowledgment --")
     sent = []
 
@@ -215,6 +248,63 @@ async def main():
         "the completed direct marker is consumed exactly once",
         len(sent) == 1,
         repr(sent),
+    )
+
+    print("\n-- Discord replies are default; room-wide remarks may stand alone --")
+    await adapter.send("channel-1", "A direct answer.", reply_to="placement-1")
+    check(
+        "ordinary output keeps its Discord reply reference",
+        sent[-1] == ("channel-1", "A direct answer.", "placement-1"),
+        repr(sent[-1]),
+    )
+
+    accounted = []
+    original_bounce_count = adapter._bounce_count_sent
+    original_catchup_count = adapter._catchup_count_sent
+    original_direct_count = adapter._direct_count_sent
+    adapter._bounce_count_sent = lambda anchor, result: accounted.append(("bounce", anchor))
+    adapter._catchup_count_sent = lambda anchor, result: accounted.append(("catchup", anchor))
+    adapter._direct_count_sent = lambda anchor, result: accounted.append(("direct", anchor))
+    try:
+        await adapter.send(
+            "channel-1",
+            "[STANDALONE] The whole room needed to hear that.",
+            reply_to="placement-2",
+        )
+    finally:
+        adapter._bounce_count_sent = original_bounce_count
+        adapter._catchup_count_sent = original_catchup_count
+        adapter._direct_count_sent = original_direct_count
+    check(
+        "the standalone marker is stripped and the Discord reference is omitted",
+        sent[-1]
+        == ("channel-1", "The whole room needed to hear that.", None),
+        repr(sent[-1]),
+    )
+    check(
+        "standalone delivery still accounts against the original inbound anchor",
+        accounted
+        == [
+            ("bounce", "placement-2"),
+            ("catchup", "placement-2"),
+            ("direct", "placement-2"),
+        ],
+        repr(accounted),
+    )
+
+    adapter._direct_pending["placement-3"] = ambient.time.time()
+    await adapter.send("channel-1", "[STANDALONE]", reply_to="placement-3")
+    check(
+        "a marker-only direct turn falls back to an anchored acknowledgment",
+        sent[-1] == ("channel-1", "I'm here.", "placement-3"),
+        repr(sent[-1]),
+    )
+    before = len(sent)
+    await adapter.send("channel-1", "[STANDALONE]", reply_to="placement-4")
+    check(
+        "a marker-only ambient turn stays silent",
+        len(sent) == before,
+        repr(sent[before:]),
     )
 
     print("\n-- known Discord handles become real mentions --")

@@ -30,6 +30,7 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 | **Silence** | — | The model may answer `[SILENT]`; the adapter swallows it. |
 | **Direct-reply guarantee** | zero | Restores replied-to author identity, marks DMs / mentions / name hits / replies-to-self as direct, and converts a direct silence token into `direct_silence_fallback` (default `I'm here.`). |
 | **Reply-target attribution** | zero | Labels a quote of someone else's message with that author's name so the bot does not treat it as speech to itself. |
+| **Hybrid reply placement** | zero | Actual Discord replies remain the default. With `reply_style.enabled`, the model may prefix an obvious room-wide remark with `[STANDALONE]`; the marker is stripped and only that send drops its Discord reply reference. |
 | **Reactions** | zero | Emoji on messages it does not answer. Regex rules plus a fallback pool. |
 | **Return greetings** | 1 inference | First message after N days away is prioritised, with a request-only hint. Last-seen is persisted per Discord bot account. |
 | **Rotating presence** | zero | Custom status from a list, on a background task. |
@@ -117,6 +118,9 @@ platforms:
         silent_marker: "[SILENT]"
         direct_silence_fallback: "I'm here."
         no_threads: true
+        reply_style:
+          enabled: false
+          standalone_marker: "[STANDALONE]"
         speaker_identity: true
         speaker_memory:
           enabled: false
@@ -254,6 +258,12 @@ and rejected messages never log. A community bot wants `DISCORD_ALLOW_ALL_USERS=
 
 `no_threads: true` is the per-profile fix for upstream's process-wide `DISCORD_AUTO_THREAD`.
 
+`reply_style.enabled: true` adds request-only placement guidance. Direct questions, older
+messages and ambiguous attribution keep Discord's reply feature. A response beginning with
+the configured standalone marker is posted as a free-standing channel message; the marker
+never reaches Discord. The original inbound anchor still drives direct, bot-bounce and
+catch-up accounting.
+
 ### 2. React more than you speak
 
 A reply costs an inference; a reaction costs nothing and appears instantly. Rate limits
@@ -388,6 +398,7 @@ append-only memory as tools, so a public bot can remember people without a shell
 cd /var/lib/hermes/.hermes/hermes-agent
 venv/bin/python /path/to/hermes-discord-ambient/test_catchup.py
 venv/bin/python /path/to/hermes-discord-ambient/test_direct_reply.py
+venv/bin/python /path/to/hermes-discord-ambient/test_no_threads.py
 venv/bin/python /path/to/hermes-discord-ambient/test_lifecycle_embed_media.py
 venv/bin/python /path/to/hermes-discord-ambient/test_voice_only.py
 venv/bin/python /path/to/hermes-discord-ambient/test_config_and_persistence.py
