@@ -395,7 +395,7 @@ venv/bin/python /path/to/hermes-discord-ambient/test_config_and_persistence.py
 
 ## Support development
 
-If this plugin saves you time, you can support continued development with an EVM donation:
+If this plugin saves you time, you find it useful, or you want to help me cover the token costs of continued development, you can support the work with an EVM donation:
 
 ```text
 0x9600c9bc632175941608a1b551cb0f018f0f40b4
