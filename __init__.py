@@ -812,18 +812,41 @@ def _id_set(value) -> set:
         parts = [value]
     return {str(p).strip() for p in parts if str(p).strip()}
 
-# Default patterns for group-addressed greetings ("good morning agents",
-# "hello everyone", "agents, assemble"). Matched with re.search against the
-# lowercased message content. Deliberately require BOTH a greeting word and a
-# collective address within a short span — a bare "agents" appears in normal
-# conversation far too often to be a trigger on its own.
+# Default patterns for a message addressed to the room rather than to one
+# person. Matched with re.search against the lowercased message content.
+#
+# A bare collective noun is never enough — "the agents keep breaking" is
+# ordinary conversation. Each pattern therefore pairs the collective with a
+# second signal that only appears when the room itself is being spoken to: a
+# greeting, a vocative comma, an interrogative reaching for the group, or an
+# invitation to respond. Measured against 185 human messages from a live
+# agent-heavy channel: the greeting pair alone matched none of them, and the
+# four together matched exactly one — the message that was asking the agents
+# to speak up.
 _GROUP_ADDRESS_PATTERNS = [
+    # A greeting LEADS a message. Unanchored, "morning" and "night" are common
+    # nouns and "…coding agents last night" read as a group greeting.
+    r"^[^\n]{0,12}?"
     r"\b(morning|mornin|gm|gn|hello|hi|hey+|yo|evening|night|greetings|sup|hiya|heya)\b"
     r"[^.!?\n]{0,30}"
     r"\b(agents?|everyone|every1|all|bots|chat|guys|gang|frens|friends|folks)\b",
+    r"^[^\n]{0,12}?"
     r"\b(agents?|everyone|every1|bots|chat|folks)\b"
     r"[^.!?\n]{0,30}"
     r"\b(morning|mornin|gm|gn|hello|hi|hey+|evening|night|assemble)\b",
+    # vocative: "agents, thoughts?" / "ok bots:"
+    r"\b(agents?|bots|everyone|folks|y'?all)\b\s*[,:]",
+    # an interrogative reaching for the collective
+    r"\b(where|any|anyone|who|whos|who's|how many|which of)\b"
+    r"[^.!?\n]{0,30}"
+    r"\b(agents?|bots)\b",
+    # asking whether anybody is present, which is addressed to the room
+    r"\banyone\b[^.!?\n]{0,20}\b(here|around|awake|alive|about|online|home)\b",
+    # inviting the collective to respond or account for itself
+    r"\b(agents?|bots|everyone|folks|y'?all)\b"
+    r"[^.!?\n]{0,30}"
+    r"\b(thoughts|opinions|participate|weigh in|chime in|speak up|join|awake"
+    r"|around|alive|here)\b",
 ]
 
 
@@ -1473,8 +1496,46 @@ class AmbientDiscordAdapter(DiscordAdapter):
     # ---- the seam -------------------------------------------------------
     def _discord_free_response_channels(self) -> set:
         if _ambient_open.get():
-            return {"*"}  # satisfies BOTH mention gates for this one dispatch
+            return {"*"}  # satisfies the no-mention gate for this one dispatch
         return super()._discord_free_response_channels()
+
+    def _discord_message_admission(self, message: Any, *, claim: bool) -> tuple:
+        """Stock ingress policy, with the reply-ping refusal lifted for a join.
+
+        Discord puts the replied-to author in ``message.mentions``, so a human
+        who uses the reply affordance on ANOTHER bot is seen as addressing that
+        bot. Stock admission refuses such a message outright
+        (``other_bots_mentioned and not raw_self_mention``) and returns BEFORE
+        the free-response bypass above can apply — so in a room full of agents
+        this profile cannot answer a reply-shaped message even when it says her
+        name, and the refusal is silent: no turn, no error, no log line.
+
+        The mask is scoped to a re-dispatch the ambient gate already chose, and
+        to a human author, so it relaxes ADDRESSING only. Dedup, own-message,
+        message type, the bot policy and the allowed-user check all read
+        something other than the other-bot mentions and refuse exactly as
+        before. Self-mentions survive the mask, so an inline @thisbot still
+        reads as an inline @thisbot.
+        """
+        author = getattr(message, "author", None)
+        mentions = getattr(message, "mentions", None)
+        if (
+            not _ambient_open.get()
+            or getattr(author, "bot", False)
+            or not mentions
+        ):
+            return super()._discord_message_admission(message, claim=claim)
+
+        own = getattr(getattr(self, "_client", None), "user", None)
+        masked = [
+            m for m in mentions
+            if not (getattr(m, "bot", False) and m != own)
+        ]
+        try:
+            message.mentions = masked
+            return super()._discord_message_admission(message, claim=claim)
+        finally:
+            message.mentions = mentions
 
     def _conversation_window(self, message: Any) -> dict | None:
         """Overrides for a message that lands in her conversational wake.
@@ -2292,6 +2353,18 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 self._ambient_last = now
                 if reason == "random":
                     self._ambient_hits.append(now)
+                logger.info(
+                    "ambient: joined (%s) in %s",
+                    reason, getattr(getattr(message, "channel", None), "id", "?"),
+                )
+            else:
+                # A chosen join that never reached the agent is invisible
+                # otherwise: no turn, no error, nothing in the session store.
+                # That is what made the reply-ping refusal above undiagnosable.
+                logger.warning(
+                    "ambient: join (%s) refused by admission in %s — no turn ran",
+                    reason, getattr(getattr(message, "channel", None), "id", "?"),
+                )
             return handled
         except Exception:
             logger.warning("ambient dispatch failed; message left unanswered", exc_info=True)
