@@ -135,19 +135,38 @@ check(
     f"(mentions={reply_to_bot.mentions})",
 )
 
-# An inline @OtherBot is a deliberate address, not a reply artifact. Relaxing
-# it would let this profile answer a question explicitly put to another bot.
-inline = Message(
+# Being NAMED is what entitles her to see a message, not who else is tagged.
+# "@OtherBot what do you think about <name>?" is a conversation she is part of
+# — she must reach the agent and decide there, with the overheard directive
+# keeping her from answering as the addressee.
+inline_named = Message(
     "<@202> what do you think about Kestrel?", HUMAN,
     mentions=[OTHER_BOT], message_id="4",
 )
 token = ambient._ambient_open.set(True)
 try:
-    admitted, _ = adapter._discord_message_admission(inline, claim=False)
+    admitted, _ = adapter._discord_message_admission(inline_named, claim=False)
 finally:
     ambient._ambient_open.reset(token)
 check(
-    "an explicit inline @mention of another bot stays refused",
+    "an inline @mention of another bot is admitted when she is named too",
+    admitted is True,
+    f"(admitted={admitted})",
+)
+
+# Not named: a question put to another bot is none of her business, and a
+# dice-roll join must not hijack it.
+inline_unnamed = Message(
+    "<@202> what did you think of the film?", HUMAN,
+    mentions=[OTHER_BOT], message_id="5",
+)
+token = ambient._ambient_open.set(True)
+try:
+    admitted, _ = adapter._discord_message_admission(inline_unnamed, claim=False)
+finally:
+    ambient._ambient_open.reset(token)
+check(
+    "an inline @mention of another bot stays refused when she is not named",
     admitted is False,
     f"(admitted={admitted})",
 )

@@ -1063,21 +1063,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
             raw = getattr(event, "raw_message", None)
             if raw is not None and self._self_is_explicitly_mentioned(raw):
                 return True
-            cfg = self._ambient_cfg()
-            triggers = [
-                str(t).strip().lower()
-                for t in _as_list(cfg.get("name_triggers"))
-                if str(t).strip()
-            ]
             content = str(getattr(raw, "content", "") or getattr(event, "text", ""))
-            lowered = content.lower()
-            # Whole tokens only, matching _join_reason. A substring test let a
-            # short trigger fire inside an unrelated word.
-            named = any(
-                re.search(rf"(?<![\w-]){re.escape(trigger)}(?![\w-])", lowered)
-                for trigger in triggers
-            )
-            if not named:
+            if not self._names_self(content):
                 return False
             # Being named is being ADDRESSED only when nobody else is. A reply
             # aimed at another person, or an inline @mention of one, makes this
@@ -1121,17 +1108,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
         """
         cfg = self._ambient_cfg()
         try:
-            triggers = [
-                str(t).strip().lower()
-                for t in _as_list(cfg.get("name_triggers"))
-                if str(t).strip()
-            ]
-            lowered = str(getattr(raw, "content", "") or "").lower()
-            named = any(
-                re.search(rf"(?<![\w-]){re.escape(trigger)}(?![\w-])", lowered)
-                for trigger in triggers
-            )
-            if named and self._addressed_to_other(None, raw):
+            content = str(getattr(raw, "content", "") or "")
+            if self._names_self(content) and self._addressed_to_other(None, raw):
                 return _OVERHEARD_HINT.replace("{marker}", marker)
         except Exception:
             logger.debug("ambient: overheard classification failed", exc_info=True)
@@ -1565,23 +1543,43 @@ class AmbientDiscordAdapter(DiscordAdapter):
             return {"*"}  # satisfies the no-mention gate for this one dispatch
         return super()._discord_free_response_channels()
 
+    def _names_self(self, content: str) -> bool:
+        """Whether the text references this profile by a configured name trigger."""
+        try:
+            lowered = str(content or "").lower()
+            return any(
+                re.search(rf"(?<![\w-]){re.escape(str(t).strip().lower())}(?![\w-])", lowered)
+                for t in _as_list(self._ambient_cfg().get("name_triggers"))
+                if str(t).strip()
+            )
+        except Exception:
+            logger.debug("ambient: name-trigger scan failed", exc_info=True)
+            return False
+
     def _discord_message_admission(self, message: Any, *, claim: bool) -> tuple:
-        """Stock ingress policy, with the reply-ping refusal lifted for a join.
+        """Stock ingress policy, with the other-bot refusal lifted for a join.
 
-        Discord puts the replied-to author in ``message.mentions``, so a human
-        who uses the reply affordance on ANOTHER bot is seen as addressing that
-        bot. Stock admission refuses such a message outright
-        (``other_bots_mentioned and not raw_self_mention``) and returns BEFORE
-        the free-response bypass above can apply — so in a room full of agents
-        this profile cannot answer a reply-shaped message even when it says her
-        name, and the refusal is silent: no turn, no error, no log line.
+        Stock admission refuses any message mentioning a different bot without
+        an inline self-mention (``other_bots_mentioned and not
+        raw_self_mention``), and returns BEFORE the free-response bypass above
+        can apply. Two ways in are hit constantly in a room full of agents:
+        Discord adds the replied-to author to ``message.mentions``, so every
+        human reply to another bot looks addressed to it; and "@OtherBot what
+        do you think about <name>?" tags someone else while being about this
+        profile. Both were refused in silence — no turn, no error, no log line.
 
-        The mask is scoped to a re-dispatch the ambient gate already chose, and
-        to a human author, so it relaxes ADDRESSING only. Dedup, own-message,
-        message type, the bot policy and the allowed-user check all read
-        something other than the other-bot mentions and refuse exactly as
-        before. Self-mentions survive the mask, so an inline @thisbot still
-        reads as an inline @thisbot.
+        **Being named is what entitles her to see a message**, not who else is
+        tagged. So when the content carries a name trigger, every other-bot
+        mention is masked; when it does not, only reply-ping artifacts are,
+        which keeps a dice-roll join from hijacking a question put to someone
+        else. She still must not ANSWER as the addressee — that is
+        ``_event_is_direct`` and the overheard directive, not this gate.
+
+        Scoped to a re-dispatch the ambient gate already chose and to a human
+        author, so it relaxes ADDRESSING only. Dedup, own-message, message
+        type, the bot policy and the allowed-user check read something other
+        than the other-bot mentions and refuse exactly as before. Self-mentions
+        survive the mask, so an inline @thisbot still reads as one.
         """
         author = getattr(message, "author", None)
         mentions = getattr(message, "mentions", None)
@@ -1595,23 +1593,16 @@ class AmbientDiscordAdapter(DiscordAdapter):
         own = getattr(getattr(self, "_client", None), "user", None)
         own_id = str(getattr(own, "id", "") or "")
         content = str(getattr(message, "content", "") or "")
+        named = self._names_self(content)
         inline_ids = set(re.findall(r"<@!?(\d+)>", content))
 
-        def _is_reply_ping(mentioned: Any) -> bool:
-            """A bot in `mentions` with no inline token is a reply artifact.
-
-            An inline @OtherBot is a deliberate address and stays visible, so
-            stock policy still refuses it — relaxing that would let this
-            profile answer a question explicitly put to another bot.
-            """
+        def _maskable(mentioned: Any) -> bool:
             mentioned_id = str(getattr(mentioned, "id", "") or "")
-            return (
-                getattr(mentioned, "bot", False)
-                and mentioned_id != own_id
-                and mentioned_id not in inline_ids
-            )
+            if not getattr(mentioned, "bot", False) or mentioned_id == own_id:
+                return False
+            return named or mentioned_id not in inline_ids
 
-        masked = [m for m in mentions if not _is_reply_ping(m)]
+        masked = [m for m in mentions if not _maskable(m)]
         if len(masked) == len(mentions):
             return super()._discord_message_admission(message, claim=claim)
         try:
