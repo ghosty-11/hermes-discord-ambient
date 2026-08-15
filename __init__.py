@@ -509,8 +509,10 @@ _DEFAULT_HINT = (
 _OVERHEARD_HINT = (
     "[ambient: someone is talking ABOUT you to another person — you were not "
     "addressed and the question was not put to you. Do NOT answer it as though "
-    "it were. You may react to overhearing your own name in one short line, or "
-    "reply with exactly {marker} and nothing else.]"
+    "it were, and do not answer on behalf of whoever was asked. But hearing "
+    "your own name IS an invitation: add one short line in your own voice — "
+    "amused, smug, curious, correcting the record, thanking them. Use "
+    "{marker} only if you genuinely have nothing to add.]"
 )
 
 _RETURN_HINT = (
