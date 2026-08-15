@@ -135,6 +135,23 @@ check(
     f"(mentions={reply_to_bot.mentions})",
 )
 
+# An inline @OtherBot is a deliberate address, not a reply artifact. Relaxing
+# it would let this profile answer a question explicitly put to another bot.
+inline = Message(
+    "<@202> what do you think about Kestrel?", HUMAN,
+    mentions=[OTHER_BOT], message_id="4",
+)
+token = ambient._ambient_open.set(True)
+try:
+    admitted, _ = adapter._discord_message_admission(inline, claim=False)
+finally:
+    ambient._ambient_open.reset(token)
+check(
+    "an explicit inline @mention of another bot stays refused",
+    admitted is False,
+    f"(admitted={admitted})",
+)
+
 # The relaxation must not become a bot-policy bypass: a bot-authored message
 # reaching the ambient re-dispatch (catch-up replay) keeps stock admission.
 adapter_bots_mentions_only = build_adapter()

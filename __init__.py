@@ -506,6 +506,13 @@ _DEFAULT_HINT = (
     "If not, reply with exactly {marker} and nothing else.]"
 )
 
+_OVERHEARD_HINT = (
+    "[ambient: someone is talking ABOUT you to another person — you were not "
+    "addressed and the question was not put to you. Do NOT answer it as though "
+    "it were. You may react to overhearing your own name in one short line, or "
+    "reply with exactly {marker} and nothing else.]"
+)
+
 _RETURN_HINT = (
     "[ambient: {who} is back after {days} days away — you noticed. Greet them "
     "warmly and briefly, and if you remember something about them, show it. "
@@ -1057,19 +1064,78 @@ class AmbientDiscordAdapter(DiscordAdapter):
             if raw is not None and self._self_is_explicitly_mentioned(raw):
                 return True
             cfg = self._ambient_cfg()
-            triggers = cfg.get("name_triggers") or []
-            if isinstance(triggers, str):
-                triggers = [part.strip() for part in triggers.split(",")]
+            triggers = [
+                str(t).strip().lower()
+                for t in _as_list(cfg.get("name_triggers"))
+                if str(t).strip()
+            ]
             content = str(getattr(raw, "content", "") or getattr(event, "text", ""))
             lowered = content.lower()
-            return any(
-                str(trigger).strip().lower() in lowered
+            # Whole tokens only, matching _join_reason. A substring test let a
+            # short trigger fire inside an unrelated word.
+            named = any(
+                re.search(rf"(?<![\w-]){re.escape(trigger)}(?![\w-])", lowered)
                 for trigger in triggers
-                if str(trigger).strip()
             )
+            if not named:
+                return False
+            # Being named is being ADDRESSED only when nobody else is. A reply
+            # aimed at another person, or an inline @mention of one, makes this
+            # profile the SUBJECT of the sentence rather than its recipient.
+            # Treating those as direct address handed the model "this person is
+            # speaking to you personally", so "what do you think about <name>?"
+            # — asked of a different bot — came back answered in the first
+            # person and the third person at once.
+            return not self._addressed_to_other(event, raw)
         except Exception:
             logger.debug("ambient.direct: address classification failed", exc_info=True)
             return False
+
+    def _addressed_to_other(self, event: Any, raw: Any) -> bool:
+        """True when this message is aimed at somebody who is not this profile."""
+        own = getattr(getattr(self, "_client", None), "user", None)
+        own_id = str(getattr(own, "id", "") or "")
+
+        reply_author_id = str(getattr(event, "reply_to_author_id", "") or "")
+        if not reply_author_id:
+            resolved = getattr(getattr(raw, "reference", None), "resolved", None)
+            reply_author_id = str(
+                getattr(getattr(resolved, "author", None), "id", "") or ""
+            )
+        if reply_author_id and reply_author_id != own_id:
+            return True
+
+        content = str(getattr(raw, "content", "") or "")
+        return any(
+            mention_id != own_id
+            for mention_id in re.findall(r"<@!?(\d+)>", content)
+        )
+
+    def _ambient_hint_for(self, raw: Any, *, marker: str) -> str:
+        """The directive for a join, matched to why the profile is in the room.
+
+        A configured `hint` overrides the plain ambient case only. Overhearing
+        your own name is a different situation from idle presence and needs to
+        say so, or the model reaches for the nearest script — answering a
+        question that was put to somebody else.
+        """
+        cfg = self._ambient_cfg()
+        try:
+            triggers = [
+                str(t).strip().lower()
+                for t in _as_list(cfg.get("name_triggers"))
+                if str(t).strip()
+            ]
+            lowered = str(getattr(raw, "content", "") or "").lower()
+            named = any(
+                re.search(rf"(?<![\w-]){re.escape(trigger)}(?![\w-])", lowered)
+                for trigger in triggers
+            )
+            if named and self._addressed_to_other(None, raw):
+                return _OVERHEARD_HINT.replace("{marker}", marker)
+        except Exception:
+            logger.debug("ambient: overheard classification failed", exc_info=True)
+        return str(cfg.get("hint") or _DEFAULT_HINT).replace("{marker}", marker)
 
     def _direct_prune_pending(self) -> None:
         now = time.time()
@@ -1527,10 +1593,27 @@ class AmbientDiscordAdapter(DiscordAdapter):
             return super()._discord_message_admission(message, claim=claim)
 
         own = getattr(getattr(self, "_client", None), "user", None)
-        masked = [
-            m for m in mentions
-            if not (getattr(m, "bot", False) and m != own)
-        ]
+        own_id = str(getattr(own, "id", "") or "")
+        content = str(getattr(message, "content", "") or "")
+        inline_ids = set(re.findall(r"<@!?(\d+)>", content))
+
+        def _is_reply_ping(mentioned: Any) -> bool:
+            """A bot in `mentions` with no inline token is a reply artifact.
+
+            An inline @OtherBot is a deliberate address and stays visible, so
+            stock policy still refuses it — relaxing that would let this
+            profile answer a question explicitly put to another bot.
+            """
+            mentioned_id = str(getattr(mentioned, "id", "") or "")
+            return (
+                getattr(mentioned, "bot", False)
+                and mentioned_id != own_id
+                and mentioned_id not in inline_ids
+            )
+
+        masked = [m for m in mentions if not _is_reply_ping(m)]
+        if len(masked) == len(mentions):
+            return super()._discord_message_admission(message, claim=claim)
         try:
             message.mentions = masked
             return super()._discord_message_admission(message, claim=claim)
@@ -2331,7 +2414,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     who=who, days=int(returning_days), marker=marker
                 )
             else:
-                hint = str(cfg.get("hint") or _DEFAULT_HINT).replace("{marker}", marker)
+                hint = self._ambient_hint_for(message, marker=marker)
             # NOT written into message.content: that is the user turn, and Hermes
             # persists it. See the _ambient_hint comment — this is the fix for the
             # 2026-08-08 self-portrait refusal.
