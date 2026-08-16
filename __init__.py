@@ -741,11 +741,89 @@ def _looks_like_sentinel(text: str, marker: str) -> bool:
     return _NON_LETTER_RE.sub("", stripped).upper() == core
 
 
+# ── leaked deliberation ─────────────────────────────────────────────────────
+# A model may narrate its reasoning as ordinary content and then answer. Some
+# do it by construction: gpt-oss served through Ollama returns its harmony
+# `analysis` channel in `content` with no `reasoning` field, measured 12/12 on a
+# real session prompt and 0/12 on the same prompt without conversation history,
+# so the failure grows with session depth rather than announcing itself. Hermes
+# strips `<think>` tags; untagged analysis is invisible to it.
+#
+# Every silence gate in the stack tests the WHOLE message against the marker
+# under a length cap — 64 chars in `gateway/response_filters.py` and
+# `gateway/delivery.py`, marker+24 in `_looks_like_sentinel`. Deliberation ending
+# in a marker matches none of them, which is how 635 characters of reasoning
+# reached a public room on 2026-08-17.
+#
+# Two independent signals, because the leak arrives with and without a marker:
+#
+# 1. A marker in its DRESSED form at the very end. Bracketed/asterisked forms are
+#    matched case-insensitively; a bare form must be UPPERCASE, so an in-character
+#    "I'll stay silent about that one" is untouched while "…so SILENT" is not.
+#    Anything before a closing marker is deliberation by definition: the model
+#    decided not to speak, so none of it was meant for the room.
+# 2. Language about the conversation's machinery. Each phrase describes the
+#    exchange from outside it ("the assistant", "the system prompt", "nobody
+#    addressed you") and belongs to no persona's voice. Deliberately narrow: the
+#    bare word "ambient" is excluded because ambient music is a real topic.
+#
+# Both fail toward silence. A false positive costs one dropped remark in a room
+# that was not owed one; a false negative publishes the model's private thinking
+# under a persona's name, in front of strangers.
+_SENTINEL_TAIL_CACHE: dict = {}
+
+
+def _sentinel_tail_re(marker: str):
+    """A regex matching `marker` in any dress at the END of a reply."""
+    core = _NON_LETTER_RE.sub("", marker or "").upper()
+    if not core:
+        return None
+    cached = _SENTINEL_TAIL_CACHE.get(core)
+    if cached is None:
+        spaced = r"\s*".join(re.escape(ch) for ch in core)
+        cached = re.compile(
+            r"(?:"
+            # bracketed or emphasised: [SILENT] (silent) **silent** {Silent}
+            rf"(?i:[\[\(\{{*_~`]+\s*{spaced}\s*[\]\)\}}*_~`]+)"
+            # or bare, but only shouted — lowercase prose keeps the word
+            rf"|\b{spaced}\b"
+            r")"
+            r"[\s.,!*_~`\"'\)\]}]*$"
+        )
+        _SENTINEL_TAIL_CACHE[core] = cached
+    return cached
+
+
+_HARNESS_META_RE = re.compile(
+    r"no(?:body|\s+one)\s+(?:has\s+)?(?:is\s+)?address(?:ed|ing)"
+    r"|there'?s?\s+no\s+(?:direct\s+address|speaker)"
+    r"|the\s+assistant\b"
+    r"|according\s+to\s+(?:the\s+)?rules?"
+    r"|we\s+(?:need|have|ought)\s+to\s+respond"
+    r"|respond\s+with\s+(?:exactly\s+)?\[?SILENT"
+    r"|the\s+user'?s?\s+(?:new\s+|last\s+)?(?:message|question)"
+    r"|(?:my|the)\s+system\s+prompt",
+    re.IGNORECASE,
+)
+
+
+def _leaks_deliberation(text: str, marker: str) -> bool:
+    """True when `text` is the model thinking out loud rather than speaking."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    tail = _sentinel_tail_re(marker)
+    if tail is not None and tail.search(stripped):
+        return True
+    return bool(_HARNESS_META_RE.search(stripped))
+
+
 def _screen_ambient_reply(content: str, marker: str) -> tuple:
     """Strip any echoed ambient directive, then decide if anything is left to say.
 
-    Returns `(text_or_None, n_stripped)`. None means "send nothing": either the
-    reply was the silence marker, or it was nothing but the echoed directive.
+    Returns `(text_or_None, n_stripped)`. None means "send nothing": the reply was
+    the silence marker, or nothing but the echoed directive, or the model's own
+    deliberation (see `_leaks_deliberation`).
 
     Ordering matters and is the whole point. The directive is removed FIRST, so a
     reply of `<hint>\\n\\n(SILENT)` — the exact 2026-08-08 leak — reduces to
@@ -761,6 +839,8 @@ def _screen_ambient_reply(content: str, marker: str) -> tuple:
         text = re.sub(r"[ \t]{2,}", " ", text)
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if _looks_like_sentinel(text if n else content, marker):
+        return None, n
+    if _leaks_deliberation(text if n else content, marker):
         return None, n
     if n and not _HAS_WORD_RE.search(text):
         return None, n
