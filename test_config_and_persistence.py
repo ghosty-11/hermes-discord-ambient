@@ -400,6 +400,32 @@ def check_quiet_resume_is_request_only():
         ambient._quiet_resume_pending.reset(token)
 
 
+def check_local_fallback_window_covers_the_local_floor():
+    print("\n-- a fallback to any local model opens the standby window --")
+    prefix = "🔄 Switched to fallback model: Qwen/Qwen3.6-35B-A3B-FP8 via custom:hetzner → "
+    block = {"standby": {"enabled": True, "only_when_local": True}}
+
+    for target, label in (
+        ("gpt-oss:20b via custom", "the first local model"),
+        ("qwen3:8b via custom", "the second local model"),
+    ):
+        a = make_adapter(dict(block))
+        a._note_fallback_notice(prefix + target)
+        check(
+            f"{label} opens only_when_local standby",
+            a._standby_engaged() is True,
+            target,
+        )
+
+    cloud = make_adapter(dict(block))
+    cloud._note_fallback_notice(prefix + "google/gemma-4-31b-it:free via openrouter")
+    check(
+        "a cloud fallback leaves standby dormant",
+        cloud._standby_engaged() is False,
+        "openrouter hop",
+    )
+
+
 def main():
     check_channel_allowlist()
     check_name_triggers_are_normalized_and_bounded()
@@ -410,6 +436,7 @@ def main():
     check_gif_request_uses_public_plugin_identity()
     check_speaker_is_request_only()
     check_quiet_resume_is_request_only()
+    check_local_fallback_window_covers_the_local_floor()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {FAILURES}")

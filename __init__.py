@@ -576,6 +576,10 @@ _FALLBACK_NOTICE_PREFIX = "🔄 Switched to fallback model:"
 # plumbing, so they are rerouted to a private channel when one is configured.
 _SYSTEM_NOTICE_PREFIXES = ["⚠️ Cron '", "Cronjob Response:"]
 
+# Surfaces whose delivery carries a reply anchor, so the room-wide marker has
+# something to opt out of. Everything else (cron, webhook) delivers flat.
+_REPLY_ANCHORED_PLATFORMS = {"discord"}
+
 # Notices that are pure gateway plumbing: they tell the OPERATOR about session
 # mechanics and mean nothing to a room full of strangers. Rerouting is wrong for
 # these — there is no other channel where "no activity for 15 min" is useful —
@@ -1083,7 +1087,12 @@ class AmbientDiscordAdapter(DiscordAdapter):
         return marker or "[STANDALONE]"
 
     def _extract_standalone_reply(self, content: str) -> tuple[str, bool]:
-        """Remove an enabled room-wide marker from the start of model output."""
+        """Remove one enabled room-wide marker from model output.
+
+        The documented placement is leading, but a marker the model appends
+        instead must never reach the room: delivery strips the marker, not the
+        position. Exactly one occurrence is removed, decorations tolerated.
+        """
         cfg = self._reply_style_cfg()
         if not cfg.get("enabled"):
             return content, False
@@ -1094,7 +1103,14 @@ class AmbientDiscordAdapter(DiscordAdapter):
             re.IGNORECASE,
         )
         cleaned, count = dressed.subn("", content, count=1)
-        return cleaned.lstrip(), bool(count)
+        if not count:
+            trailing = re.compile(
+                rf"(?:\s+|^)(?:[*_~`]{{0,3}}\s*)?{re.escape(marker)}"
+                rf"(?:\s*[*_~`]{{0,3}})?\s*$",
+                re.IGNORECASE,
+            )
+            cleaned, count = trailing.subn("", content, count=1)
+        return cleaned.strip(), bool(count)
 
     def _annotate_reply_context(self, event: Any) -> None:
         """Restore Discord reply-author fields omitted by the stock adapter."""
@@ -2201,7 +2217,14 @@ class AmbientDiscordAdapter(DiscordAdapter):
         then suppressed — observation and presentation are separate."""
         try:
             target = notice.split("→", 1)[1] if "→" in notice else notice
-            markers = self._sub("standby").get("local_markers") or ["gpt-oss", "ollama"]
+            # Every model on the shared local lane, not just the first one: a
+            # marker list narrower than the chain's local floor leaves standby
+            # dormant exactly when the fleet is contended.
+            markers = self._sub("standby").get("local_markers") or [
+                "gpt-oss",
+                "ollama",
+                "qwen3",
+            ]
             if any(str(m).lower() in target.lower() for m in markers):
                 self._local_fallback_ts = time.time()
                 logger.info(
@@ -4688,7 +4711,16 @@ def _on_llm_request_ambient_hint(**kwargs: Any):
         reply_style_enabled = bool(
             isinstance(reply_style, dict) and reply_style.get("enabled")
         )
-        if reply_style_enabled:
+        # The marker only means something where delivery carries a reply
+        # anchor. A cron or webhook turn has none, so the guidance there is an
+        # instruction the model can follow and delivery cannot honour — which
+        # is how a scheduled spark shipped a literal "[STANDALONE]" into the
+        # public room. An unknown surface keeps the guidance: the Discord path
+        # is the one that must never lose it.
+        platform = str(kwargs.get("platform") or "").strip().lower()
+        if reply_style_enabled and (
+            not platform or platform in _REPLY_ANCHORED_PLATFORMS
+        ):
             marker = str(
                 reply_style.get("standalone_marker") or "[STANDALONE]"
             ).strip() or "[STANDALONE]"

@@ -223,6 +223,28 @@ async def main():
             len(request["messages"]) == 1,
             repr(request["messages"]),
         )
+        cron_patched = ambient._on_llm_request_ambient_hint(
+            request={"messages": [{"role": "user", "content": "hello"}]},
+            platform="cron",
+        )
+        check(
+            "a cron turn is not told about Discord reply placement",
+            cron_patched is None,
+            repr(cron_patched),
+        )
+        discord_patched = ambient._on_llm_request_ambient_hint(
+            request={"messages": [{"role": "user", "content": "hello"}]},
+            platform="discord",
+        )
+        discord_messages = (
+            ((discord_patched or {}).get("request") or {}).get("messages", [])
+        )
+        check(
+            "a Discord turn still receives the placement guidance",
+            bool(discord_messages)
+            and "[STANDALONE]" in discord_messages[-1].get("content", ""),
+            repr(discord_messages),
+        )
     finally:
         ambient._ambient_cfg = original_cfg
 
@@ -290,6 +312,27 @@ async def main():
             ("direct", "placement-2"),
         ],
         repr(accounted),
+    )
+
+    await adapter.send(
+        "channel-1",
+        "The whole room needed to hear that.\n\n[STANDALONE]",
+        reply_to="placement-2b",
+    )
+    check(
+        "a marker placed after the remark is stripped, not delivered",
+        sent[-1] == ("channel-1", "The whole room needed to hear that.", None),
+        repr(sent[-1]),
+    )
+    await adapter.send(
+        "channel-1",
+        "Moons have phases. **[standalone]**",
+        reply_to="placement-2c",
+    )
+    check(
+        "a dressed trailing marker is stripped in any case",
+        sent[-1] == ("channel-1", "Moons have phases.", None),
+        repr(sent[-1]),
     )
 
     adapter._direct_pending["placement-3"] = ambient.time.time()

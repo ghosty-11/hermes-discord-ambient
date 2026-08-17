@@ -30,13 +30,13 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 | **Silence** | — | The model may answer `[SILENT]`; the adapter swallows it. |
 | **Direct-reply guarantee** | zero | Restores replied-to author identity, marks DMs / mentions / name hits / replies-to-self as direct, and converts a direct silence token into `direct_silence_fallback` (default `I'm here.`). |
 | **Reply-target attribution** | zero | Labels a quote of someone else's message with that author's name so the bot does not treat it as speech to itself. |
-| **Hybrid reply placement** | zero | Actual Discord replies remain the default. With `reply_style.enabled`, the model may prefix an obvious room-wide remark with `[STANDALONE]`; the marker is stripped and only that send drops its Discord reply reference. |
+| **Hybrid reply placement** | zero | Actual Discord replies remain the default. With `reply_style.enabled`, the model may mark an obvious room-wide remark with `[STANDALONE]`; the marker is stripped wherever it lands in the reply, and only that send drops its Discord reply reference. Surfaces without a reply anchor (cron, webhook) are never given the guidance. |
 | **Reactions** | zero | Emoji on messages it does not answer. Regex rules plus a fallback pool. |
 | **Return greetings** | 1 inference | First message after N days away is prioritised, with a request-only hint. Last-seen is persisted per Discord bot account. |
 | **Rotating presence** | zero | Custom status from a list, on a background task. |
 | **No-thread mode** | zero | Per-profile kill switch. Upstream `DISCORD_AUTO_THREAD` is process-wide under multiplex; this adds the channel to the no-thread set instead of failing thread creation (upstream treats that as an error and drops the message). |
 | **Bot bounce** | zero while suppressing | Circuit breaker for bot-to-bot volleys. Suppresses before admission; counts at send. |
-| **Fleet standby** | zero while holding | Holds dispatch while the shared inference slot is busy. Delay, never mute. |
+| **Fleet standby** | zero while holding | Holds dispatch while the shared inference slot is busy. Delay, never mute. `only_when_local` waits for a fallback notice naming a local model; `standby.local_markers` must cover every local model in the profile's chain (default `gpt-oss`, `ollama`, `qwen3`). |
 | **Fallback-notice suppression** | zero | Swallows `🔄 Switched to fallback model:` for this profile. Still parsed as the local-fallback signal for standby. |
 | **Group-address greetings** | 1 inference when it answers | "good morning agents" / "hello everyone" at its own probability and cooldown, exempt from the daily cap. |
 | **System-notice rerouting** | zero | Cron failures go to a private channel. Drain/stall notices can be rewritten in-character. Pure plumbing is dropped. |
