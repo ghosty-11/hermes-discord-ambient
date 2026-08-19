@@ -2221,6 +2221,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
             # marker list narrower than the chain's local floor leaves standby
             # dormant exactly when the fleet is contended.
             markers = self._sub("standby").get("local_markers") or [
+                "gptoss",
+                "nemo4",
                 "gpt-oss",
                 "ollama",
                 "qwen3",
