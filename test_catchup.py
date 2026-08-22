@@ -19,7 +19,7 @@ import time
 import types
 from datetime import datetime, timedelta, timezone
 
-sys.path.insert(0, "/var/lib/hermes/.hermes/hermes-agent")
+sys.path.insert(0, os.environ.get("HERMES_FRAMEWORK_PATH", "/var/lib/hermes/.hermes/hermes-agent"))
 
 # State must not land in a real HERMES_HOME.
 _STATE_DIR = tempfile.mkdtemp(prefix="catchup-test-")

@@ -23,7 +23,7 @@ import sys
 import tempfile
 import types
 
-sys.path.insert(0, "/var/lib/hermes/.hermes/hermes-agent")
+sys.path.insert(0, os.environ.get("HERMES_FRAMEWORK_PATH", "/var/lib/hermes/.hermes/hermes-agent"))
 os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="overheard-test-")
 
 import plugins.platforms.discord.adapter as discord_adapter  # noqa: E402
