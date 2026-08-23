@@ -499,6 +499,15 @@ _gif_profile_context: contextvars.ContextVar[str] = contextvars.ContextVar(
     "hermes_ambient_gif_profile", default=""
 )
 
+# The room-context block for the turn currently being dispatched: server,
+# channel, topic, recently-present people and the last few lines of talk,
+# delivered request-only like every other directive here. Same ContextVar
+# pattern as _ambient_hint — see its comment for why this must never be
+# written onto message.content.
+_room_context: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "hermes_ambient_room_context", default=""
+)
+
 
 _DEFAULT_HINT = (
     "[ambient: nobody addressed you — you are simply present in the room. "
@@ -1052,10 +1061,24 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # plain ``@display-name`` into the wire form Discord actually pings.
         # Values are sets because reused display names must stay ambiguous.
         self._discord_identities: dict[str, dict[str, set[str]]] = {}
-        # At most one bounded history read per channel and process. This fills
-        # the ambient gap where the model names someone who was not in the
-        # narrow transcript window that triggered the turn.
-        self._mention_history_scanned: set[str] = set()
+        # Same observations at GUILD scope: a person met in one channel is
+        # pingable in every channel of that guild, because a Discord member
+        # mention resolves guild-wide. Only consulted for aliases that are
+        # unambiguous AND absent from the channel directory, so the narrower
+        # observation always wins.
+        self._guild_identities: dict[str, dict[str, set[str]]] = {}
+        self._channel_guild: dict[str, str] = {}
+        # Bounded history reads per channel, with a timestamp: a long-lived
+        # gateway must be able to re-observe a channel after newcomers arrive,
+        # not freeze its identity directory at the first scan.
+        self._mention_history_scanned: dict[str, float] = {}
+        # Recent inbound talk per channel (see _remember_room_talk) plus the
+        # last time each channel was appended to, for eviction.
+        self._room_talk: dict[str, list[tuple]] = {}
+        self._room_talk_touched: dict[str, float] = {}
+        # (set_at, the room-context lines most recently handed to the model).
+        # The echo guard reads it in send(); see _room_echo_leak.
+        self._room_echo: tuple[float, set] = (0.0, set())
 
     # ---- config ---------------------------------------------------------
     def _ambient_cfg(self) -> dict:
@@ -2408,12 +2431,14 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # and neither should be able to leak one into the NEXT message's turn.
         hint_token = _ambient_hint.set("")
         speaker_token = _speaker_context.set(("", None))
+        room_token = _room_context.set("")
         gif_token = _gif_profile_context.set(self._bot_user_id())
         try:
             return await self._dispatch_inner(message)
         finally:
             _ambient_hint.reset(hint_token)
             _speaker_context.reset(speaker_token)
+            _room_context.reset(room_token)
             _gif_profile_context.reset(gif_token)
             _current_speaker_id.reset(authorization_token)
             if token is not None:
@@ -2454,6 +2479,11 @@ class AmbientDiscordAdapter(DiscordAdapter):
         self._remember_discord_identities(message)
         self._apply_speaker_tag(message)
         self._note_inbound_for_window(message)
+        # Room context BEFORE the current message enters the buffer, so the
+        # recent-talk block is strictly the conversation before this turn;
+        # the current message is already the user turn.
+        self._stage_room_context(message)
+        self._remember_room_talk(message)
 
         # Bot bounce first: a tripped pair must cost NOTHING, so it returns
         # before admission runs. Every un-tripped message falls through to the
@@ -2708,18 +2738,26 @@ class AmbientDiscordAdapter(DiscordAdapter):
 
         Discord does not treat ``@name`` as a ping; the outbound wire form is
         ``<@numeric-id>``. Models naturally write the former. Resolve only
-        identities supplied by Discord on an inbound message, scoped to the
-        same channel, and retain collisions as ambiguous rather than guessing.
+        identities supplied by Discord on an inbound message, and retain
+        collisions as ambiguous rather than guessing. Observations land at
+        CHANNEL scope and, when the message carries a guild, at GUILD scope
+        too — a person met in one channel is pingable across the guild.
         """
         if not self._hygiene_cfg().get("resolve_plain_mentions", False):
             return
         try:
-            channel_id = str(
-                getattr(getattr(message, "channel", None), "id", "") or ""
-            )
+            channel = getattr(message, "channel", None)
+            channel_id = str(getattr(channel, "id", "") or "")
             if not channel_id:
                 return
+            guild = getattr(channel, "guild", None) or getattr(message, "guild", None)
+            guild_id = str(getattr(guild, "id", "") or "")
+            if guild_id:
+                self._channel_guild[channel_id] = guild_id
             directory = self._discord_identities.setdefault(channel_id, {})
+            guild_dir = (
+                self._guild_identities.setdefault(guild_id, {}) if guild_id else None
+            )
             people = [getattr(message, "author", None)]
             people.extend(list(getattr(message, "mentions", None) or []))
             for person in people:
@@ -2733,26 +2771,296 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 for alias in aliases:
                     if not alias or len(alias) > 64 or alias.isdigit():
                         continue
-                    directory.setdefault(alias.casefold(), set()).add(uid)
+                    key = alias.casefold()
+                    directory.setdefault(key, set()).add(uid)
+                    if guild_dir is not None:
+                        guild_dir.setdefault(key, set()).add(uid)
             # A busy public channel should not grow this process-lifetime cache
             # without bound. Dropping an old alias merely leaves future text
             # unconverted; it can never produce a false ping.
-            while len(directory) > 512:
-                directory.pop(next(iter(directory)))
+            for d in (directory, guild_dir):
+                while d is not None and len(d) > 512:
+                    d.pop(next(iter(d)))
         except Exception:
             logger.debug("ambient: Discord identity observation failed", exc_info=True)
 
+    # ---- room context -------------------------------------------------------
+    #
+    # WHY: the stock system prompt tells the model only "You are in a Discord
+    # server" (prompt_builder), and the adapter's chat_name/topic feed nothing
+    # but the agent-cache key — so a profile sitting in several guilds cannot
+    # tell which community it is speaking in, and a turn arrives as one
+    # message with no idea what conversation it interrupts or who replied to
+    # whom. Everything below is assembled at dispatch and delivered
+    # REQUEST-ONLY through the llm_request middleware, exactly like the
+    # ambient hint and speaker tag: never written onto message.content, which
+    # Hermes persists verbatim (the 2026-08-08 directive-echo lesson).
+    #
+    # Display names and message text are attacker-controlled. Snippets are
+    # flattened to single lines and capped so they cannot forge a wrapper row
+    # or an identity line; every bracketed wrapper this code emits is
+    # single-line and bounded so the existing `_AMBIENT_ECHO_RE` strip can
+    # remove a regurgitated one.
+    _ROOM_SNIPPET_CHARS = 90
+
+    def _room_cfg(self) -> dict:
+        return self._sub("room_context")
+
+    @staticmethod
+    def _flatten_room_line(text: Any, cap: int) -> str:
+        """One line, whitespace-collapsed, capped. Never raises."""
+        line = " ".join(str(text or "").split())
+        if len(line) > cap:
+            line = line[: cap - 1].rstrip() + " …"
+        return line
+
+    @staticmethod
+    def _room_author_label(person: Any) -> str | None:
+        uid = str(getattr(person, "id", "") or "")
+        if not uid:
+            return None
+        handle = str(
+            getattr(person, "name", "") or getattr(person, "display_name", "") or ""
+        ).strip()
+        return f"@{handle} (id {uid})" if handle else f"@id {uid}"
+
+    def _remember_room_talk(self, message: Any) -> None:
+        """Append one inbound message to the channel's bounded recent-talk buffer.
+
+        Opt-in via `room_context.enabled`. Skips the profile's own messages
+        (its turns are already in its session history) and messages with
+        nothing readable. Reply refs prefer Discord's own resolved reference,
+        then fall back to the buffer, then to nothing — never a guessed name.
+        """
+        cfg = self._room_cfg()
+        if not (self._ambient_enabled() and cfg.get("enabled")):
+            return
+        try:
+            channel_id = str(
+                getattr(getattr(message, "channel", None), "id", "") or ""
+            )
+            if not channel_id:
+                return
+            author = getattr(message, "author", None)
+            uid = str(getattr(author, "id", "") or "")
+            if not uid or uid == str(self._bot_user_id() or ""):
+                return
+            content = str(getattr(message, "content", "") or "").strip()
+            snippet = self._flatten_room_line(content, self._ROOM_SNIPPET_CHARS)
+            if not snippet:
+                if list(getattr(message, "attachments", None) or []):
+                    snippet = "(media)"
+                else:
+                    return
+            reply_to = None
+            reference = getattr(message, "reference", None)
+            resolved = getattr(reference, "resolved", None)
+            target = getattr(resolved, "author", None) if resolved is not None else None
+            if target is not None:
+                reply_to = self._room_author_label(target)
+            else:
+                ref_id = str(getattr(reference, "message_id", "") or "")
+                if ref_id:
+                    for entry in reversed(self._room_talk.get(channel_id, [])):
+                        if str(entry[0]) == ref_id:
+                            reply_to = f"@{entry[2]} (id {entry[1]})"
+                            break
+            handle = str(
+                getattr(author, "name", "")
+                or getattr(author, "display_name", "")
+                or ""
+            ).strip()
+            entry = (
+                str(getattr(message, "id", "") or ""),
+                uid,
+                handle,
+                bool(getattr(author, "bot", False)),
+                snippet,
+                reply_to,
+                time.time(),
+            )
+            buffer = self._room_talk.setdefault(channel_id, [])
+            buffer.append(entry)
+            keep = max(int(cfg.get("recent_messages", 6)) * 4, 24)
+            if len(buffer) > keep:
+                del buffer[: len(buffer) - keep]
+            self._room_talk_touched[channel_id] = time.time()
+            while len(self._room_talk) > 128:
+                oldest = min(self._room_talk_touched, key=self._room_talk_touched.get)
+                self._room_talk.pop(oldest, None)
+                self._room_talk_touched.pop(oldest, None)
+        except Exception:
+            logger.debug("ambient: room talk capture failed", exc_info=True)
+
+    def _room_context_rows(self, message: Any) -> list:
+        """The room-context rows for this turn: room line, roster, recent talk."""
+        cfg = self._room_cfg()
+        if not (self._ambient_enabled() and cfg.get("enabled")):
+            return []
+        try:
+            channel = getattr(message, "channel", None)
+            channel_id = str(getattr(channel, "id", "") or "")
+            guild = getattr(channel, "guild", None) or getattr(message, "guild", None)
+            guild_id = str(getattr(guild, "id", "") or "")
+            if guild_id and channel_id:
+                self._channel_guild[channel_id] = guild_id
+            if guild is None:
+                who = self._room_author_label(getattr(message, "author", None))
+                parts = [f"DM with {who}"] if who else ["private chat"]
+            else:
+                server_name = self._flatten_room_line(getattr(guild, "name", ""), 48)
+                channel_name = self._flatten_room_line(
+                    getattr(channel, "name", ""), 48
+                ) or channel_id
+                parts = [
+                    f'server "{server_name}"',
+                    f"channel #{channel_name}",
+                ]
+                parent_name = getattr(getattr(channel, "parent", None), "name", None)
+                if parent_name:
+                    parts.append(
+                        "thread of #"
+                        + self._flatten_room_line(parent_name, 48)
+                    )
+                if cfg.get("include_topic", True):
+                    topic = self._flatten_room_line(
+                        getattr(channel, "topic", "") or "", 120
+                    )
+                    if topic:
+                        parts.append(f'topic "{topic}"')
+                notes = cfg.get("guild_notes")
+                if isinstance(notes, dict) and guild_id:
+                    note = self._flatten_room_line(str(notes.get(guild_id, "") or ""), 120)
+                    if note:
+                        parts.append(f"operator note: {note}")
+            body = " · ".join(parts)
+            if len(body) > 330:
+                body = body[:330].rstrip() + " …"
+            rows = [f"[ambient room: {body}]"]
+
+            current_id = str(getattr(message, "id", "") or "")
+            entries = [
+                e for e in self._room_talk.get(channel_id, []) if e[0] != current_id
+            ]
+            if entries and cfg.get("roster", True):
+                seen: list[str] = []
+                for entry in reversed(entries):
+                    label = (
+                        f"@{entry[2]} (id {entry[1]})"
+                        if entry[2]
+                        else f"@id {entry[1]}"
+                    )
+                    if label not in seen:
+                        seen.append(label)
+                    if len(seen) >= 8:
+                        break
+                roster = "[ambient present recently: " + ", ".join(seen) + "]"
+                if len(roster) > 380:
+                    roster = roster[:380].rstrip() + " …]"
+                rows.append(roster)
+
+            wanted = max(0, int(cfg.get("recent_messages", 6)))
+            if entries and wanted:
+                budget = max(120, int(cfg.get("max_chars", 700)))
+                talk: list[str] = []
+                used = 0
+                for entry in entries[-wanted:]:
+                    who = f"@{entry[2]} id:{entry[1]}" if entry[2] else f"@id:{entry[1]}"
+                    if entry[3]:
+                        who += " (bot)"
+                    arrow = f" → {entry[5]}" if entry[5] else ""
+                    line = self._flatten_room_line(f"{who}{arrow}: {entry[4]}", 200)
+                    if talk and used + len(line) > budget:
+                        break
+                    talk.append(line)
+                    used += len(line)
+                if talk:
+                    rows.append(
+                        "[ambient recent talk, oldest first — you are not its "
+                        "addressee unless named]"
+                    )
+                    rows.extend(talk)
+            return rows
+        except Exception:
+            logger.debug("ambient: room context build failed", exc_info=True)
+            return []
+
+    def _stage_room_context(self, message: Any) -> None:
+        """Stage this turn's room context for request-only delivery."""
+        rows = self._room_context_rows(message)
+        if not rows:
+            return
+        _room_context.set("\n".join(rows))
+        # Same acceptance as the catch-up transcript: the echo guard compares
+        # the reply against exactly what we know we handed over.
+        self._room_echo = (
+            time.time(),
+            {" ".join(ln.split()) for ln in rows},
+        )
+
+    def _room_echo_leak(self, content: Any) -> bool:
+        """True when a reply repeats the room block we just fed the model.
+
+        Same threshold and reasoning as `_catchup_echo_leak`: two verbatim
+        lines is regurgitation, one is plausibly a deliberate quote.
+        Over-suppressing costs one reply; under-suppressing reposts the
+        room's conversation back at itself.
+        """
+        try:
+            set_at, lines = self._room_echo
+            if not lines or time.time() - set_at > 900:
+                return False
+            body = [" ".join(ln.split()) for ln in str(content or "").splitlines()]
+            hits = sum(1 for ln in body if ln and ln in lines)
+            return hits >= 2
+        except Exception:
+            return False
+
     def _resolve_plain_mentions(self, content: str, chat_id: Any) -> str:
-        """Convert known, unambiguous ``@aliases`` to Discord mention syntax."""
+        """Convert known, unambiguous ``@aliases`` to Discord mention syntax.
+
+        Channel-scoped observations win; guild-scoped observations fill the
+        gaps, because a Discord member mention resolves guild-wide while a
+        plain ``@name`` written in one channel is usually about a person met
+        anywhere in the server. Ambiguous aliases stay plain text.
+        """
         if not self._hygiene_cfg().get("resolve_plain_mentions", False):
             return content
         try:
-            directory = self._discord_identities.get(str(chat_id), {})
-            aliases = [
-                (alias, next(iter(ids)))
-                for alias, ids in directory.items()
-                if len(ids) == 1
-            ]
+            def _unique(directory: dict) -> list:
+                return [
+                    (alias, next(iter(ids)))
+                    for alias, ids in directory.items()
+                    if len(ids) == 1
+                ]
+
+            aliases = _unique(self._discord_identities.get(str(chat_id), {}))
+            guild_id = self._channel_guild.get(str(chat_id), "")
+            if not guild_id:
+                # A channel nobody spoke in yet has no remembered guild. Ask
+                # the client once (discord.py serves this from cache) and
+                # remember the answer; failure just skips the guild fallback.
+                getter = getattr(getattr(self, "_client", None), "get_channel", None)
+                if callable(getter):
+                    try:
+                        lookup = int(chat_id) if str(chat_id).isdigit() else chat_id
+                        found = getter(lookup)
+                        guild_id = str(
+                            getattr(getattr(found, "guild", None), "id", "") or ""
+                        )
+                        if guild_id:
+                            self._channel_guild[str(chat_id)] = guild_id
+                    except Exception:
+                        guild_id = ""
+            if guild_id:
+                known = {alias for alias, _ in aliases}
+                aliases += [
+                    (alias, uid)
+                    for alias, uid in _unique(
+                        self._guild_identities.get(guild_id, {})
+                    )
+                    if alias not in known
+                ]
             text = content
             for alias, uid in sorted(aliases, key=lambda item: len(item[0]), reverse=True):
                 pattern = re.compile(
@@ -2772,16 +3080,23 @@ class AmbientDiscordAdapter(DiscordAdapter):
 
         The reactive path normally learns the current speaker directly. An
         idle catch-up can instead mention an earlier participant outside its
-        short prompt window. Read a bounded slice of that same channel once,
-        using Discord message objects as the identity source; never search
-        another channel or guess from model text.
+        short prompt window. Read a bounded slice of that same channel, using
+        Discord message objects as the identity source; never search another
+        channel or guess from model text. Re-read after
+        `mention_rescan_seconds` (default 6h): a long-lived gateway otherwise
+        freezes its identity directory at the first scan and never learns
+        anyone who arrived later — measured here as plain-text ``@name``
+        replies persisting long after the feature shipped.
         """
         if not self._hygiene_cfg().get("resolve_plain_mentions", False):
             return
         if not isinstance(content, str) or not re.search(r"(?<![\w@<])@\w", content):
             return
         channel_id = str(chat_id or "")
-        if not channel_id or channel_id in self._mention_history_scanned:
+        now = time.time()
+        ttl = float(self._hygiene_cfg().get("mention_rescan_seconds", 21600))
+        last = self._mention_history_scanned.get(channel_id)
+        if not channel_id or (last is not None and now - last < ttl):
             return
         try:
             client = getattr(self, "_client", None)
@@ -2791,12 +3106,13 @@ class AmbientDiscordAdapter(DiscordAdapter):
             channel = client.get_channel(lookup)
             if channel is None or not hasattr(channel, "history"):
                 return
-            self._mention_history_scanned.add(channel_id)
+            self._mention_history_scanned[channel_id] = now
             configured = int(self._hygiene_cfg().get("mention_history_limit", 50))
             limit = max(1, min(configured, 100))
             observed = 0
             async for message in channel.history(limit=limit):
                 self._remember_discord_identities(message)
+                self._remember_room_talk(message)
                 observed += 1
             logger.info(
                 "ambient: observed %d recent channel message(s) for mention resolution",
@@ -3363,6 +3679,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
         )
         speaker_token = _speaker_context.set(("", None))
         self._apply_speaker_tag(target)
+        room_token = _room_context.set("")
+        self._stage_room_context(target)
 
         hint_token = _ambient_hint.set(hint)
         thread_token = self._ambient_no_thread_token(target)
@@ -3374,6 +3692,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             _ambient_open.reset(open_token)
             _ambient_hint.reset(hint_token)
             _speaker_context.reset(speaker_token)
+            _room_context.reset(room_token)
             _gif_profile_context.reset(gif_token)
             _current_speaker_id.reset(authorization_token)
             if thread_token is not None:
@@ -4012,6 +4331,17 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.warning(
                 "ambient.catch_up: suppressed a reply that repeated the "
                 "transcript back into the room: %r", content[:200],
+            )
+            self._bounce_discard_pending(reply_to)
+            self._catchup_discard_pending(reply_to)
+            return self._suppressed_result()
+        # Room-context echo guard, same reasoning: the recent-talk lines are
+        # other people's sentences, indistinguishable from ordinary speech by
+        # any pattern — matched against exactly what we handed the model.
+        if self._ambient_enabled() and isinstance(content, str) and self._room_echo_leak(content):
+            logger.warning(
+                "ambient.room: suppressed a reply that repeated the recent-talk "
+                "block back into the room: %r", content[:200],
             )
             self._bounce_discard_pending(reply_to)
             self._catchup_discard_pending(reply_to)
@@ -4742,6 +5072,9 @@ def _on_llm_request_ambient_hint(**kwargs: Any):
         tag, known = _speaker_context.get(("", None))
         if tag:
             extras.append(f"{tag}\n{known}" if known else tag)
+        room = _room_context.get("")
+        if room:
+            extras.append(room)
         if _quiet_resume_pending.get(False):
             extras.append(_QUIET_RESUME_DIRECTIVE)
             _quiet_resume_pending.set(False)
@@ -4767,6 +5100,8 @@ def _on_llm_request_ambient_hint(**kwargs: Any):
             kind = "reply-placement"
         else:
             kind = "speaker"
+        if _room_context.get(""):
+            kind += "+room"
         logger.info(
             "ambient: %s directive delivered via llm_request middleware (request-only)",
             kind,

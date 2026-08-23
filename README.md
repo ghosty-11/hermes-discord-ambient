@@ -41,7 +41,7 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 | **Group-address greetings** | 1 inference when it answers | "good morning agents" / "hello everyone" at its own probability and cooldown, exempt from the daily cap. |
 | **System-notice rerouting** | zero | Cron failures go to a private channel. Drain/stall notices can be rewritten in-character. Pure plumbing is dropped. |
 | **Speaker identity** | zero | Request-only `[speaker @handle id:123]` so memory can key on a stable id. Not written onto the persisted user turn. |
-| **Speaker memory** | zero | Optional subprocess recall at dispatch, also request-only. Keyed on numeric id. Off by default. |
+| **Room context** | zero | Request-only `[ambient room: …]` — server, channel, topic, thread, optional operator note per guild — plus a roster of recently-present people and the last few lines of room talk with reply refs (`→ @author`), so a turn knows which conversation it interrupts. Never written onto the persisted user turn; echoing it back is suppressed like the catch-up transcript. |
 | **Speaker boost** | zero | Per-user overrides of probability / cooldown / daily cap. Cooldown is the load-bearing half. |
 | **Conversation window** | zero | Messages in the bot's wake get a high response chance, bounded by both count and elapsed time. |
 | **Catch-up** | zero per scan; 1 inference on a check-in | Timer scanner. Hands **one** real message to the normal ambient path with a transcript. Same budget as reactive joins. |
@@ -50,8 +50,7 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 | **Compaction focus** | zero | Standing `focus_topic` for social summaries. Unset leaves stock behaviour. |
 | **GIF search** | one HTTP call | `gif_search` tool via [Klipy](https://klipy.com/developers). Hidden unless enabled **and** `KLIPY_API_KEY` is set. Pending/rate-limit state is per profile. |
 | **Media URL isolation** | zero | Prose first, each media URL as its own bare message so Discord renders it clean. |
-| **Mention resolution** | usually zero | Known unambiguous `@display-name` → `<@id>`. Collisions stay plain text. |
-| **Outbound hygiene** | zero | Harmony/control-token strip, speaker-tag echo strip, ambient-directive echo strip, empty markdown images, optional em-dash rewrite. |
+| **Mention resolution** | usually zero | Known unambiguous `@display-name` → `<@id>`, at channel scope first and guild scope second (a person met in one channel is pingable across the guild). Collisions stay plain text. Channel history is re-observed after `text_hygiene.mention_rescan_seconds` so newcomers become pingable on a long-lived gateway. |
 | **Slash-command policy** | zero | Restrict `/model`, `/reset`, … to listed channels/users. Chat is untouched. |
 | **Image gate** | zero | `pre_tool_call` refuse of `image_generate` unless the speaker is allow-listed. Fails closed. |
 | **Voice hygiene** | zero | Kaomoji stripped from speech only. `voice_only_replies` drops the text twin (45s tool-path window, consume-once, reply-anchored). |
@@ -134,6 +133,14 @@ platforms:
             probability: 0.75
             cooldown_seconds: 90
             exempt_daily_cap: true
+        room_context:
+          enabled: true
+          include_topic: true
+          recent_messages: 6      # lines of prior room talk surfaced
+          max_chars: 700          # cap on the talk block
+          roster: true
+          guild_notes:            # trusted, operator-authored; id -> one sentence
+            "<guild-id>": "the operator's home server"
         conversation_window:
           enabled: true
           messages: 3
@@ -190,6 +197,7 @@ platforms:
           strip_speaker_echo: true
           resolve_plain_mentions: false
           mention_history_limit: 50
+          mention_rescan_seconds: 21600   # re-observe channel history after this long
           no_em_dash: false
           isolate_media_urls: true
           suppress_stt_echo: false
@@ -306,8 +314,12 @@ bug, not a style choice.
   also serves operator profiles.
 - **Fail closed.** Exceptions degrade to stock behaviour, never to a mute or an auth bypass.
 - **Auth is re-run.** Ambient re-dispatch cannot skip `_is_allowed_user`.
-- **Directives are request-only.** Ambient hints, speaker tags, speaker memory and quiet
-  resume are appended to the outgoing request. They are not written onto `message.content`.
+- **Directives are request-only.** Ambient hints, speaker tags, speaker memory, room
+  context and quiet resume are appended to the outgoing request. They are not written
+  onto `message.content`.
+- **Room context is structurally safe.** Snippets are flattened to single lines and
+  capped, so user text cannot forge a wrapper row or an identity line; a reply that
+  repeats two lines of the surfaced talk is suppressed, exactly like a catch-up echo.
 - **Silence is scoped.** Unaddressed `[SILENT]` is swallowed. A directly addressed turn
   that emits silence becomes `direct_silence_fallback`.
 - **Charge at send.** Bot-bounce and the shared catch-up budget count replies that went
@@ -402,6 +414,7 @@ venv/bin/python /path/to/hermes-discord-ambient/test_no_threads.py
 venv/bin/python /path/to/hermes-discord-ambient/test_lifecycle_embed_media.py
 venv/bin/python /path/to/hermes-discord-ambient/test_voice_only.py
 venv/bin/python /path/to/hermes-discord-ambient/test_config_and_persistence.py
+venv/bin/python /path/to/hermes-discord-ambient/test_room_context.py
 ```
 
 ## Support development
