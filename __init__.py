@@ -2827,10 +2827,14 @@ class AmbientDiscordAdapter(DiscordAdapter):
     def _remember_room_talk(self, message: Any) -> None:
         """Append one inbound message to the channel's bounded recent-talk buffer.
 
-        Opt-in via `room_context.enabled`. Skips the profile's own messages
-        (its turns are already in its session history) and messages with
-        nothing readable. Reply refs prefer Discord's own resolved reference,
-        then fall back to the buffer, then to nothing — never a guessed name.
+        Opt-in via `room_context.enabled`. Includes the profile's own
+        messages — rendered as ``you`` — so a session that starts fresh
+        (new session, gateway restart, catch-up backfill) still sees the
+        bot's side of the conversation and continuation survives; the
+        duplication with live session history is capped by the talk budget.
+        Messages with nothing readable are skipped. Reply refs prefer
+        Discord's own resolved reference, then fall back to the buffer,
+        then to nothing — never a guessed name.
         """
         cfg = self._room_cfg()
         if not (self._ambient_enabled() and cfg.get("enabled")):
@@ -2843,7 +2847,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 return
             author = getattr(message, "author", None)
             uid = str(getattr(author, "id", "") or "")
-            if not uid or uid == str(self._bot_user_id() or ""):
+            if not uid:
                 return
             content = str(getattr(message, "content", "") or "").strip()
             snippet = self._flatten_room_line(content, self._ROOM_SNIPPET_CHARS)
@@ -2933,11 +2937,19 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     note = self._flatten_room_line(str(notes.get(guild_id, "") or ""), 120)
                     if note:
                         parts.append(f"operator note: {note}")
+                chan_notes = cfg.get("channel_notes")
+                if isinstance(chan_notes, dict) and channel_id:
+                    cnote = self._flatten_room_line(
+                        str(chan_notes.get(channel_id, "") or ""), 120
+                    )
+                    if cnote:
+                        parts.append(f"operator note (this channel): {cnote}")
             body = " · ".join(parts)
             if len(body) > 330:
                 body = body[:330].rstrip() + " …"
             rows = [f"[ambient room: {body}]"]
 
+            self_id = str(self._bot_user_id() or "")
             current_id = str(getattr(message, "id", "") or "")
             entries = [
                 e for e in self._room_talk.get(channel_id, []) if e[0] != current_id
@@ -2945,6 +2957,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
             if entries and cfg.get("roster", True):
                 seen: list[str] = []
                 for entry in reversed(entries):
+                    if entry[1] == self_id:
+                        continue
                     label = (
                         f"@{entry[2]} (id {entry[1]})"
                         if entry[2]
@@ -2965,9 +2979,12 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 talk: list[str] = []
                 used = 0
                 for entry in entries[-wanted:]:
-                    who = f"@{entry[2]} id:{entry[1]}" if entry[2] else f"@id:{entry[1]}"
-                    if entry[3]:
-                        who += " (bot)"
+                    if entry[1] == self_id:
+                        who = "you"
+                    else:
+                        who = f"@{entry[2]} id:{entry[1]}" if entry[2] else f"@id:{entry[1]}"
+                        if entry[3]:
+                            who += " (bot)"
                     arrow = f" → {entry[5]}" if entry[5] else ""
                     line = self._flatten_room_line(f"{who}{arrow}: {entry[4]}", 200)
                     if talk and used + len(line) > budget:

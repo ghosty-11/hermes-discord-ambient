@@ -41,7 +41,7 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 | **Group-address greetings** | 1 inference when it answers | "good morning agents" / "hello everyone" at its own probability and cooldown, exempt from the daily cap. |
 | **System-notice rerouting** | zero | Cron failures go to a private channel. Drain/stall notices can be rewritten in-character. Pure plumbing is dropped. |
 | **Speaker identity** | zero | Request-only `[speaker @handle id:123]` so memory can key on a stable id. Not written onto the persisted user turn. |
-| **Room context** | zero | Request-only `[ambient room: …]` — server, channel, topic, thread, optional operator note per guild — plus a roster of recently-present people and the last few lines of room talk with reply refs (`→ @author`), so a turn knows which conversation it interrupts. Never written onto the persisted user turn; echoing it back is suppressed like the catch-up transcript. |
+| **Room context** | zero | Request-only `[ambient room: …]` — server, channel, topic, thread, optional operator notes per guild and per channel — plus a roster of recently-present people and the last few lines of room talk with reply refs (`→ @author`; the bot's own messages ride as `you` so a fresh session keeps its side of the conversation). Never written onto the persisted user turn; echoing it back is suppressed like the catch-up transcript. |
 | **Speaker boost** | zero | Per-user overrides of probability / cooldown / daily cap. Cooldown is the load-bearing half. |
 | **Conversation window** | zero | Messages in the bot's wake get a high response chance, bounded by both count and elapsed time. |
 | **Catch-up** | zero per scan; 1 inference on a check-in | Timer scanner. Hands **one** real message to the normal ambient path with a transcript. Same budget as reactive joins. |
@@ -141,6 +141,8 @@ platforms:
           roster: true
           guild_notes:            # trusted, operator-authored; id -> one sentence
             "<guild-id>": "the operator's home server"
+          channel_notes:          # same, scoped to one channel's turns
+            "<channel-id>": "the common room"
         conversation_window:
           enabled: true
           messages: 3
@@ -320,6 +322,8 @@ bug, not a style choice.
 - **Room context is structurally safe.** Snippets are flattened to single lines and
   capped, so user text cannot forge a wrapper row or an identity line; a reply that
   repeats two lines of the surfaced talk is suppressed, exactly like a catch-up echo.
+  The bot's own messages are included for continuation and rendered as `you`, never
+  as a roster member.
 - **Silence is scoped.** Unaddressed `[SILENT]` is swallowed. A directly addressed turn
   that emits silence becomes `direct_silence_fallback`.
 - **Charge at send.** Bot-bounce and the shared catch-up budget count replies that went

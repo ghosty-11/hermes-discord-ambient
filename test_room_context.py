@@ -262,6 +262,28 @@ noscrub._remember_discord_identities(Message(402, BOB, SHRINE, "hi"))
 plain_out = noscrub._scrub_outbound("hey @bob", "502")
 check("send path leaves @name alone when the config is off", plain_out == "hey @bob", plain_out)
 
+print("self continuation and channel notes")
+adapter5 = build_adapter(ROOM_CFG)
+HER = Author(999, "roomtest", bot=True)
+adapter5._remember_room_talk(Message(600, HER, GENERAL, "settling in here with you all"))
+adapter5._remember_room_talk(Message(601, BOB, GENERAL, "morning!"))
+rows5 = adapter5._room_context_rows(Message(602, ALICE, GENERAL, "hi"))
+check("her own message is in the room talk as 'you'",
+      any(ln.startswith("you") and "settling in" in ln for ln in rows5), rows5)
+roster5 = [ln for ln in rows5 if ln.startswith("[ambient present recently")]
+check("the roster does not list herself", roster5 and "roomtest" not in roster5[0], roster5)
+adapter5._remember_room_talk(Message(603, HER, GENERAL, "welcome back!", reference=Ref(resolved=RefMsg(BOB))))
+adapter5._remember_room_talk(Message(604, BOB, GENERAL, "thanks", reference=Ref(resolved=RefMsg(HER))))
+rows6 = adapter5._room_context_rows(Message(605, ALICE, GENERAL, "hi"))
+check("her reply renders 'you → @bob'", any(ln.startswith("you → @bob") for ln in rows6), rows6)
+check("a reply to her names her label", any("→ @roomtest (id 999)" in ln for ln in rows6), rows6)
+CFG_CN = {**ROOM_CFG, "room_context": {**ROOM_CFG["room_context"], "channel_notes": {"501": "the common room"}}}
+adapter6 = build_adapter(CFG_CN)
+check("channel note rides the room line",
+      "operator note (this channel): the common room" in adapter6._room_context_rows(Message(610, ALICE, GENERAL, "hi"))[0],
+      adapter6._room_context_rows(Message(610, ALICE, GENERAL, "hi")))
+check("channel note stays in its channel",
+      "common room" not in adapter6._room_context_rows(Message(611, ALICE, OFFTOPIC, "hi"))[0])
 print("history rescan staleness")
 adapter4 = build_adapter(ROOM_CFG)
 class HistoryChan:
