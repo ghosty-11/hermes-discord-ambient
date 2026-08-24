@@ -164,7 +164,7 @@ UPSTREAM COUPLING (what discord-adapter-watch.sh guards)
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 import contextvars
 import json
 import logging
@@ -1058,6 +1058,15 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # the five-second disconnect budget never waits on inference.
         self._lifecycle_generation_task: Any = None
         self._lifecycle_departure_copy: str | None = None
+        # Epoch of the last SUCCESSFUL lifecycle post (any channel, any
+        # label), persisted under HERMES_HOME/state so back-to-back gateway
+        # restarts — how plugin code loads here — cannot stack "she's back"
+        # lines: `gateway_lifecycle.daily_max` (default 1) caps her to one
+        # per calendar day. Keyed on the bot's own Discord id, same reason
+        # as catch-up state: under the multiplex each seat is its own
+        # account.
+        self._lifecycle_last_post: float = 0.0
+        self._lifecycle_state_loaded = False
         # Per-channel, observed Discord identities used to turn a model's
         # plain ``@display-name`` into the wire form Discord actually pings.
         # Values are sets because reused display names must stay ambiguous.
@@ -1367,45 +1376,71 @@ class AmbientDiscordAdapter(DiscordAdapter):
             if (cleaned := self._clean_lifecycle_copy(decoded.get(event)))
         }
 
-    async def _recent_self_message_in(self, channel_id: str, within_minutes: float) -> bool:
-        """True when the bot's own most recent message in the channel is recent.
+    def _lifecycle_state_path(self) -> str | None:
+        """Keyed on the BOT's own Discord user id — see `_catchup_state_path`."""
+        try:
+            uid = getattr(getattr(self, "_client", None), "user", None)
+            uid = getattr(uid, "id", None)
+            if not uid:
+                return None
+            home = os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
+            return os.path.join(home, "state", f"ambient-lifecycle-{uid}.json")
+        except Exception:
+            return None
 
-        Rapid gateway restarts (how plugin code loads on this host) each roll
-        a return/departure line, so a work session of back-to-back restarts
-        stacks several "she's back" messages. Any recent self-message —
-        lifecycle or ordinary chat — suppresses the post: the room saw her
-        moments ago and does not need an announcement. Fails open (returns
-        False) when history cannot be read, preserving the old behaviour.
+    def _lifecycle_load_state(self) -> None:
+        """Restore the daily marker once per process."""
+        if self._lifecycle_state_loaded:
+            return
+        path = self._lifecycle_state_path()
+        if not path:
+            return  # no identity yet; try again next post
+        self._lifecycle_state_loaded = True
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+            self._lifecycle_last_post = float(data.get("last") or 0.0)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.debug("ambient.lifecycle: could not restore marker", exc_info=True)
+
+    def _lifecycle_save_state(self) -> None:
+        path = self._lifecycle_state_path()
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.tmp"
+            with open(tmp, "w") as fh:
+                json.dump({"last": self._lifecycle_last_post}, fh)
+            os.replace(tmp, path)
+        except Exception:
+            logger.debug("ambient.lifecycle: could not persist marker", exc_info=True)
+
+    def _lifecycle_daily_budget_spent(self) -> bool:
+        """True when this calendar day's lifecycle-post budget is used up.
+
+        `gateway_lifecycle.daily_max` (default 1, 0 = unlimited) caps return
+        and departure posts together, so a day of back-to-back restarts gets
+        at most one line. Checked before rolls and inference as well as at
+        send time — a blocked restart must cost nothing. Only lifecycle
+        posts count; ordinary chat never touches the budget. Fails open:
+        unreadable state reads as "no marker".
         """
-        if within_minutes <= 0:
-            return False
-        getter = getattr(getattr(self, "_client", None), "get_channel", None)
-        if getter is None:
-            return False
         try:
-            lookup = int(channel_id) if str(channel_id).isdigit() else channel_id
-            channel = getter(lookup)
-        except Exception:
+            daily_max = int(self._lifecycle_cfg().get("daily_max", 1))
+        except (TypeError, ValueError):
+            daily_max = 1
+        if daily_max <= 0:
             return False
-        history = getattr(channel, "history", None)
-        if history is None:
+        self._lifecycle_load_state()
+        if self._lifecycle_last_post <= 0:
             return False
-        try:
-            self_id = str(self._bot_user_id() or "")
-            cutoff = datetime.now(timezone.utc) - timedelta(minutes=within_minutes)
-            async for message in history(limit=12):
-                created = getattr(message, "created_at", None)
-                author = getattr(message, "author", None)
-                if created is None or author is None:
-                    continue
-                if str(getattr(author, "id", "") or "") == self_id:
-                    return created >= cutoff
-            return False
-        except Exception:
-            logger.debug(
-                "ambient.lifecycle: recent-self history read failed", exc_info=True
-            )
-            return False
+        return (
+            datetime.fromtimestamp(self._lifecycle_last_post).date()
+            == datetime.now().date()
+        )
 
     async def _send_lifecycle_message(self, channel: Any, content: Any, *, label: str) -> bool:
         channel_id = str(channel or "").strip()
@@ -1414,20 +1449,18 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.info("ambient.lifecycle: %s stayed silent", label)
             return False
         try:
-            cfg = self._lifecycle_cfg()
-            try:
-                window = float(cfg.get("skip_if_recent_self_minutes", 45))
-            except (TypeError, ValueError):
-                window = 45.0
-            if await self._recent_self_message_in(channel_id, window):
+            if self._lifecycle_daily_budget_spent():
                 logger.info(
-                    "ambient.lifecycle: %s skipped — she posted in %s within %.0f min",
-                    label, channel_id, window,
+                    "ambient.lifecycle: %s skipped — daily lifecycle budget "
+                    "already spent",
+                    label,
                 )
                 return False
             result = await self.send(channel_id, text)
             success = bool(getattr(result, "success", False))
             if success:
+                self._lifecycle_last_post = time.time()
+                self._lifecycle_save_state()
                 logger.info("ambient.lifecycle: %s sent to %s", label, channel_id)
             else:
                 logger.warning("ambient.lifecycle: %s send failed for %s", label, channel_id)
@@ -1439,6 +1472,13 @@ class AmbientDiscordAdapter(DiscordAdapter):
     def _select_gateway_lifecycle_events(self) -> list[str]:
         cfg = self._lifecycle_cfg()
         if not self._ambient_enabled() or not cfg.get("enabled"):
+            return []
+        if self._lifecycle_daily_budget_spent():
+            # Before the rolls and before inference: a blocked restart must
+            # cost nothing, not even a generation task.
+            logger.info(
+                "ambient.lifecycle: no events rolled — daily budget already spent"
+            )
             return []
         shrine_probability = self._lifecycle_probability(
             cfg.get("shrine_probability"), 0.4

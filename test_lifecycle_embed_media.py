@@ -58,6 +58,7 @@ def make_adapter():
                     "enabled": True,
                     "shrine_channel": "shrine",
                     "shrine_probability": 0.4,
+                    "daily_max": 0,  # this suite tests send mechanics, not budget
                     "inference": {
                         "enabled": True,
                         "task": "title_generation",

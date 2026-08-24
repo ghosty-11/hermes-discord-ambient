@@ -284,62 +284,75 @@ check("channel note rides the room line",
       adapter6._room_context_rows(Message(610, ALICE, GENERAL, "hi")))
 check("channel note stays in its channel",
       "common room" not in adapter6._room_context_rows(Message(611, ALICE, OFFTOPIC, "hi"))[0])
-print("lifecycle double-post guard")
-from datetime import datetime, timedelta, timezone  # noqa: E402
+print("lifecycle daily cap")
+import json  # noqa: E402
+from datetime import datetime, timedelta  # noqa: E402
+_TEST_HOME = os.environ["HERMES_HOME"]
 
-class HistMsg:
-    def __init__(self, author, created_at):
-        self.author = author
-        self.created_at = created_at
-
-class HistChan:
-    def __init__(self, messages):
-        self._messages = messages
-    def history(self, limit=10):
-        msgs = list(self._messages[:limit])
-        async def gen():
-            for m in msgs:
-                yield m
-        return gen()
-
-def lc_adapter(messages, window=45):
+def lc_adapter(last=0.0, daily_max=1):
     a = build_adapter({"gateway_lifecycle": {
-        "enabled": True, "shrine_channel": "900",
-        "skip_if_recent_self_minutes": window,
+        "enabled": True, "shrine_channel": "900", "daily_max": daily_max,
     }})
-    a._client = types.SimpleNamespace(
-        user=Author(999, "roomtest", bot=True),
-        get_channel=lambda cid: HistChan(messages) if str(cid) == "900" else None,
-    )
+    a._client = types.SimpleNamespace(user=Author(999, "roomtest", bot=True))
     a._sent = []
     async def fake_send(cid, text, metadata=None):
         a._sent.append((str(cid), text))
         return types.SimpleNamespace(success=True)
     a.send = fake_send
+    a._lifecycle_last_post = float(last)
+    a._lifecycle_state_loaded = True
     return a
 
-_now = datetime.now(timezone.utc)
-_recent_self = HistMsg(Author(999, "roomtest", bot=True), _now - timedelta(minutes=3))
-_other = HistMsg(Author(102, "bob"), _now - timedelta(minutes=1))
-_old_self = HistMsg(Author(999, "roomtest", bot=True), _now - timedelta(hours=3))
+_today00 = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+_earlier_today = _today00.timestamp() + 3600          # 01:00 today — always past or harmless
+_yesterday = (_today00 - timedelta(days=1)).timestamp()
 
-_a1 = lc_adapter([_other, _recent_self])
-check("recent self message skips the lifecycle post",
-      asyncio.run(_a1._send_lifecycle_message("900", "she returned", label="return")) is False and _a1._sent == [],
-      _a1._sent)
-_a2 = lc_adapter([_other, _old_self])
-check("old self message still posts",
-      asyncio.run(_a2._send_lifecycle_message("900", "she returned", label="return")) is True and len(_a2._sent) == 1,
-      _a2._sent)
-_a3 = lc_adapter([_recent_self], window=0)
-check("window 0 disables the guard",
-      asyncio.run(_a3._send_lifecycle_message("900", "she returned", label="return")) is True, _a3._sent)
-_a4 = lc_adapter([HistMsg(Author(999, "roomtest", bot=True), _now - timedelta(minutes=10))], window=5)
-check("config window is honored",
-      asyncio.run(_a4._send_lifecycle_message("900", "she returned", label="return")) is True, _a4._sent)
-_a5 = lc_adapter([], window=45)
-check("empty history posts",
-      asyncio.run(_a5._send_lifecycle_message("900", "she returned", label="departure")) is True, _a5._sent)
+_d1 = lc_adapter()
+check("no marker yet: the day's first lifecycle post goes out",
+      asyncio.run(_d1._send_lifecycle_message(900, "she returned", label="return")) is True, _d1._sent)
+check("a successful post records the day marker",
+      time.time() - _d1._lifecycle_last_post < 5, _d1._lifecycle_last_post)
+check("a second post the same day is skipped",
+      asyncio.run(_d1._send_lifecycle_message(901, "she returned", label="public return")) is False and len(_d1._sent) == 1,
+      _d1._sent)
+_d2 = lc_adapter(last=_earlier_today)
+check("an earlier-today marker blocks the post",
+      asyncio.run(_d2._send_lifecycle_message(900, "she returned", label="return")) is False, _d2._sent)
+_d3 = lc_adapter(last=_yesterday)
+check("a yesterday marker does not block today's post",
+      asyncio.run(_d3._send_lifecycle_message(900, "she returned", label="return")) is True, _d3._sent)
+_d4 = lc_adapter(last=_earlier_today, daily_max=0)
+check("daily_max 0 lifts the cap",
+      asyncio.run(_d4._send_lifecycle_message(900, "she returned", label="return")) is True, _d4._sent)
+_d5 = lc_adapter(last=_earlier_today)
+check("spent budget stops event selection before any roll or inference",
+      _d5._select_gateway_lifecycle_events() == [])
+
+# A failed send must not consume the day's budget.
+_d6 = lc_adapter()
+async def _failing_send(cid, text, metadata=None):
+    return types.SimpleNamespace(success=False)
+_d6.send = _failing_send
+check("failed send reports failure",
+      asyncio.run(_d6._send_lifecycle_message(900, "x", label="return")) is False)
+check("failed send does not consume the budget",
+      _d6._lifecycle_last_post == 0.0, _d6._lifecycle_last_post)
+
+# Restart survival: the marker lives in a state file under HERMES_HOME/state,
+# keyed on the bot's own id — a restarted process must still see it.
+_home = tempfile.mkdtemp(prefix="lifecycle-state-")
+_state_dir = os.path.join(_home, "state")
+os.makedirs(_state_dir, exist_ok=True)
+with open(os.path.join(_state_dir, "ambient-lifecycle-999.json"), "w") as _fh:
+    json.dump({"last": time.time() - 60}, _fh)
+_d7 = lc_adapter()
+_d7._lifecycle_state_loaded = False
+os.environ["HERMES_HOME"] = _home
+try:
+    check("the day marker survives a restart (state file)",
+          asyncio.run(_d7._send_lifecycle_message(900, "she returned", label="return")) is False, _d7._sent)
+finally:
+    os.environ["HERMES_HOME"] = _TEST_HOME
 print("history rescan staleness")
 adapter4 = build_adapter(ROOM_CFG)
 class HistoryChan:
