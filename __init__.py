@@ -164,6 +164,7 @@ UPSTREAM COUPLING (what discord-adapter-watch.sh guards)
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import contextvars
 import json
 import logging
@@ -1366,6 +1367,46 @@ class AmbientDiscordAdapter(DiscordAdapter):
             if (cleaned := self._clean_lifecycle_copy(decoded.get(event)))
         }
 
+    async def _recent_self_message_in(self, channel_id: str, within_minutes: float) -> bool:
+        """True when the bot's own most recent message in the channel is recent.
+
+        Rapid gateway restarts (how plugin code loads on this host) each roll
+        a return/departure line, so a work session of back-to-back restarts
+        stacks several "she's back" messages. Any recent self-message —
+        lifecycle or ordinary chat — suppresses the post: the room saw her
+        moments ago and does not need an announcement. Fails open (returns
+        False) when history cannot be read, preserving the old behaviour.
+        """
+        if within_minutes <= 0:
+            return False
+        getter = getattr(getattr(self, "_client", None), "get_channel", None)
+        if getter is None:
+            return False
+        try:
+            lookup = int(channel_id) if str(channel_id).isdigit() else channel_id
+            channel = getter(lookup)
+        except Exception:
+            return False
+        history = getattr(channel, "history", None)
+        if history is None:
+            return False
+        try:
+            self_id = str(self._bot_user_id() or "")
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=within_minutes)
+            async for message in history(limit=12):
+                created = getattr(message, "created_at", None)
+                author = getattr(message, "author", None)
+                if created is None or author is None:
+                    continue
+                if str(getattr(author, "id", "") or "") == self_id:
+                    return created >= cutoff
+            return False
+        except Exception:
+            logger.debug(
+                "ambient.lifecycle: recent-self history read failed", exc_info=True
+            )
+            return False
+
     async def _send_lifecycle_message(self, channel: Any, content: Any, *, label: str) -> bool:
         channel_id = str(channel or "").strip()
         text = self._clean_lifecycle_copy(content)
@@ -1373,6 +1414,17 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.info("ambient.lifecycle: %s stayed silent", label)
             return False
         try:
+            cfg = self._lifecycle_cfg()
+            try:
+                window = float(cfg.get("skip_if_recent_self_minutes", 45))
+            except (TypeError, ValueError):
+                window = 45.0
+            if await self._recent_self_message_in(channel_id, window):
+                logger.info(
+                    "ambient.lifecycle: %s skipped — she posted in %s within %.0f min",
+                    label, channel_id, window,
+                )
+                return False
             result = await self.send(channel_id, text)
             success = bool(getattr(result, "success", False))
             if success:

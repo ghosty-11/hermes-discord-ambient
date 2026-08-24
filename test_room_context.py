@@ -284,6 +284,62 @@ check("channel note rides the room line",
       adapter6._room_context_rows(Message(610, ALICE, GENERAL, "hi")))
 check("channel note stays in its channel",
       "common room" not in adapter6._room_context_rows(Message(611, ALICE, OFFTOPIC, "hi"))[0])
+print("lifecycle double-post guard")
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+class HistMsg:
+    def __init__(self, author, created_at):
+        self.author = author
+        self.created_at = created_at
+
+class HistChan:
+    def __init__(self, messages):
+        self._messages = messages
+    def history(self, limit=10):
+        msgs = list(self._messages[:limit])
+        async def gen():
+            for m in msgs:
+                yield m
+        return gen()
+
+def lc_adapter(messages, window=45):
+    a = build_adapter({"gateway_lifecycle": {
+        "enabled": True, "shrine_channel": "900",
+        "skip_if_recent_self_minutes": window,
+    }})
+    a._client = types.SimpleNamespace(
+        user=Author(999, "roomtest", bot=True),
+        get_channel=lambda cid: HistChan(messages) if str(cid) == "900" else None,
+    )
+    a._sent = []
+    async def fake_send(cid, text, metadata=None):
+        a._sent.append((str(cid), text))
+        return types.SimpleNamespace(success=True)
+    a.send = fake_send
+    return a
+
+_now = datetime.now(timezone.utc)
+_recent_self = HistMsg(Author(999, "roomtest", bot=True), _now - timedelta(minutes=3))
+_other = HistMsg(Author(102, "bob"), _now - timedelta(minutes=1))
+_old_self = HistMsg(Author(999, "roomtest", bot=True), _now - timedelta(hours=3))
+
+_a1 = lc_adapter([_other, _recent_self])
+check("recent self message skips the lifecycle post",
+      asyncio.run(_a1._send_lifecycle_message("900", "she returned", label="return")) is False and _a1._sent == [],
+      _a1._sent)
+_a2 = lc_adapter([_other, _old_self])
+check("old self message still posts",
+      asyncio.run(_a2._send_lifecycle_message("900", "she returned", label="return")) is True and len(_a2._sent) == 1,
+      _a2._sent)
+_a3 = lc_adapter([_recent_self], window=0)
+check("window 0 disables the guard",
+      asyncio.run(_a3._send_lifecycle_message("900", "she returned", label="return")) is True, _a3._sent)
+_a4 = lc_adapter([HistMsg(Author(999, "roomtest", bot=True), _now - timedelta(minutes=10))], window=5)
+check("config window is honored",
+      asyncio.run(_a4._send_lifecycle_message("900", "she returned", label="return")) is True, _a4._sent)
+_a5 = lc_adapter([], window=45)
+check("empty history posts",
+      asyncio.run(_a5._send_lifecycle_message("900", "she returned", label="departure")) is True, _a5._sent)
 print("history rescan staleness")
 adapter4 = build_adapter(ROOM_CFG)
 class HistoryChan:

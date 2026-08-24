@@ -167,6 +167,8 @@ platforms:
           enabled: false
           shrine_channel: "<private-channel-id>"
           shrine_probability: 0.4
+          skip_if_recent_self_minutes: 45   # skip a return/departure post when her own
+                                            # last message in the channel is newer; 0 disables
           inference:
             enabled: true
             task: title_generation
