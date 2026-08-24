@@ -251,6 +251,16 @@ unresolved = adapter3._resolve_plain_mentions("hey @bob", "507")
 check("a guild-wide collision stays plain text", unresolved == "hey @bob", unresolved)
 unknown = adapter3._resolve_plain_mentions("hey @stranger", "502")
 check("unknown names are left alone", unknown == "hey @stranger", unknown)
+# The SEND call site, not the helper: _scrub_outbound is what send() runs on
+# every reply, and it must apply the same config lookup, directory key and
+# <@id> wire format with the chat_id it is handed.
+sent = adapter3._scrub_outbound("hey @bob, welcome back!", "502")
+check("send path resolves @name to a Discord ping", sent == "hey <@102>, welcome back!", sent)
+noscrub = build_adapter({"text_hygiene": {"resolve_plain_mentions": False},
+                         "room_context": {"enabled": True}})
+noscrub._remember_discord_identities(Message(402, BOB, SHRINE, "hi"))
+plain_out = noscrub._scrub_outbound("hey @bob", "502")
+check("send path leaves @name alone when the config is off", plain_out == "hey @bob", plain_out)
 
 print("history rescan staleness")
 adapter4 = build_adapter(ROOM_CFG)
