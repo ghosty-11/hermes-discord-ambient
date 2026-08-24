@@ -2828,13 +2828,13 @@ class AmbientDiscordAdapter(DiscordAdapter):
         """Append one inbound message to the channel's bounded recent-talk buffer.
 
         Opt-in via `room_context.enabled`. Includes the profile's own
-        messages — rendered as ``you`` — so a session that starts fresh
-        (new session, gateway restart, catch-up backfill) still sees the
-        bot's side of the conversation and continuation survives; the
-        duplication with live session history is capped by the talk budget.
-        Messages with nothing readable are skipped. Reply refs prefer
-        Discord's own resolved reference, then fall back to the buffer,
-        then to nothing — never a guessed name.
+        messages — rendered as ``you`` — so a populated buffer preserves
+        the bot's side of the conversation across sessions; after a
+        restart it repopulates via live traffic or eligible catch-up.
+        The duplication with live session history is capped by the talk
+        budget. Messages with nothing readable are skipped. Reply refs
+        prefer Discord's own resolved reference, then fall back to the
+        buffer, then to nothing — never a guessed name.
         """
         cfg = self._room_cfg()
         if not (self._ambient_enabled() and cfg.get("enabled")):
