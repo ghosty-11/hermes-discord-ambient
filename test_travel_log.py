@@ -423,6 +423,54 @@ with case("a lane already obs-idle at load closes as 'restart'"):
               and a._travel_beats[0].get("close_reason") == "restart", a._travel_beats)
         check("the fresh lane stayed open", set(a._travel_lanes) == {"506"}, list(a._travel_lanes))
 
+with case("the restart backfill never touches a live lane"):
+    with state_home():
+        # The corner the first red run exposed: a lane that was never
+        # persisted is LIVE, not downtime — only the closure table may close
+        # it. (Production reaches this only via the first sweep's lazy load.)
+        a = build_adapter()
+        arrive(a, Message(45, ALICE, GENERAL, "hi"))
+        a._travel_spoke("501")
+        age(a._travel_lanes["501"], opened_m=200, obs_m=90, spoke_m=10)
+        a._travel_sweep()  # first sweep ever: lazy load + backfill run here
+        check("a live mid-monologue lane survives the first sweep",
+              "501" in a._travel_lanes and not a._travel_beats,
+              (list(a._travel_lanes), a._travel_beats))
+
+with case("a lazy load mid-visit never clobbers the live lane"):
+    with state_home() as home:
+        seed_travel_store(home, [], {"501": mk_lane(GENERAL, 200, 90, 95, her=1)})
+        a = build_adapter()
+        arrive(a, Message(46, ALICE, GENERAL, "live again"))
+        arrive(a, Message(47, BOB, GENERAL, "still live"))
+        a._travel_sweep()  # lazy load finds the disk copy under a live lane
+        lane = a._travel_lanes.get("501")
+        check("the live lane wins over its disk copy",
+              lane is not None and lane["obs_count"] == 2
+              and time.time() - lane["last_observed_at"] < 5, lane)
+        check("the stale disk copy still earned its restart beat",
+              any(b.get("close_reason") == "restart" and str(b.get("channel_id")) == "501"
+                  for b in a._travel_beats), a._travel_beats)
+
+with case("a warm superseded copy is dropped as the same visit continuing"):
+    with state_home() as home:
+        # Not obs-idle on disk, and the channel already has a live lane:
+        # the copy is the same visit, mid-flight — not downtime, not a
+        # second visit. Dropping it silently is the only honest reading.
+        seed_travel_store(home, [], {"501": mk_lane(GENERAL, 200, 5, 30, her=1)})
+        a = build_adapter()
+        arrive(a, Message(48, ALICE, GENERAL, "still me"))
+        arrive(a, Message(49, BOB, GENERAL, "still going"))
+        a._travel_sweep()  # lazy load meets a live lane holding the channel
+        lane = a._travel_lanes.get("501")
+        check("no beat was written for the warm copy", not a._travel_beats, a._travel_beats)
+        check("the live lane is untouched",
+              lane is not None and lane["obs_count"] == 2
+              and time.time() - lane["last_observed_at"] < 5, lane)
+        check("no restart close fired",
+              not any(b.get("close_reason") == "restart" for b in a._travel_beats)
+              and "501" in a._travel_lanes, list(a._travel_lanes))
+
 with case("beat ids continue past the persisted maximum"):
     with state_home() as home:
         seed_travel_store(home, [mk_beat(3, GENERAL, 300, 290), mk_beat(7, RANDOM, 100, 90)], {})

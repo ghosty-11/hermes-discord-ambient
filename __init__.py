@@ -3261,10 +3261,11 @@ class AmbientDiscordAdapter(DiscordAdapter):
         if not path:
             return  # no identity yet; try again next sweep
         self._travel_state_loaded = True
-        # Keys restored from disk — the restart backfill closes only these
-        # (a corrupt file must not turn the backfill call into a NameError,
-        # hence the pre-try init).
+        # Lane keys restored from disk, and disk copies whose channel a LIVE
+        # lane already holds (identity arrived late). Both pre-try so a
+        # corrupt file cannot turn the backfill call into a NameError.
         restored: list[str] = []
+        superseded: list[tuple[str, dict]] = []
         try:
             with open(path) as fh:
                 data = json.load(fh)
@@ -3275,10 +3276,20 @@ class AmbientDiscordAdapter(DiscordAdapter):
             self._travel_beats.extend(beats)
             lanes = data.get("lanes")
             if isinstance(lanes, dict):
-                for key, lane in lanes.items():
-                    if isinstance(lane, dict) and lane.get("last_observed_at"):
-                        self._travel_lanes[str(key)] = lane
-                        restored.append(str(key))
+                for raw_key, lane in lanes.items():
+                    if not (isinstance(lane, dict) and lane.get("last_observed_at")):
+                        continue
+                    key = str(raw_key)
+                    if key in self._travel_lanes:
+                        # A live lane holds this channel: the disk copy is an
+                        # EARLIER visit, not fresher state of this one.
+                        # Clobbering would erase every observation since the
+                        # process came up; judge the copy on its own clocks
+                        # instead (see _travel_backfill_restart).
+                        superseded.append((key, lane))
+                    else:
+                        self._travel_lanes[key] = lane
+                        restored.append(key)
             # Monotonic across restarts: the next id handed out must clear
             # every id already on disk.
             self._travel_seq = max(
@@ -3294,7 +3305,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
         except Exception:
             logger.debug("ambient.travel_log: could not restore state", exc_info=True)
         self._travel_load_room_talk()
-        self._travel_backfill_restart(restored)
+        self._travel_backfill_restart(restored, superseded)
 
     def _travel_load_room_talk(self) -> None:
         path = self._room_talk_state_path()
@@ -3345,7 +3356,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
         except Exception:
             logger.debug("ambient.travel_log: could not restore room talk", exc_info=True)
 
-    def _travel_backfill_restart(self, persisted: list[str]) -> None:
+    def _travel_backfill_restart(
+        self, persisted: list[str], superseded: list[tuple[str, dict]] = ()
+    ) -> None:
         """Close PERSISTED lanes that were already quiet when we came up.
 
         A persisted lane's last_observed_at is the last message she saw
@@ -3369,6 +3382,21 @@ class AmbientDiscordAdapter(DiscordAdapter):
             lane = self._travel_lanes.get(key)
             if lane is None:
                 continue
+            try:
+                if now - float(lane.get("last_observed_at") or 0.0) > idle:
+                    self._travel_close_lane(key, lane, now, "restart")
+            except Exception:
+                logger.debug(
+                    "ambient.travel_log: restart backfill skipped a lane",
+                    exc_info=True,
+                )
+        # Superseded disk copies (their channel already has a live lane)
+        # still owe their beat when they went quiet before the restart:
+        # that visit DID end during downtime. Closed on their own clocks —
+        # _travel_close_lane pops by identity, so the live lane is safe. A
+        # copy that was still warm is simply dropped: the live lane is the
+        # same visit continuing.
+        for key, lane in superseded:
             try:
                 if now - float(lane.get("last_observed_at") or 0.0) > idle:
                     self._travel_close_lane(key, lane, now, "restart")
@@ -3552,7 +3580,10 @@ class AmbientDiscordAdapter(DiscordAdapter):
             ),
         })
         self._travel_seq += 1
-        self._travel_lanes.pop(key, None)
+        # Identity check, not just key: closing a superseded disk copy must
+        # never pop the LIVE lane that replaced it.
+        if self._travel_lanes.get(key) is lane:
+            self._travel_lanes.pop(key, None)
 
     def _travel_sweep(self) -> None:
         """One sweep tick: close finished visits, prune, persist.
