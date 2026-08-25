@@ -41,10 +41,11 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 | **Group-address greetings** | 1 inference when it answers | "good morning agents" / "hello everyone" at its own probability and cooldown, exempt from the daily cap. |
 | **System-notice rerouting** | zero | Cron failures go to a private channel. Drain/stall notices can be rewritten in-character. Pure plumbing is dropped. |
 | **Speaker identity** | zero | Request-only `[speaker @handle id:123]` so memory can key on a stable id. Not written onto the persisted user turn. |
-| **Room context** | zero | Request-only `[ambient room: …]` — server, channel, topic, thread, optional operator notes per guild and per channel — plus a roster of recently-present people and the last few lines of room talk with reply refs (`→ @author`; the bot's own messages ride as `you`, so a populated buffer preserves its side of the conversation across sessions — after a restart it repopulates via live traffic or eligible catch-up). Never written onto the persisted user turn; echoing it back is suppressed like the catch-up transcript. |
+| **Room context** | zero | Request-only `[ambient room: …]` — server, channel, topic, thread, optional operator notes per guild and per channel — plus a roster of recently-present people and the last few lines of room talk with reply refs (`→ @author`; the bot's own messages ride as `you`, so a populated buffer preserves its side of the conversation across sessions — with `persist_room_talk` on it survives restarts from disk; otherwise it repopulates via live traffic or eligible catch-up). Never written onto the persisted user turn; echoing it back is suppressed like the catch-up transcript. |
 | **Speaker boost** | zero | Per-user overrides of probability / cooldown / daily cap. Cooldown is the load-bearing half. |
 | **Conversation window** | zero | Messages in the bot's wake get a high response chance, bounded by both count and elapsed time. |
 | **Catch-up** | zero per scan; 1 inference on a check-in | Timer scanner. Hands **one** real message to the normal ambient path with a transcript. Same budget as reactive joins. |
+| **Travel log** | zero inference | Durable 32h cross-space visit record; idle-based beats (her participation or the room's life keep a visit open; both quiet, or she stops joining for `lurk_max_minutes`, closes it); projected request-only so she narrates her own continuity. |
 | **Gateway lifecycle** | at most 1 background inference | Independent rolls for private return, cached departure, optional public return. Reconnects stay quiet. |
 | **Rich-embed video** | local STT; video inference only when used | Discord-proxied `video/*` only (`images-ext-*.discordapp.net`). Stock size limits apply. |
 | **Compaction focus** | zero | Standing `focus_topic` for social summaries. Unset leaves stock behaviour. |
@@ -143,6 +144,16 @@ platforms:
             "<guild-id>": "the operator's home server"
           channel_notes:          # same, scoped to one channel's turns
             "<channel-id>": "the common room"
+        persist_room_talk: true  # talk buffer survives restarts; flushed on the travel-log sweep
+        travel_log:
+          enabled: true
+          horizon_hours: 32      # beats older than this pruned on save, never projected
+          idle_minutes: 60       # room-quiet threshold
+          lurk_max_minutes: 360  # participation-staleness cap
+          sweep_seconds: 300     # background sweep cadence
+          max_events: 8          # projection budget
+          max_chars: 600         # projection budget
+          include_lurk_only: true
         conversation_window:
           enabled: true
           messages: 3
@@ -327,6 +338,16 @@ bug, not a style choice.
   repeats two lines of the surfaced talk is suppressed, exactly like a catch-up echo.
   The bot's own messages are included for continuation and rendered as `you`, never
   as a roster member.
+- **Beats are observed facts.** A travel-log beat records traffic the adapter saw —
+  counts, participants, snippets from the room-talk buffer. Nothing in it is model
+  output, and no inference ever summarises a visit.
+- **The travel projection is request-only.** Like room context it is appended to the
+  outgoing request and never written onto `message.content`; the beats underneath are
+  persisted state, the projection itself never is.
+- **Closure is traffic-based.** Beats close on observed idle clocks alone — sessions
+  are never consulted, and gateway downtime simply counts as quiet.
+- **No disk I/O on the message path.** Lanes live in memory; the sweep tick is the
+  only writer, and it writes atomically (temp file plus rename).
 - **Silence is scoped.** Unaddressed `[SILENT]` is swallowed. A directly addressed turn
   that emits silence becomes `direct_silence_fallback`.
 - **Charge at send.** Bot-bounce and the shared catch-up budget count replies that went
@@ -338,8 +359,8 @@ bug, not a style choice.
 - **Standby delays, never mutes.** A busy-probe failure answers "not busy".
 - **Image gate fails closed.** Unknown speaker → refuse, before the provider is called.
 - **GIF state is per profile.** Pending URL and rate limits do not cross seats.
-- **Last-seen and catch-up budgets are keyed on the bot's Discord user id**, because under
-  multiplex `HERMES_HOME` is root's for every profile.
+- **Last-seen, catch-up budgets and travel-log state are keyed on the bot's Discord
+  user id**, because under multiplex `HERMES_HOME` is root's for every profile.
 
 ## Catch-up
 
@@ -371,6 +392,54 @@ venv/bin/python /path/to/hermes-discord-ambient/test_catchup.py
 ```
 
 Needs the framework venv. Quiet-hours cases pin the clock to 03:00.
+
+## Travel log
+
+Everything else here is per-turn or per-scan: room context describes **this** channel
+now, catch-up rescues one stalled conversation. Neither carries where the bot has been
+across servers and sessions, so continuity ("you were quiet in #general yesterday") had
+nothing to draw on — and a restart amputated even that.
+
+The travel log keeps **beats**: closed visits. A beat spans one channel from the first
+message observed after it went quiet to when it went quiet again — place (guild,
+channel, thread), open and close times and why it closed, messages observed, messages
+of hers, who was present (bounded, herself excluded), and up to four short snippets
+captured from the room-talk buffer at close. While the visit is live it is an open
+**lane** in memory, advanced by every inbound message and by every send.
+
+Closure is traffic-based and consults nothing else. Each sweep measures two idle
+clocks — time since the room was last observed to move, and time since she last spoke
+(measured from the lane's opening when she has not spoken in it at all). The beat
+closes when **both** clocks pass `idle_minutes`, or when the spoken clock alone passes
+`lurk_max_minutes`: her participation or the room's life keeps a visit open, and
+lurking cannot hold one open forever. Gateway downtime counts as quiet — a persisted
+lane already past idle when the sweep first runs closes with reason `restart`. Beats
+older than `horizon_hours` (32 by default) are pruned on save and never projected.
+
+The projection is facts, not prose: one strippable single-line header
+(`[ambient travel log — …]`), then newest-first lines of place, time-ago, duration,
+her message count, bounded participant handles and — where she spoke — up to two
+snippets; consecutive beats in one lane closer together than `idle_minutes` render
+merged, and an open current lane adds a final "you have been in this room since …"
+line. Lurk-only beats render softer ("hung around #general, mostly listening") and are
+dropped when `include_lurk_only` is false. `max_events` and `max_chars` bound the
+block; a reply quoting two snippet lines verbatim is suppressed by the room-echo
+guard, exactly like a room-context echo.
+
+No summariser runs anywhere in this feature. The record is what the adapter observed,
+and the model narrates it in her own voice — a summariser's voice would flatten hers,
+and the summarising itself would cost inference.
+
+State lives in `$HERMES_HOME/state/ambient-travel-log-<bot-user-id>.json` (closed
+beats plus open lanes). With `persist_room_talk: true` the room-talk buffer also
+snapshots to `ambient-room-talk-<bot-user-id>.json` on each sweep and reloads before
+the first dispatch, entries keeping their true timestamps. All writes happen on the
+sweep tick, atomically; the per-message path touches memory only.
+
+```bash
+cd /var/lib/hermes/.hermes/hermes-agent
+venv/bin/python /path/to/hermes-discord-ambient/test_travel_log.py
+```
 
 ## Known limitations
 
@@ -422,6 +491,7 @@ venv/bin/python /path/to/hermes-discord-ambient/test_lifecycle_embed_media.py
 venv/bin/python /path/to/hermes-discord-ambient/test_voice_only.py
 venv/bin/python /path/to/hermes-discord-ambient/test_config_and_persistence.py
 venv/bin/python /path/to/hermes-discord-ambient/test_room_context.py
+venv/bin/python /path/to/hermes-discord-ambient/test_travel_log.py
 ```
 
 ## Support development

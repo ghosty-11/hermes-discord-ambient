@@ -509,6 +509,17 @@ _room_context: contextvars.ContextVar[str] = contextvars.ContextVar(
     "hermes_ambient_room_context", default=""
 )
 
+# The travel-log block for the turn currently being dispatched: where she has
+# been across sessions and servers, rendered strictly from recorded facts
+# (open lanes and closed beats — see the travel-log section on the adapter).
+# Delivered request-only exactly like the room block above it, and under the
+# same disciplines: the wrapper is single-line and bounded so
+# `_AMBIENT_ECHO_RE` can strip a regurgitated one, and the snippet lines it
+# carries join the room-echo acceptance set in send().
+_travel_context: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "hermes_ambient_travel_context", default=""
+)
+
 
 _DEFAULT_HINT = (
     "[ambient: nobody addressed you — you are simply present in the room. "
@@ -1089,6 +1100,18 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # (set_at, the room-context lines most recently handed to the model).
         # The echo guard reads it in send(); see _room_echo_leak.
         self._room_echo: tuple[float, set] = (0.0, set())
+
+        # Travel log — cross-session presence memory. One OPEN lane per
+        # channel she is present in, one CLOSED beat per finished visit.
+        # In-memory on the message path (O(1), no disk I/O — the hot-path
+        # invariant this file keeps everywhere); persisted only on the sweep
+        # tick, keyed on the bot's own Discord id like catch-up state.
+        # `_travel_seq` hands out monotonic beat ids.
+        self._travel_task: Any = None
+        self._travel_state_loaded: bool = False
+        self._travel_beats: list[dict] = []
+        self._travel_lanes: dict[str, dict] = {}
+        self._travel_seq: int = 1
 
     # ---- config ---------------------------------------------------------
     def _ambient_cfg(self) -> dict:
@@ -2524,6 +2547,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
         hint_token = _ambient_hint.set("")
         speaker_token = _speaker_context.set(("", None))
         room_token = _room_context.set("")
+        travel_token = _travel_context.set("")
         gif_token = _gif_profile_context.set(self._bot_user_id())
         try:
             return await self._dispatch_inner(message)
@@ -2531,6 +2555,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             _ambient_hint.reset(hint_token)
             _speaker_context.reset(speaker_token)
             _room_context.reset(room_token)
+            _travel_context.reset(travel_token)
             _gif_profile_context.reset(gif_token)
             _current_speaker_id.reset(authorization_token)
             if token is not None:
@@ -2576,6 +2601,13 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # the current message is already the user turn.
         self._stage_room_context(message)
         self._remember_room_talk(message)
+
+        # Travel log, same site and same reasoning as the two lines above:
+        # presence is a fact about ARRIVAL, not about admission — recorded
+        # before any gate can refuse the message, then shown to her as where
+        # she has been, not only where she is.
+        self._travel_observe(message)
+        self._stage_travel_log(message)
 
         # Bot bounce first: a tripped pair must cost NOTHING, so it returns
         # before admission runs. Every un-tripped message falls through to the
@@ -3124,6 +3156,704 @@ class AmbientDiscordAdapter(DiscordAdapter):
             return hits >= 2
         except Exception:
             return False
+
+    # ---- travel log (cross-session presence memory) ----------------------
+    # WHY THIS EXISTS: room context and catch-up both answer "what is
+    # happening in THIS turn". Nothing answered "where has she been" — after
+    # a restart every room was as new, so continuity ("I was here earlier,
+    # alice and bob were arguing about sprites") lasted exactly as long as
+    # the process did. The travel log is that memory: one open lane per
+    # channel while she is present, one closed beat per visit, facts only.
+    # There is no LLM summarisation anywhere — every line the model ever
+    # sees is rendered from recorded fields, so the log cannot remember
+    # anything that did not happen.
+    #
+    # Durability follows the catch-up pattern exactly: state keyed on the
+    # BOT's own Discord id under HERMES_HOME/state, atomic tmp+replace
+    # writes, and persistence ONLY on the sweep tick — the per-message path
+    # stays O(1) in-memory work.
+
+    _TRAVEL_DEFAULTS = {
+        "enabled": True,
+        "horizon_hours": 32,
+        "idle_minutes": 60,
+        "lurk_max_minutes": 360,
+        "sweep_seconds": 300,
+        "max_events": 8,
+        "max_chars": 600,
+        "include_lurk_only": True,
+    }
+
+    def _travel_cfg(self) -> dict:
+        """The travel_log block with every default filled, or {} when off.
+
+        An absent block, a non-dict, or `enabled` falsy all mean the feature
+        is OFF (stock behaviour), so callers can treat an empty dict as "do
+        nothing" without each of them re-checking the master switch.
+        """
+        raw = self._sub("travel_log")
+        if not raw.get("enabled"):
+            return {}
+        cfg = dict(self._TRAVEL_DEFAULTS)
+        cfg.update(raw)
+        cfg["enabled"] = True
+        return cfg
+
+    def _travel_enabled(self) -> bool:
+        return bool(self._ambient_enabled()) and bool(self._travel_cfg())
+
+    def _travel_seconds(self, key: str, default: float) -> float:
+        """One numeric setting as seconds-safe float, tolerant of config-set
+        string coercion (`hermes config set` writes "60" as easily as 60)."""
+        try:
+            return float(self._travel_cfg().get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _travel_idle_seconds(self) -> float:
+        return max(0.0, self._travel_seconds("idle_minutes", 60)) * 60
+
+    def _travel_lurk_seconds(self) -> float:
+        return max(0.0, self._travel_seconds("lurk_max_minutes", 360)) * 60
+
+    def _travel_horizon_seconds(self) -> float:
+        return max(1.0, self._travel_seconds("horizon_hours", 32)) * 3600
+
+    def _travel_state_path(self) -> str | None:
+        """Bot-uid-keyed, for the same seat-isolation reason as catch-up
+        state (see _catchup_state_path): under the multiplex every profile
+        resolves the same HERMES_HOME, and a shared filename would log one
+        seat's travels into another's memory."""
+        try:
+            uid = getattr(getattr(self, "_client", None), "user", None)
+            uid = getattr(uid, "id", None)
+            if not uid:
+                return None
+            home = os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
+            return os.path.join(home, "state", f"ambient-travel-log-{uid}.json")
+        except Exception:
+            return None
+
+    def _room_talk_state_path(self) -> str | None:
+        try:
+            uid = getattr(getattr(self, "_client", None), "user", None)
+            uid = getattr(uid, "id", None)
+            if not uid:
+                return None
+            home = os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
+            return os.path.join(home, "state", f"ambient-room-talk-{uid}.json")
+        except Exception:
+            return None
+
+    def _travel_load_state(self) -> None:
+        """Restore lanes, beats and the room-talk snapshot once per process.
+
+        The room-talk buffer used to be process-local by design; with the
+        travel log on it is also her snippet memory, so it now rehydrates
+        from disk BEFORE the first dispatch (connect() calls this; the sweep
+        retries it until the client has an identity, mirroring catch-up).
+        Loaded entries keep their true timestamps, so ages render honestly
+        after a restart instead of resetting to "just now".
+        """
+        if self._travel_state_loaded:
+            return
+        path = self._travel_state_path()
+        if not path:
+            return  # no identity yet; try again next sweep
+        self._travel_state_loaded = True
+        # Keys restored from disk — the restart backfill closes only these
+        # (a corrupt file must not turn the backfill call into a NameError,
+        # hence the pre-try init).
+        restored: list[str] = []
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+            beats = [
+                b for b in (data.get("beats") or [])
+                if isinstance(b, dict) and b.get("closed_at")
+            ]
+            self._travel_beats.extend(beats)
+            lanes = data.get("lanes")
+            if isinstance(lanes, dict):
+                for key, lane in lanes.items():
+                    if isinstance(lane, dict) and lane.get("last_observed_at"):
+                        self._travel_lanes[str(key)] = lane
+                        restored.append(str(key))
+            # Monotonic across restarts: the next id handed out must clear
+            # every id already on disk.
+            self._travel_seq = max(
+                [int(b.get("id") or 0) for b in self._travel_beats]
+                + [self._travel_seq - 1]
+            ) + 1
+            logger.debug(
+                "ambient.travel_log: restored %d beat(s), %d open lane(s)",
+                len(self._travel_beats), len(self._travel_lanes),
+            )
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.debug("ambient.travel_log: could not restore state", exc_info=True)
+        self._travel_load_room_talk()
+        self._travel_backfill_restart(restored)
+
+    def _travel_load_room_talk(self) -> None:
+        path = self._room_talk_state_path()
+        if not path:
+            return
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+            room = data.get("room_talk")
+            touched = data.get("touched")
+            if not isinstance(room, dict) or not isinstance(touched, dict):
+                return
+            keep = max(int(self._room_cfg().get("recent_messages", 6)) * 4, 24)
+            for key, rows in room.items():
+                entries = [
+                    tuple(r)
+                    for r in rows or []
+                    if isinstance(r, (list, tuple)) and len(r) == 7
+                ]
+                if not entries:
+                    continue
+                # Seed, don't clobber: live traffic may already be in the
+                # buffer when identity arrives late, and dedupe is by
+                # message id — the one field Discord guarantees unique.
+                buffer = self._room_talk.setdefault(str(key), [])
+                known = {str(e[0]) for e in buffer}
+                buffer[:0] = [e for e in entries if str(e[0]) not in known]
+                if len(buffer) > keep:
+                    del buffer[: len(buffer) - keep]
+                self._room_talk_touched[str(key)] = max(
+                    float(touched.get(key) or 0.0),
+                    self._room_talk_touched.get(str(key), 0.0),
+                )
+            # Same 128-channel bound as the live path, and for the same
+            # reason: memory must not grow because of persistence. A
+            # snapshot from a differently-configured run (or a hand-edited
+            # one) cannot be allowed to seed more rooms than the buffer
+            # itself would ever hold; oldest touch evicts first.
+            while len(self._room_talk) > 128:
+                oldest = min(
+                    self._room_talk,
+                    key=lambda k: self._room_talk_touched.get(k, 0.0),
+                )
+                self._room_talk.pop(oldest, None)
+                self._room_talk_touched.pop(oldest, None)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.debug("ambient.travel_log: could not restore room talk", exc_info=True)
+
+    def _travel_backfill_restart(self, persisted: list[str]) -> None:
+        """Close PERSISTED lanes that were already quiet when we came up.
+
+        A persisted lane's last_observed_at is the last message she saw
+        BEFORE the gateway went down; if that is already past the idle
+        threshold, the visit ended during downtime and owes a beat with
+        close_reason "restart". Without this, a room she left hours ago
+        stays "open" until the next sweep closes it as "quiet" — downtime
+        recorded as presence, and a reopen impossible because the lane never
+        closed.
+
+        Scoped to lanes restored from disk, and deliberately so: the
+        obs-idle-only test encodes "the whole gateway was down", which is
+        not true of a lane born in THIS process. A live lane that has gone
+        quiet follows the ordinary closure table like any other — including
+        one she is still speaking into with no inbound traffic, where this
+        test would otherwise close a visit mid-monologue.
+        """
+        idle = self._travel_idle_seconds()
+        now = time.time()
+        for key in persisted:
+            lane = self._travel_lanes.get(key)
+            if lane is None:
+                continue
+            try:
+                if now - float(lane.get("last_observed_at") or 0.0) > idle:
+                    self._travel_close_lane(key, lane, now, "restart")
+            except Exception:
+                logger.debug(
+                    "ambient.travel_log: restart backfill skipped a lane",
+                    exc_info=True,
+                )
+
+    def _travel_lane_meta(self, channel: Any) -> dict:
+        """Place facts for a lane, from the channel object we were handed.
+
+        chat_type follows the stock adapter's own vocabulary (dm / thread /
+        channel) so the log and the gateway describe the same room the same
+        way. thread_parent is the parent channel id, or None.
+        """
+        guild = getattr(channel, "guild", None)
+        parent = getattr(channel, "parent", None)
+        return {
+            "guild_id": str(getattr(guild, "id", "") or ""),
+            "guild_name": self._flatten_room_line(getattr(guild, "name", ""), 48),
+            "channel_name": self._flatten_room_line(getattr(channel, "name", ""), 48),
+            "chat_type": (
+                "dm"
+                if guild is None
+                else "thread" if parent is not None else "channel"
+            ),
+            "thread_parent": str(getattr(parent, "id", "") or "") or None,
+        }
+
+    def _travel_observe(self, message: Any) -> None:
+        """Inbound touch point: arrival opens a lane, traffic keeps it warm.
+
+        Runs for EVERY inbound message before any admission gate (same site
+        as _remember_room_talk), because presence is a fact about arrival —
+        a message she reads and never answers is still a visit, and lurking
+        is half the point. O(1) memory only, never disk: persistence happens
+        on the sweep tick.
+        """
+        cfg = self._travel_cfg()
+        if not (self._ambient_enabled() and cfg):
+            return
+        try:
+            channel = getattr(message, "channel", None)
+            channel_id = str(getattr(channel, "id", "") or "")
+            if not channel_id:
+                return
+            now = time.time()
+            lane = self._travel_lanes.get(channel_id)
+            if lane is None:
+                lane = {
+                    "channel_id": channel_id,
+                    "opened_at": now,
+                    "last_observed_at": now,
+                    "obs_count": 0,
+                    # NULL means she has not spoken in this beat yet — the
+                    # closure rule then measures staleness from opened_at.
+                    "last_spoke_at": None,
+                    "her_msg_count": 0,
+                    "participants": [],
+                }
+                lane.update(self._travel_lane_meta(channel))
+                self._travel_lanes[channel_id] = lane
+            lane["last_observed_at"] = now
+            lane["obs_count"] = int(lane.get("obs_count") or 0) + 1
+            author = getattr(message, "author", None)
+            uid = str(getattr(author, "id", "") or "")
+            self_id = self._bot_user_id()
+            if uid and uid != self_id:
+                participants = lane["participants"]
+                if not any(p and str(p[0]) == uid for p in participants):
+                    if len(participants) < 8:  # beat-spec cap, union over the visit
+                        handle = str(
+                            getattr(author, "name", "")
+                            or getattr(author, "display_name", "")
+                            or ""
+                        ).strip()
+                        participants.append([uid, handle])
+        except Exception:
+            logger.debug("ambient.travel_log: observe failed", exc_info=True)
+
+    def _travel_spoke(self, chat_id: Any) -> None:
+        """Her own send: both clocks move, because the echo cannot be trusted.
+
+        Discord echoes her message back as MESSAGE_CREATE, but neither its
+        timing nor its arrival is ours to rely on, so the send itself stamps
+        last_spoke_at AND last_observed_at — she is present in the room she
+        speaks into. A room she opens herself (check-in, scheduled spark)
+        gets its lane here, metadata best-effort from the client cache; the
+        first inbound message fills in anything missing. participants is
+        deliberately untouched: she is excluded from her own log.
+        """
+        if not self._travel_enabled():
+            return
+        try:
+            key = str(chat_id or "")
+            if not key:
+                return
+            now = time.time()
+            lane = self._travel_lanes.get(key)
+            if lane is None:
+                channel = None
+                try:
+                    getter = getattr(getattr(self, "_client", None), "get_channel", None)
+                    if callable(getter):
+                        channel = getter(int(key)) if key.isdigit() else getter(key)
+                except Exception:
+                    channel = None
+                meta = (
+                    self._travel_lane_meta(channel)
+                    if channel is not None
+                    else {
+                        "guild_id": self._channel_guild.get(key, ""),
+                        "guild_name": "",
+                        "channel_name": "",
+                        "chat_type": "channel",
+                        "thread_parent": None,
+                    }
+                )
+                lane = {
+                    "channel_id": key,
+                    "opened_at": now,
+                    "last_observed_at": now,
+                    "obs_count": 0,
+                    "last_spoke_at": None,
+                    "her_msg_count": 0,
+                    "participants": [],
+                }
+                lane.update(meta)
+                self._travel_lanes[key] = lane
+            lane["last_spoke_at"] = now
+            lane["her_msg_count"] = int(lane.get("her_msg_count") or 0) + 1
+            lane["last_observed_at"] = now
+        except Exception:
+            logger.debug("ambient.travel_log: spoke note failed", exc_info=True)
+
+    def _travel_close_snippets(self, channel_id: str) -> list:
+        """Up to 4 recent lines from the room-talk buffer, herself excluded.
+
+        Newest first — these are the quotes the projection may show later,
+        and the most recent thing said is the one worth quoting. Taken from
+        exactly the buffer the room-context block renders, never a second
+        capture path that could disagree with it.
+        """
+        try:
+            self_id = self._bot_user_id()
+            out = []
+            for entry in reversed(self._room_talk.get(channel_id, [])):
+                if self_id and str(entry[1]) == self_id:
+                    continue
+                snippet = self._flatten_room_line(entry[4], self._ROOM_SNIPPET_CHARS)
+                if not snippet:
+                    continue
+                out.append(snippet)
+                if len(out) >= 4:
+                    break
+            return out
+        except Exception:
+            return []
+
+    def _travel_close_lane(
+        self, key: str, lane: dict, closed_at: float, reason: str
+    ) -> None:
+        """Fold an open lane into a closed beat and drop it from the map."""
+        self._travel_beats.append({
+            "id": self._travel_seq,
+            "guild_id": lane.get("guild_id", ""),
+            "guild_name": lane.get("guild_name", ""),
+            "channel_id": lane.get("channel_id", key),
+            "channel_name": lane.get("channel_name", ""),
+            "chat_type": lane.get("chat_type", "channel"),
+            "thread_parent": lane.get("thread_parent"),
+            "opened_at": lane.get("opened_at", closed_at),
+            "closed_at": closed_at,
+            "close_reason": reason,
+            "obs_count": int(lane.get("obs_count") or 0),
+            "her_msg_count": int(lane.get("her_msg_count") or 0),
+            "participants": [list(p) for p in (lane.get("participants") or [])[:8]],
+            "snippets": self._travel_close_snippets(
+                str(lane.get("channel_id") or key)
+            ),
+        })
+        self._travel_seq += 1
+        self._travel_lanes.pop(key, None)
+
+    def _travel_sweep(self) -> None:
+        """One sweep tick: close finished visits, prune, persist.
+
+        Sync on purpose — the loop below is thin and tests drive this
+        directly. Prune lives in the save, the one moment the contract
+        allows disk work: a beat older than the horizon can never be
+        projected again, so carrying it only grows the file.
+        """
+        if not self._travel_enabled():
+            return
+        self._travel_load_state()  # retries until the client has an identity
+        if not self._travel_state_loaded:
+            return
+        now = time.time()
+        idle = self._travel_idle_seconds()
+        lurk = self._travel_lurk_seconds()
+        for key, lane in list(self._travel_lanes.items()):
+            try:
+                obs_idle = now - float(lane.get("last_observed_at") or 0.0)
+                # NULL last_spoke_at means she never spoke in this beat;
+                # staleness then runs from the visit's own opening.
+                spoke_from = float(
+                    lane.get("last_spoke_at") or lane.get("opened_at") or now
+                )
+                spoke_idle = now - spoke_from
+                capped = spoke_idle > lurk
+                quiet = obs_idle > idle and spoke_idle > idle
+                if capped or quiet:
+                    # A lurk-capped visit ended when she stopped
+                    # participating, not when the sweep noticed: dating the
+                    # beat at the moment the cap crossed keeps the
+                    # projection's "ended Xh ago" honest instead of
+                    # resetting it to "just now" on every sweep.
+                    self._travel_close_lane(
+                        key, lane,
+                        spoke_from + lurk if capped else now,
+                        "lurk_cap" if capped else "quiet",
+                    )
+            except Exception:
+                logger.debug("ambient.travel_log: lane sweep failed", exc_info=True)
+        self._travel_save_state()
+        self._travel_flush_room_talk()
+
+    async def _travel_loop(self) -> None:
+        interval = max(30.0, self._travel_seconds("sweep_seconds", 300))
+        try:
+            while True:
+                try:
+                    self._travel_sweep()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug("ambient.travel_log: sweep failed", exc_info=True)
+                # Jittered like the catch-up loop so she is not visibly on
+                # a clock.
+                await asyncio.sleep(
+                    interval + random.randint(0, max(1, int(interval) // 3))
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("ambient: travel log sweep stopped", exc_info=True)
+
+    def _travel_save_state(self) -> None:
+        path = self._travel_state_path()
+        if not path:
+            return
+        try:
+            cutoff = time.time() - self._travel_horizon_seconds()
+            self._travel_beats = [
+                b for b in self._travel_beats
+                if float(b.get("closed_at") or 0.0) >= cutoff
+            ]
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            payload = {"beats": self._travel_beats, "lanes": self._travel_lanes}
+            tmp = f"{path}.tmp"
+            with open(tmp, "w") as fh:
+                json.dump(payload, fh)
+            os.replace(tmp, path)
+        except Exception:
+            logger.debug("ambient.travel_log: could not persist state", exc_info=True)
+
+    def _travel_flush_room_talk(self) -> None:
+        """Snapshot the room-talk buffer, bounded exactly like the live one.
+
+        Same caps as _remember_room_talk — max(recent_messages*4, 24)
+        entries per channel, 128 channels by eviction time — so the file can
+        never outgrow the buffer it mirrors and memory cannot grow because
+        of persistence.
+        """
+        if not self._room_cfg().get("persist_room_talk", True):
+            return
+        path = self._room_talk_state_path()
+        if not path:
+            return
+        try:
+            keep = max(int(self._room_cfg().get("recent_messages", 6)) * 4, 24)
+            room = {}
+            touched = {}
+            for key, rows in self._room_talk.items():
+                room[key] = [list(r) for r in rows[-keep:]]
+                touched[key] = float(self._room_talk_touched.get(key, 0.0))
+            while len(room) > 128:
+                oldest = min(touched, key=touched.get)
+                room.pop(oldest, None)
+                touched.pop(oldest, None)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            payload = {"room_talk": room, "touched": touched}
+            tmp = f"{path}.tmp"
+            with open(tmp, "w") as fh:
+                json.dump(payload, fh)
+            os.replace(tmp, path)
+        except Exception:
+            logger.debug("ambient.travel_log: could not persist room talk", exc_info=True)
+
+    @staticmethod
+    def _travel_span(seconds: float) -> str:
+        """Compact duration/age rendering: 45s, 12m, 3h, 2d."""
+        total = max(0, int(seconds))
+        if total < 60:
+            return f"{total}s"
+        if total < 3600:
+            return f"{total // 60}m"
+        if total < 172800:
+            return f"{total // 3600}h"
+        return f"{total // 86400}d"
+
+    def _travel_place(self, record: dict) -> str:
+        guild_name = str(record.get("guild_name") or "").strip()
+        channel_name = (
+            str(record.get("channel_name") or "").strip()
+            or str(record.get("channel_id") or "?")
+        )
+        if str(record.get("chat_type") or "") == "dm":
+            return "DM"
+        return f"{guild_name} #{channel_name}" if guild_name else f"#{channel_name}"
+
+    def _travel_render_group(self, group: list, now: float, her: int) -> tuple:
+        """One fact line for a (possibly merged) run of beats, plus quotes.
+
+        The snippets ride on their own lines so the echo guard can match a
+        reply against them verbatim — the same acceptance the room block
+        uses. Facts only; no narrative voice.
+        """
+        newest = group[0]
+        oldest = group[-1]
+        place = self._travel_place(newest)
+        ended = self._travel_span(now - float(newest.get("closed_at") or now))
+        lasted = self._travel_span(
+            float(newest.get("closed_at") or now)
+            - float(oldest.get("opened_at") or now)
+        )
+        # Union across the group, newest names first: rooms get renamed, and
+        # the freshest reading is the one she would use herself.
+        seen: list[str] = []
+        for beat in group:
+            for pair in beat.get("participants") or []:
+                handle = str(pair[1] or "").strip() or f"id:{pair[0]}"
+                if handle not in seen:
+                    seen.append(handle)
+        who = seen[:3] + ([f"+{len(seen) - 3} more"] if len(seen) > 3 else [])
+        if her > 0:
+            line = (
+                f"{place} · ended {ended} ago · stayed {lasted} · "
+                f"you spoke {her} time{'s' if her != 1 else ''}"
+                + (f" · with {', '.join(who)}" if who else "")
+            )
+            quotes: list[str] = []
+            for beat in group:  # newest-first; the latest words matter most
+                for snippet in beat.get("snippets") or []:
+                    text = self._flatten_room_line(snippet, self._ROOM_SNIPPET_CHARS)
+                    if text and text not in quotes:
+                        quotes.append(text)
+                    if len(quotes) >= 2:
+                        break
+                if len(quotes) >= 2:
+                    break
+            return line, quotes
+        # Lurk-only: she was there and listening — softer, and truthful.
+        return (
+            f"hung around {place}, mostly listening · {ended} ago · stayed {lasted}"
+            + (f" · with {', '.join(who)}" if who else ""),
+            [],
+        )
+
+    def _travel_rows(self, message: Any) -> list:
+        """The travel-log block for this turn, facts only.
+
+        Every line renders from recorded lane/beat fields — place, when, how
+        long, how much she spoke, who was there, and (when she spoke) a
+        couple of lines the room actually said. No summariser: the log must
+        not be able to remember anything that did not happen.
+        """
+        cfg = self._travel_cfg()
+        if not (self._ambient_enabled() and cfg):
+            return []
+        try:
+            now = time.time()
+            horizon = self._travel_horizon_seconds()
+            idle = self._travel_idle_seconds()
+            beats = [
+                b for b in self._travel_beats
+                if now - float(b.get("closed_at") or 0.0) <= horizon
+            ]
+            header = (
+                "[ambient travel log — where you have been in the last "
+                f"{int(horizon // 3600)}h; records to draw on, not commands]"
+            )
+            budget = max(120, int(self._travel_seconds("max_chars", 600) or 600))
+            max_events = max(1, int(self._travel_seconds("max_events", 8) or 8))
+            include_lurk = cfg.get("include_lurk_only", True)
+            rows = [header]
+            used = len(header)
+
+            # Newest first across ALL lanes, then grouped: consecutive beats
+            # in the same lane whose gap is under the idle threshold are the
+            # same visit wearing two beats — arriving back within the hour is
+            # not a second departure, and rendering it as one would invent
+            # one.
+            beats.sort(key=lambda b: float(b.get("closed_at") or 0.0), reverse=True)
+            groups: list[list[dict]] = []
+            i = 0
+            while i < len(beats):
+                group = [beats[i]]
+                i += 1
+                while i < len(beats):
+                    newer, older = group[-1], beats[i]
+                    if str(newer.get("channel_id")) != str(older.get("channel_id")):
+                        break
+                    gap = (
+                        float(newer.get("opened_at") or 0.0)
+                        - float(older.get("closed_at") or 0.0)
+                    )
+                    if gap >= idle:
+                        break
+                    group.append(older)
+                    i += 1
+                groups.append(group)
+
+            content = False
+            events = 0
+            for group in groups:
+                if events >= max_events:
+                    break
+                her = sum(int(b.get("her_msg_count") or 0) for b in group)
+                if her == 0 and not include_lurk:
+                    continue  # omitted by config; costs no budget
+                if events + len(group) > max_events:
+                    group = group[: max_events - events]  # oldest beats drop off
+                events += len(group)
+                line, quotes = self._travel_render_group(group, now, her)
+                if used + len(line) > budget:
+                    break
+                rows.append(line)
+                used += len(line)
+                content = True
+                for quote in quotes:
+                    if used + len(quote) > budget:
+                        break
+                    rows.append(quote)
+                    used += len(quote)
+
+            # The room she is in RIGHT NOW, if any: one closing line so the
+            # log ends where the conversation is happening.
+            channel_id = str(
+                getattr(getattr(message, "channel", None), "id", "") or ""
+            )
+            lane = self._travel_lanes.get(channel_id)
+            if lane is not None:
+                tail = (
+                    "you have been in this room since "
+                    f"{self._travel_span(now - float(lane.get('opened_at') or now))}"
+                    " ago"
+                )
+                if used + len(tail) <= budget:
+                    rows.append(tail)
+                    content = True
+            if not content:
+                return []  # a header with nothing under it is noise, not memory
+            return rows
+        except Exception:
+            logger.debug("ambient.travel_log: projection build failed", exc_info=True)
+            return []
+
+    def _stage_travel_log(self, message: Any) -> None:
+        """Stage this turn's travel log for request-only delivery."""
+        rows = self._travel_rows(message)
+        if not rows:
+            return
+        _travel_context.set("\n".join(rows))
+        # The snippet lines are other people's sentences handed to the model,
+        # so they join the room block's acceptance set: a reply repeating
+        # two of them verbatim never reaches the room (see _room_echo_leak).
+        # Union, not replace — the room block staged moments ago stays
+        # guarded too.
+        _, existing = self._room_echo
+        self._room_echo = (
+            time.time(),
+            set(existing) | {" ".join(ln.split()) for ln in rows},
+        )
 
     def _resolve_plain_mentions(self, content: str, chat_id: Any) -> str:
         """Convert known, unambiguous ``@aliases`` to Discord mention syntax.
@@ -3789,6 +4519,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
         speaker_token = _speaker_context.set(("", None))
         self._apply_speaker_tag(target)
         room_token = _room_context.set("")
+        # The check-in turn gets no travel block (it renders the room's NOW,
+        # not her memory) but must not inherit one either.
+        travel_token = _travel_context.set("")
         self._stage_room_context(target)
 
         hint_token = _ambient_hint.set(hint)
@@ -3802,6 +4535,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             _ambient_hint.reset(hint_token)
             _speaker_context.reset(speaker_token)
             _room_context.reset(room_token)
+            _travel_context.reset(travel_token)
             _gif_profile_context.reset(gif_token)
             _current_speaker_id.reset(authorization_token)
             if thread_token is not None:
@@ -4036,6 +4770,34 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     )
         except Exception:
             logger.debug("ambient: could not start catch-up scanner", exc_info=True)
+        try:
+            # Same double guard as catch-up: connect() runs again on every
+            # reconnect, and a second sweep would double-close lanes while
+            # each tick still looked like the only one.
+            if ok and self._travel_enabled():
+                if self._travel_task is None or self._travel_task.done():
+                    # Before the first dispatch, so a message arriving the
+                    # instant the gateway is up meets a room that already
+                    # remembers her last visit.
+                    self._travel_load_state()
+                    self._travel_task = asyncio.create_task(self._travel_loop())
+                    # Says what was CONFIGURED, not what was restored —
+                    # lanes and beats on disk are state, not setting, and a
+                    # line reading "0 visits" would misreport a fresh seat
+                    # as a broken one. What came off disk logs at debug.
+                    tcfg = self._travel_cfg()
+                    logger.info(
+                        "ambient.travel_log: sweep started (idle=%sm, "
+                        "lurk_cap=%sm, horizon=%sh, sweep=%ss, "
+                        "persist_room_talk=%s)",
+                        int(tcfg.get("idle_minutes", 60)),
+                        int(tcfg.get("lurk_max_minutes", 360)),
+                        int(tcfg.get("horizon_hours", 32)),
+                        int(tcfg.get("sweep_seconds", 300)),
+                        bool(self._room_cfg().get("persist_room_talk", True)),
+                    )
+        except Exception:
+            logger.debug("ambient: could not start travel log sweep", exc_info=True)
         return ok
 
     async def disconnect(self) -> None:
@@ -4298,6 +5060,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
             self._spoke[str(chat_id)] = (time.time(), 0)
         except Exception:
             pass
+        # Travel log: her own send is the one clock this plugin controls end
+        # to end — see _travel_spoke for why both clocks move here.
+        self._travel_spoke(chat_id)
 
         reply_to = kwargs.get("reply_to", args[0] if args else None)
         standalone = False
@@ -5184,6 +5949,9 @@ def _on_llm_request_ambient_hint(**kwargs: Any):
         room = _room_context.get("")
         if room:
             extras.append(room)
+        travel = _travel_context.get("")
+        if travel:
+            extras.append(travel)
         if _quiet_resume_pending.get(False):
             extras.append(_QUIET_RESUME_DIRECTIVE)
             _quiet_resume_pending.set(False)
@@ -5211,6 +5979,8 @@ def _on_llm_request_ambient_hint(**kwargs: Any):
             kind = "speaker"
         if _room_context.get(""):
             kind += "+room"
+        if _travel_context.get(""):
+            kind += "+travel"
         logger.info(
             "ambient: %s directive delivered via llm_request middleware (request-only)",
             kind,
