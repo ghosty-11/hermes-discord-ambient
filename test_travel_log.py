@@ -970,5 +970,69 @@ with case("v1.32.1: secrets pasted in chat are redacted from persistence"):
         check("room-talk snapshot holds no plaintext secret", secret not in rt_disk)
 
 
+# ---- v1.33.0: travel_log.channels scoping ---------------------------------
+# The Digital Structures contract (2026-08-25): a seat whose Discord presence
+# spans work and roleplay rooms accumulates NO travel state outside the listed
+# channels — no lane from inbound traffic, no lane from her own sends (cron
+# deliveries included) — and projects NO travel block onto a turn dispatched
+# in an unlisted channel. Key ABSENT keeps today's behaviour exactly: every
+# channel in scope, so existing configs are byte-for-byte unaffected.
+
+TRAVEL_SCOPED = {"enabled": True, "channels": ["502"]}  # the shrine only
+
+with case("v1.33.0: observe opens no lane in an unlisted channel"):
+    with state_home():
+        a = build_adapter(travel=dict(TRAVEL_SCOPED))
+        arrive(a, Message(3000, ALICE, GENERAL, "work talk"))
+        check("no lane for unlisted channel", not a._travel_lanes, dict(a._travel_lanes))
+        arrive(a, Message(3001, ALICE, SHRINE, "shrine talk"))
+        check("lane opens for the listed channel", "502" in a._travel_lanes)
+
+with case("v1.33.0: scoping tolerates config-set coercion shapes"):
+    with state_home():
+        # hermes config set delivers ints and comma strings, never tidy lists
+        for shape, listed_chan in (({"enabled": True, "channels": 502}, SHRINE),
+                                   ({"enabled": True, "channels": "501,502"}, GENERAL)):
+            a = build_adapter(travel=dict(shape))
+            arrive(a, Message(3050, ALICE, RANDOM, "elsewhere"))
+            check(f"shape {shape['channels']!r}: unlisted stays laneless",
+                  not a._travel_lanes, dict(a._travel_lanes))
+            arrive(a, Message(3051, ALICE, listed_chan, "in scope"))
+            check(f"shape {shape['channels']!r}: listed opens",
+                  str(listed_chan.id) in a._travel_lanes)
+
+with case("v1.33.0: her own send opens no lane in an unlisted channel"):
+    with state_home():
+        a = build_adapter(travel=dict(TRAVEL_SCOPED))
+        a._travel_spoke("501")  # e.g. a cron delivery into a work channel
+        check("no lane from unlisted send", not a._travel_lanes, dict(a._travel_lanes))
+        a._travel_spoke("502")
+        check("lane from listed send", "502" in a._travel_lanes)
+
+with case("v1.33.0: no travel block rides a turn in an unlisted channel"):
+    with state_home():
+        a = build_adapter(travel=dict(TRAVEL_SCOPED))
+        arrive(a, Message(3100, ALICE, SHRINE, "earlier"))
+        key = next(iter(a._travel_lanes))
+        a._travel_close_lane(key, a._travel_lanes[key], time.time() + 61 * MIN, "quiet")
+        arrive(a, Message(3101, ALICE, SHRINE, "again"))
+        ambient._travel_context.set("")
+        a._stage_travel_log(Message(3102, ALICE, GENERAL, "a work-channel turn"))
+        check("unlisted turn carries no travel block", ambient._travel_context.get() == "")
+        a._stage_travel_log(Message(3103, ALICE, SHRINE, "a shrine turn"))
+        check("listed turn still gets the block", bool(ambient._travel_context.get()))
+        ambient._travel_context.set("")
+
+with case("v1.33.0: absent channels key keeps every channel in scope"):
+    with state_home():
+        a = build_adapter()  # TRAVEL_ON: no channels key at all
+        arrive(a, Message(3200, ALICE, RANDOM, "anywhere"))
+        check("default still observes everywhere", "506" in a._travel_lanes)
+        ambient._travel_context.set("")
+        a._stage_travel_log(Message(3201, ALICE, RANDOM, "any turn"))
+        check("default still projects everywhere", bool(ambient._travel_context.get()))
+        ambient._travel_context.set("")
+
+
 print("all checks passed")
 

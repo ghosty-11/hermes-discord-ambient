@@ -45,7 +45,7 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 | **Speaker boost** | zero | Per-user overrides of probability / cooldown / daily cap. Cooldown is the load-bearing half. |
 | **Conversation window** | zero | Messages in the bot's wake get a high response chance, bounded by both count and elapsed time. |
 | **Catch-up** | zero per scan; 1 inference on a check-in | Timer scanner. Hands **one** real message to the normal ambient path with a transcript. Same budget as reactive joins. |
-| **Travel log** | zero inference | Durable 32h cross-space visit record; idle-based beats (her participation or the room's life keep a visit open; both quiet, or she stops joining for `lurk_max_minutes`, closes it); projected request-only so she narrates her own continuity. |
+| **Travel log** | zero inference | Durable 32h cross-space visit record; idle-based beats (her participation or the room's life keep a visit open; both quiet, or she stops joining for `lurk_max_minutes`, closes it); projected request-only so she narrates her own continuity. `travel_log.channels` scopes every touch point — inbound observation, her own sends (cron deliveries included), and which turns get the projection — to an allowlist of channel ids; absent means everywhere. |
 | **Gateway lifecycle** | at most 1 background inference | Independent rolls for private return, cached departure, optional public return. Reconnects stay quiet. |
 | **Rich-embed video** | local STT; video inference only when used | Discord-proxied `video/*` only (`images-ext-*.discordapp.net`). Stock size limits apply. |
 | **Compaction focus** | zero | Standing `focus_topic` for social summaries. Unset leaves stock behaviour. |
@@ -147,6 +147,8 @@ platforms:
         persist_room_talk: true  # talk buffer survives restarts; flushed on the travel-log sweep
         travel_log:
           enabled: true
+          channels: ["*"]        # allowlist scoping every travel touch point;
+                                 # absent/blank = everywhere, [] = nowhere
           horizon_hours: 32      # beats older than this pruned on save, never projected
           idle_minutes: 60       # room-quiet threshold
           lurk_max_minutes: 360  # participation-staleness cap

@@ -3187,6 +3187,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
 
     _TRAVEL_DEFAULTS = {
         "enabled": True,
+        # None = every channel (the pre-scoping behaviour, byte-for-byte);
+        # a list/CSV/int is an allowlist; an explicit empty list blocks all.
+        "channels": None,
         "horizon_hours": 32,
         "idle_minutes": 60,
         "lurk_max_minutes": 360,
@@ -3210,6 +3213,26 @@ class AmbientDiscordAdapter(DiscordAdapter):
         cfg.update(raw)
         cfg["enabled"] = True
         return cfg
+
+    def _travel_channel_allowed(self, channel_key: str) -> bool:
+        """Channel scoping for the travel log.
+
+        Absent or blank -> every channel, which is exactly the historical
+        behaviour, so configs written before this knob existed change
+        nothing. A present list is an ALLOWLIST of channel ids/names/"*"
+        through the same normaliser as every other id option (int- and
+        comma-string-tolerant); an explicitly EMPTY list allows nothing.
+        Built for a seat whose Discord presence spans work and roleplay
+        rooms: continuity accumulates and projects only inside the spaces
+        listed, never in a channel where actual work happens.
+        """
+        raw = self._travel_cfg().get("channels")
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return True
+        allow = _id_set(raw)
+        if not allow:
+            return False
+        return "*" in allow or str(channel_key) in allow
 
     def _travel_enabled(self) -> bool:
         return bool(self._ambient_enabled()) and bool(self._travel_cfg())
@@ -3456,6 +3479,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
             channel_id = str(getattr(channel, "id", "") or "")
             if not channel_id:
                 return
+            if not self._travel_channel_allowed(channel_id):
+                return
             now = time.time()
             lane = self._travel_lanes.get(channel_id)
             if lane is None:
@@ -3527,6 +3552,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
             key = str(chat_id or "")
             if not key:
                 return
+            if not self._travel_channel_allowed(key):
+                return
             now = time.time()
             lane = self._travel_lanes.get(key)
             if lane is None:
@@ -3545,7 +3572,6 @@ class AmbientDiscordAdapter(DiscordAdapter):
                         "guild_name": "",
                         "channel_name": "",
                         "chat_type": "channel",
-                        "thread_parent": None,
                     }
                 )
                 lane = {
@@ -3926,7 +3952,18 @@ class AmbientDiscordAdapter(DiscordAdapter):
             return []
 
     def _stage_travel_log(self, message: Any) -> None:
-        """Stage this turn's travel log for request-only delivery."""
+        """Stage this turn's travel log for request-only delivery.
+
+        Scoped to the turn's own channel first (Digital Structures,
+        2026-08-25): a turn dispatched in a channel outside
+        `travel_log.channels` carries no travel block at all, so continuity
+        narration never leaks into a room where actual work happens. The
+        dispatcher wrapper pre-clears the context var per turn, so an early
+        return here is exactly "no block", never a stale one.
+        """
+        turn_channel = str(getattr(getattr(message, "channel", None), "id", "") or "")
+        if not self._travel_channel_allowed(turn_channel):
+            return
         rows = self._travel_rows(message)
         if not rows:
             return
