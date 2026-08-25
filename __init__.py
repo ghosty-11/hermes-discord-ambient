@@ -176,6 +176,12 @@ from collections import deque
 from typing import Any
 from urllib.parse import urlparse
 
+try:  # fail-open: redaction is defence in depth, never load-bearing
+    from agent.redact import redact_sensitive_text  # type: ignore
+except Exception:  # pragma: no cover - framework always ships agent.redact
+    def redact_sensitive_text(text):
+        return text
+
 from plugins.platforms.discord.adapter import DiscordAdapter  # type: ignore
 from plugins.platforms.discord import adapter as _bundled  # type: ignore
 
@@ -2579,6 +2585,12 @@ class AmbientDiscordAdapter(DiscordAdapter):
             verdict = self._bounce_pre_dispatch(message)
             if verdict == "suppress":
                 return False
+            # Presence truth on replay: a recovered message is real inbound
+            # traffic she witnesses, and the restart that made it "missed"
+            # must not erase the visit from her history. Observe only -- no
+            # directive staging, a burst of replays must not multiply travel
+            # blocks into turns that are auto-continuations.
+            self._travel_observe(message)
             await self._standby_wait(message)  # backfill replays queue behind the slot too
             handled = await super()._dispatch_recovered_message(message)
             if handled and verdict in ("goodbye", "count"):
@@ -3459,7 +3471,22 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     "participants": [],
                 }
                 lane.update(self._travel_lane_meta(channel))
+                # Bounded like room-talk's 128-LRU: channels are attacker-
+                # influenceable in a public guild, and an unclosed lane per
+                # channel would grow without limit. Under flood the stale-most
+                # open visit is dropped (its beat is lost, never falsified).
+                while len(self._travel_lanes) >= 256:
+                    oldest = min(
+                        self._travel_lanes,
+                        key=lambda k: float(self._travel_lanes[k].get("last_observed_at") or 0.0),
+                    )
+                    self._travel_lanes.pop(oldest, None)
                 self._travel_lanes[channel_id] = lane
+            if not lane.get("channel_name"):
+                # Bare lane opened by her own send into an uncached channel:
+                # the promised fill-in happens on the first REAL inbound,
+                # which is also what corrects a DM mis-typed as "channel".
+                lane.update(self._travel_lane_meta(channel))
             lane["last_observed_at"] = now
             lane["obs_count"] = int(lane.get("obs_count") or 0) + 1
             author = getattr(message, "author", None)
@@ -3469,11 +3496,16 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 participants = lane["participants"]
                 if not any(p and str(p[0]) == uid for p in participants):
                     if len(participants) < 8:  # beat-spec cap, union over the visit
-                        handle = str(
-                            getattr(author, "name", "")
-                            or getattr(author, "display_name", "")
-                            or ""
-                        ).strip()
+                        # Flatten+cap HERE, not just at render: webhook and
+                        # display names are freeform and can carry interior
+                        # newlines that would split a rendered fact row into
+                        # forged-looking rows (the structural-safety bar the
+                        # room-context block already meets).
+                        handle = self._flatten_room_line(
+                            str(getattr(author, "name", "")
+                                or getattr(author, "display_name", "") or ""),
+                            48,
+                        )
                         participants.append([uid, handle])
         except Exception:
             logger.debug("ambient.travel_log: observe failed", exc_info=True)
@@ -3548,6 +3580,11 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 if self_id and str(entry[1]) == self_id:
                     continue
                 snippet = self._flatten_room_line(entry[4], self._ROOM_SNIPPET_CHARS)
+                # Session-store content passes redact_sensitive_text; these
+                # snippets persist to a shared file for up to 32h and must
+                # not hold what the transcript would have scrubbed.
+                if snippet:
+                    snippet = redact_sensitive_text(snippet)
                 if not snippet:
                     continue
                 out.append(snippet)
@@ -3661,7 +3698,11 @@ class AmbientDiscordAdapter(DiscordAdapter):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             payload = {"beats": self._travel_beats, "lanes": self._travel_lanes}
             tmp = f"{path}.tmp"
-            with open(tmp, "w") as fh:
+            # 0640: drop group-write. Every seat runs as hermes, so a
+            # group-writable store is writable by anything on the host, and
+            # these rows are replayed into her prompt at render time.
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
+            with os.fdopen(fd, "w") as fh:
                 json.dump(payload, fh)
             os.replace(tmp, path)
         except Exception:
@@ -3685,7 +3726,12 @@ class AmbientDiscordAdapter(DiscordAdapter):
             room = {}
             touched = {}
             for key, rows in self._room_talk.items():
-                room[key] = [list(r) for r in rows[-keep:]]
+                # index 4 is the flattened line; redact it exactly like the
+                # close-time snippet path above.
+                room[key] = [
+                    [(redact_sensitive_text(v) if i == 4 else v) for i, v in enumerate(r)]
+                    for r in rows[-keep:]
+                ]
                 touched[key] = float(self._room_talk_touched.get(key, 0.0))
             while len(room) > 128:
                 oldest = min(touched, key=touched.get)
@@ -3694,7 +3740,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             payload = {"room_talk": room, "touched": touched}
             tmp = f"{path}.tmp"
-            with open(tmp, "w") as fh:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
+            with os.fdopen(fd, "w") as fh:
                 json.dump(payload, fh)
             os.replace(tmp, path)
         except Exception:
@@ -3756,19 +3803,28 @@ class AmbientDiscordAdapter(DiscordAdapter):
             for beat in group:  # newest-first; the latest words matter most
                 for snippet in beat.get("snippets") or []:
                     text = self._flatten_room_line(snippet, self._ROOM_SNIPPET_CHARS)
-                    if text and text not in quotes:
-                        quotes.append(text)
+                    # Prefixed, ALWAYS: a bare quote row is verbatim user
+                    # text, and a public-room user who pastes the travel
+                    # header or a directive lookalike would otherwise have it
+                    # render inside this block as if the harness authored
+                    # it. Same reason room-context prefixes its talk lines.
+                    marked = f"\u00b7 said: {text}" if text else ""
+                    if marked and marked not in quotes:
+                        quotes.append(marked)
                     if len(quotes) >= 2:
                         break
                 if len(quotes) >= 2:
                     break
-            return line, quotes
+            # Re-flatten the COMPOSED line: handles/place names ride in from
+            # state that may predate the capture-side guard, and user text can
+            # never be allowed to start or split a row.
+            return self._flatten_room_line(line, 400), quotes
         # Lurk-only: she was there and listening — softer, and truthful.
-        return (
+        line = (
             f"hung around {place}, mostly listening · {ended} ago · stayed {lasted}"
-            + (f" · with {', '.join(who)}" if who else ""),
-            [],
+            + (f" · with {', '.join(who)}" if who else "")
         )
+        return self._flatten_room_line(line, 400), []
 
     def _travel_rows(self, message: Any) -> list:
         """The travel-log block for this turn, facts only.
@@ -5091,9 +5147,11 @@ class AmbientDiscordAdapter(DiscordAdapter):
             self._spoke[str(chat_id)] = (time.time(), 0)
         except Exception:
             pass
-        # Travel log: her own send is the one clock this plugin controls end
-        # to end — see _travel_spoke for why both clocks move here.
-        self._travel_spoke(chat_id)
+        # Travel log stamps moved DOWN: they fire at the delivery funnels
+        # below, after every suppression gate. A reply swallowed by the
+        # sentinel, an echo guard or voice-only never reached the room, so it
+        # must not read as "she spoke" in her own history (charge-at-send,
+        # same rule the bounce/catchup accounting already follows).
 
         reply_to = kwargs.get("reply_to", args[0] if args else None)
         standalone = False
@@ -5354,6 +5412,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 rest, media = self._split_media_urls(content)
                 media = self._attach_pending_gif(content, media)
                 if media:
+                    self._travel_spoke(chat_id)
                     first = None
                     if rest:
                         first = await super().send(
@@ -5373,6 +5432,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     self._direct_count_sent(reply_to, first)
                     return first
 
+        self._travel_spoke(chat_id)
         result = await super().send(chat_id, content, *send_args, **send_kwargs)
         self._bounce_count_sent(reply_to, result)
         self._catchup_count_sent(reply_to, result)
