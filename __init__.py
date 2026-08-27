@@ -165,6 +165,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+import contextlib
 import contextvars
 import json
 import logging
@@ -173,6 +174,7 @@ import random
 import re
 import time
 from collections import deque
+from pathlib import Path as _Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -1328,6 +1330,69 @@ class AmbientDiscordAdapter(DiscordAdapter):
     def _lifecycle_cfg(self) -> dict:
         return self._sub("gateway_lifecycle")
 
+    @contextlib.contextmanager
+    def _lifecycle_secret_scope(self):
+        """Guarantee the lifecycle one-shot can read credentials.
+
+        Under multiplex, ``get_secret`` fails CLOSED: with no profile secret
+        scope active it raises ``UnscopedSecretError`` rather than falling back
+        to ``os.environ``. Secondary profiles are fine — gateway/run.py creates
+        and connects their adapters inside ``_profile_runtime_scope``, so the
+        task ``_announce_gateway_return`` spawns inherits that scope. The
+        PRIMARY profile's startup path has no such wrapper, so its lifecycle
+        inference ran unscoped and every attempt died in the generic handler as
+        "inference failed; staying silent" on every restart where a roll fired.
+
+        An inherited scope is left ALONE. Replacing it would let one profile's
+        turn read another profile's credentials, so the home is resolved at call
+        time — never captured at construction, which would freeze whichever home
+        happened to be current when the adapter was built.
+
+        Fail-open throughout: this is a repair for a path that is currently
+        broken, so a problem installing the scope must leave the old behaviour
+        rather than turn a silent lifecycle into a crashed connect().
+        """
+        try:
+            from agent.secret_scope import (
+                build_profile_secret_scope,
+                current_secret_scope,
+                reset_secret_scope,
+                set_secret_scope,
+            )
+            from hermes_constants import get_hermes_home
+        except Exception:  # pragma: no cover - framework always ships these
+            yield
+            return
+
+        if current_secret_scope() is not None:
+            yield
+            return
+
+        try:
+            home = get_hermes_home()
+            try:
+                from hermes_cli.env_loader import hydrate_profile_secret_sources
+
+                hydrate_profile_secret_sources(_Path(home))
+            except Exception:
+                # Credential POOLS need this; a plain key_env read does not.
+                logger.debug(
+                    "ambient.lifecycle: secret sources not hydrated", exc_info=True
+                )
+            token = set_secret_scope(build_profile_secret_scope(_Path(home)))
+        except Exception:
+            logger.debug(
+                "ambient.lifecycle: could not install a secret scope; "
+                "inference will run as before", exc_info=True
+            )
+            yield
+            return
+
+        try:
+            yield
+        finally:
+            reset_secret_scope(token)
+
     @staticmethod
     def _lifecycle_probability(value: Any, default: float) -> float:
         try:
@@ -1382,16 +1447,17 @@ class AmbientDiscordAdapter(DiscordAdapter):
         except (TypeError, ValueError):
             timeout = 20.0
         requested = {event: _LIFECYCLE_EVENT_BRIEFS[event] for event in selected}
-        raw = run_oneshot(
-            instructions=(
-                f"{_LIFECYCLE_COPY_INSTRUCTIONS}\n\nPersona context:\n{persona[:1200]}"
-            ),
-            user_input=json.dumps(requested, ensure_ascii=False, sort_keys=True),
-            task=task or "title_generation",
-            max_tokens=240,
-            temperature=0.9,
-            timeout=timeout,
-        )
+        with self._lifecycle_secret_scope():
+            raw = run_oneshot(
+                instructions=(
+                    f"{_LIFECYCLE_COPY_INSTRUCTIONS}\n\nPersona context:\n{persona[:1200]}"
+                ),
+                user_input=json.dumps(requested, ensure_ascii=False, sort_keys=True),
+                task=task or "title_generation",
+                max_tokens=240,
+                temperature=0.9,
+                timeout=timeout,
+            )
         try:
             decoded = json.loads(raw)
         except (TypeError, ValueError, json.JSONDecodeError):

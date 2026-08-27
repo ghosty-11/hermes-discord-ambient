@@ -1,7 +1,7 @@
 name: discord-ambient
 label: Discord (ambient presence)
 kind: platform
-version: 1.33.0
+version: 1.33.1
 description: >
   Subclasses the bundled Discord adapter to add opt-in ambient presence.
   A profile may occasionally join conversations it was not mentioned in,
