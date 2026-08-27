@@ -107,6 +107,13 @@ def main():
     oneshot_mod.run_oneshot = fake_run_oneshot
     adapter = make_adapter()
 
+    # A credential only this home's .env can supply. If the installed scope
+    # carries it, the scope was built from the resolved home's file -- not
+    # inherited from os.environ, which is exactly the fallthrough that
+    # multiplexing disables on purpose.
+    with open(os.path.join(_HOME, ".env"), "w") as fh:
+        fh.write("LIFECYCLE_SCOPE_PROBE=from-the-home-env-file\n")
+
     # ---- case 1: no inherited scope (the primary-profile startup path) ----
     SEEN.clear()
     check("case 1 precondition: no scope active", current_secret_scope() is None)
@@ -117,6 +124,15 @@ def main():
           bool(SEEN) and SEEN[0] is not None,
           "inference ran unscoped -> real credential reads raise "
           "UnscopedSecretError and the lifecycle stays silent")
+    check("case 1: the scope was built from the resolved home's .env",
+          bool(SEEN) and isinstance(SEEN[0], dict)
+          and SEEN[0].get("LIFECYCLE_SCOPE_PROBE") == "from-the-home-env-file",
+          "a scope that lacks the home's own file-declared secret is not a "
+          "profile scope; it would be relying on process env instead")
+    check("case 1: the scope was RESTORED afterwards",
+          current_secret_scope() is None,
+          "an installed scope that outlives the call leaks into whatever "
+          "runs next in this context")
 
     # ---- case 2: an inherited scope must be preserved, not replaced ----
     SEEN.clear()
@@ -124,6 +140,7 @@ def main():
     token = set_secret_scope(sentinel)
     try:
         out2 = adapter._generate_lifecycle_copy(["shrine_return"])
+        still_scoped = current_secret_scope()
     finally:
         reset_secret_scope(token)
     check("case 2: copy generated", out2.get("shrine_return") == "back at the shrine",
@@ -132,6 +149,12 @@ def main():
           bool(SEEN) and SEEN[0] is sentinel,
           f"saw {SEEN[0]!r}; replacing an inherited scope would let one "
           f"profile's turn read another profile's credentials")
+    check("case 2: the inherited scope is still installed afterwards",
+          still_scoped is sentinel,
+          f"saw {still_scoped!r}; the caller's scope must survive the call")
+    check("case 2: no probe leakage into the inherited scope",
+          "LIFECYCLE_SCOPE_PROBE" not in sentinel,
+          "the fallback must not mutate or augment a caller-owned scope")
 
     print()
     if FAILURES:
