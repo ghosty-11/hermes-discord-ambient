@@ -58,16 +58,15 @@ to that 10k-line file keep flowing — and adds profile-scoped behaviours:
    after falling back to the local model, so standby stays dormant until a
    fallback-switch notice naming a local model (see 8) is observed, and
    re-sleeps local_fallback_ttl_seconds later. Cloud turns are never held.
-8. FALLBACK-NOTICE SUPPRESSION — upstream surfaces a provider/model
-   fallback switch as a one-shot status send ("🔄 Switched to fallback
-   model: ...") delivered through plain adapter.send(). Right for an
-   operator channel, wrong for a public community room. With
-   `suppress_fallback_notice: true` the notice is swallowed for THIS
-   profile only (logged instead); other profiles keep stock behaviour.
-   Suppressed or not, the notice is also the only signal the adapter ever
-   gets about the model its sessions actually run on — upstream keeps
-   fallback state on the per-session agent object, out of adapter reach —
-   so it is parsed either way to drive only_when_local standby above.
+8. OPERATOR-NOTICE ROUTING — upstream sends fallback, compression, provider,
+   reset and cron diagnostics through plain adapter.send(). These notices are
+   useful in an operator channel and wrong in a public community room. When
+   `system_notices.reroute_channel` is set, the adapter sends diagnostics there
+   instead. With no reroute target, `suppress_fallback_notice: true` still
+   drops fallback notices for this profile. The adapter parses every fallback
+   notice before presentation because it is the only signal available about
+   the model a session actually uses; that signal drives `only_when_local`
+   standby.
 9. GROUP-ADDRESS GREETINGS — "good morning agents" / "hello everyone" is
    addressed to the room, which the stock mention gate (and a bare name
    trigger list) can't represent. Opt-in `group_address` matches
@@ -132,13 +131,13 @@ UPSTREAM COUPLING (what discord-adapter-watch.sh guards)
     -> bool and DiscordAdapter._reject_slash(interaction, command_text, *,
     reason) -> False (slash-command policy rides these; every slash handler
     upstream funnels through the former)
-  * fallback-switch notice text: agent/chat_completion_helpers.py
-    try_activate_fallback sets "🔄 Switched to fallback model: {old} via
-    {old_provider} → {new} via {new_provider}"; run_agent.py
-    _emit_pending_fallback_notice emits it via status_callback and the
-    gateway delivers it through adapter.send. Suppression + local-fallback
-    detection match on the stable prefix — if upstream rewords it, both
-    degrade to stock (notice shown, standby stays dormant), never worse.
+  * fallback-switch notice text: agent/chat_completion_helpers.py currently
+    emits "⚠️ Model fallback: {old} via {old_provider} unavailable (...);
+    using {new} via {new_provider}." Older sessions can emit "🔄 Switched to
+    fallback model: {old} via {old_provider} → {new} via {new_provider}".
+    run_agent.py delivers both through adapter.send. Routing and local-fallback
+    detection match both stable prefixes. If upstream changes them, the adapter
+    uses stock delivery and leaves standby dormant.
   * drain notice text: gateway/run.py emits three variants while _draining,
     all built from GatewayRunner._status_action_gerund() ("shutting down" /
     "restarting"). The in-voice rewrite matches only the "⏳ Gateway <gerund>"
@@ -594,16 +593,37 @@ _GOODBYE_HINT = (
 
 _DEFAULT_REACTIONS = ["👀", "😹", "✨", "🐈", "💅", "🔥"]
 
-# Stable prefix of upstream's one-shot fallback-switch status notice (see
-# UPSTREAM COUPLING in the module docstring). Matched with startswith on the
-# stripped content: distinctive enough that a real chat reply cannot
-# plausibly collide with it.
-_FALLBACK_NOTICE_PREFIX = "🔄 Switched to fallback model:"
+# Stable prefixes of upstream's fallback-switch notices (see UPSTREAM COUPLING
+# in the module docstring). Hermes changed the wording in August 2026; both
+# forms remain valid while deployed sessions can span framework updates.
+_FALLBACK_NOTICE_PREFIXES = (
+    "🔄 Switched to fallback model:",
+    "⚠️ Model fallback:",
+    "⚠ Model fallback:",
+)
 
 # Operator-facing machinery that upstream posts into whatever channel a job
 # delivers to. In a community room these read as the bot leaking its own
 # plumbing, so they are rerouted to a private channel when one is configured.
-_SYSTEM_NOTICE_PREFIXES = ["⚠️ Cron '", "Cronjob Response:"]
+_SYSTEM_NOTICE_PREFIXES = [
+    "⚠️ Cron '",
+    "Cronjob Response:",
+    *_FALLBACK_NOTICE_PREFIXES,
+    "⚠️ Provider unreachable",
+    "⚠ Provider unreachable",
+    "⚠️ Rate limited",
+    "⚠ Rate limited",
+    "⚠️ The model provider failed after retries",
+    "⚠ The model provider failed after retries",
+    "⚠️ Context compression timed out",
+    "⚠ Context compression timed out",
+    "⚠️ Context is over the compression threshold",
+    "⚠ Context is over the compression threshold",
+    "⚠️ Compression aborted",
+    "⚠ Compression aborted",
+    "Context length exceeded",
+    "🔄 Session auto-reset",
+]
 
 # Surfaces whose delivery carries a reply anchor, so the room-wide marker has
 # something to opt out of. Everything else (cron, webhook) delivers flat.
@@ -633,6 +653,7 @@ _SYSTEM_NOTICE_DROP = [
     "⏳ Queued for the next turn",
     "⏳ Subagent working",
     "⏳ Compressing context",
+    "Let me think about our conversation",
 ]
 
 # Drain notices. While the gateway is stopping or restarting it refuses (or
@@ -2426,7 +2447,12 @@ class AmbientDiscordAdapter(DiscordAdapter):
         switch target names a local model. Runs whether or not the notice is
         then suppressed — observation and presentation are separate."""
         try:
-            target = notice.split("→", 1)[1] if "→" in notice else notice
+            if "; using " in notice:
+                target = notice.rsplit("; using ", 1)[1]
+            elif "→" in notice:
+                target = notice.split("→", 1)[1]
+            else:
+                target = notice
             # Every model on the shared local lane, not just the first one: a
             # marker list narrower than the chain's local floor leaves standby
             # dormant exactly when the fleet is contended.
@@ -5360,11 +5386,18 @@ class AmbientDiscordAdapter(DiscordAdapter):
             )
             content = _stall
 
+        fallback_notice = None
+        if isinstance(content, str):
+            stripped = content.strip()
+            if stripped.startswith(_FALLBACK_NOTICE_PREFIXES):
+                fallback_notice = stripped
+                self._note_fallback_notice(fallback_notice)
+
         target = self._system_notice_target(content, chat_id)
         if target:
-            # Reroute, don't drop: the operator still wants cron failures, just
-            # not in the community room. reply_to is deliberately dropped — the
-            # anchor message lives in the channel we are routing away from.
+            # Reroute, don't drop: the operator still wants diagnostics, just
+            # not in the community room. reply_to is deliberately dropped —
+            # the anchor message lives in the channel we are routing away from.
             logger.info(
                 "ambient: system notice rerouted to %s: %s",
                 target, str(content).strip()[:120],
@@ -5372,23 +5405,14 @@ class AmbientDiscordAdapter(DiscordAdapter):
             return await super().send(
                 target, content, metadata=kwargs.get("metadata"),
             )
-        if isinstance(content, str) and content.strip().startswith(_FALLBACK_NOTICE_PREFIX):
-            notice = content.strip()
-            # Track first (standby signal), decide visibility second.
-            self._note_fallback_notice(notice)
-            if self._ambient_enabled() and self._ambient_cfg().get(
-                "suppress_fallback_notice"
-            ):
-                logger.info(
-                    "ambient: fallback-switch notice suppressed for this "
-                    "profile: %s", notice[:160],
-                )
-                try:
-                    from gateway.platforms.base import SendResult  # type: ignore
-
-                    return SendResult(success=True, message_id=None)
-                except Exception:
-                    return None
+        if fallback_notice and self._ambient_enabled() and self._ambient_cfg().get(
+            "suppress_fallback_notice"
+        ):
+            logger.info(
+                "ambient: fallback-switch notice suppressed for this "
+                "profile: %s", fallback_notice[:160],
+            )
+            return self._suppressed_result()
         # Catch-up echo guard, before the general ambient screen so it sees the
         # reply exactly as the model wrote it. WARNING, not info: this firing at
         # all means the model is reproducing its input, and the frequency of the
