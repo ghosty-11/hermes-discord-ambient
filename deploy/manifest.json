@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "module": "hermes-discord-ambient",
+  "artifacts": [
+    {"source": "__init__.py", "destination": "plugins/discord-ambient/__init__.py", "kind": "file"},
+    {"source": "plugin.yaml", "destination": "plugins/discord-ambient/plugin.yaml", "kind": "file"}
+  ]
+}
