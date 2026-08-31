@@ -17,13 +17,30 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-24.04
+    env:
+      HERMES_FRAMEWORK_PATH: ${{ github.workspace }}/hermes-agent
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
-      - name: Run contract suite
-        run: python3 -m unittest discover -s . -p 'test_*.py' -v
+      - name: Check out compatible Hermes framework
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: ghosty-11/hermes-agent
+          ref: 009b580fc956c051db0db15f509c67db84a770c8
+          path: hermes-agent
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: python3 -m pip install --disable-pip-version-check 'discord.py==2.7.1' 'PyYAML==6.0.3'
+      - name: Run isolated contract suite
+        run: |
+          for test in test_*.py; do python3 \"$test\"; done
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
       - name: Validate deployment manifest
         run: python3 -m json.tool deploy/manifest.json >/dev/null
       - name: Compile Python sources
