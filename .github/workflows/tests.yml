@@ -1,0 +1,30 @@
+name: Tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Run contract suite
+        run: python3 -m unittest discover -s . -p 'test_*.py' -v
+      - name: Validate deployment manifest
+        run: python3 -m json.tool deploy/manifest.json >/dev/null
+      - name: Compile Python sources
+        run: python3 -m compileall -q __init__.py tests
