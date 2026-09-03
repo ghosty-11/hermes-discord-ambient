@@ -2459,9 +2459,6 @@ class AmbientDiscordAdapter(DiscordAdapter):
             markers = self._sub("standby").get("local_markers") or [
                 "gptoss",
                 "nemo4",
-                "gpt-oss",
-                "ollama",
-                "qwen3",
             ]
             if any(str(m).lower() in target.lower() for m in markers):
                 self._local_fallback_ts = time.time()

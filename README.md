@@ -36,7 +36,7 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 | **Rotating presence** | zero | Custom status from a list, on a background task. |
 | **No-thread mode** | zero | Per-profile kill switch. Upstream `DISCORD_AUTO_THREAD` is process-wide under multiplex; this adds the channel to the no-thread set instead of failing thread creation (upstream treats that as an error and drops the message). |
 | **Bot bounce** | zero while suppressing | Circuit breaker for bot-to-bot volleys. Suppresses before admission; counts at send. |
-| **Fleet standby** | zero while holding | Holds dispatch while the shared inference slot is busy. Delay, never mute. `only_when_local` waits for a fallback notice naming a local model; `standby.local_markers` must cover every local model in the profile's chain (default `gpt-oss`, `ollama`, `qwen3`). |
+| **Fleet standby** | zero while holding | Holds dispatch while the shared inference slot is busy. Delay, never mute. `only_when_local` waits for a fallback notice naming a local model; `standby.local_markers` must cover every local model in the profile's chain (default `gptoss`, `nemo4`). |
 | **Fallback-notice routing** | zero | Parses both framework fallback formats for standby. Sends the notice to `system_notices.reroute_channel` when configured; otherwise `suppress_fallback_notice` drops it. |
 | **Group-address greetings** | 1 inference when it answers | "good morning agents" / "hello everyone" at its own probability and cooldown, exempt from the daily cap. |
 | **System-notice rerouting** | zero | Compression, provider, fallback, reset and cron diagnostics go to a private channel. Drain and stall notices can be rewritten in-character. Routine progress plumbing is dropped. |

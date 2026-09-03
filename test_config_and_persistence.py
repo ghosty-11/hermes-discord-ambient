@@ -402,12 +402,12 @@ def check_quiet_resume_is_request_only():
 
 def check_local_fallback_window_covers_the_local_floor():
     print("\n-- a fallback to any local model opens the standby window --")
-    prefix = "🔄 Switched to fallback model: Qwen/Qwen3.6-35B-A3B-FP8 via custom:hetzner → "
+    prefix = "🔄 Switched to fallback model: bb-chat via custom:gateway → "
     block = {"standby": {"enabled": True, "only_when_local": True}}
 
     for target, label in (
-        ("gpt-oss:20b via custom", "the first local model"),
-        ("qwen3:8b via custom", "the second local model"),
+        ("gptoss via custom", "the first local model"),
+        ("nemo4 via custom", "the second local model"),
     ):
         a = make_adapter(dict(block))
         a._note_fallback_notice(prefix + target)
@@ -417,13 +417,18 @@ def check_local_fallback_window_covers_the_local_floor():
             target,
         )
 
-    cloud = make_adapter(dict(block))
-    cloud._note_fallback_notice(prefix + "google/gemma-4-31b-it:free via openrouter")
-    check(
-        "a cloud fallback leaves standby dormant",
-        cloud._standby_engaged() is False,
-        "openrouter hop",
-    )
+    for target, label in (
+        ("gpt-oss:20b via custom", "retired ollama gpt-oss"),
+        ("qwen3:8b via custom", "retired ollama qwen3"),
+        ("google/gemma-4-31b-it:free via openrouter", "a cloud fallback"),
+    ):
+        cloud = make_adapter(dict(block))
+        cloud._note_fallback_notice(prefix + target)
+        check(
+            f"{label} leaves standby dormant",
+            cloud._standby_engaged() is False,
+            target,
+        )
 
 
 def main():
