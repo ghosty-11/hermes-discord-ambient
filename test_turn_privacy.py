@@ -1,10 +1,12 @@
 """Turn-scoped Discord identity and context at Hermes' real plugin boundaries."""
 
 import importlib.util
+from importlib import _bootstrap
 import os
 import socket
 import sys
 import tempfile
+import threading
 import types
 from unittest import mock
 
@@ -125,7 +127,34 @@ def main():
         key="ambient-turn-test",
     )
     ctx = PluginContext(manifest, manager)
-    ambient.register(ctx)
+    gateway_spec = sys.modules["gateway.run"].__spec__
+    import_lock = _bootstrap._get_module_lock("gateway.run")
+    was_initializing = gateway_spec._initializing
+    registration_done = threading.Event()
+    registration_errors = []
+
+    def register_during_gateway_import():
+        try:
+            ambient.register(ctx)
+        except BaseException as exc:
+            registration_errors.append(exc)
+        finally:
+            registration_done.set()
+
+    worker = threading.Thread(target=register_during_gateway_import, daemon=True)
+    import_lock.acquire()
+    try:
+        gateway_spec._initializing = True
+        worker.start()
+        registered_without_gateway_import = registration_done.wait(3)
+    finally:
+        gateway_spec._initializing = was_initializing
+        import_lock.release()
+        worker.join(timeout=10)
+    if registration_errors:
+        raise registration_errors[0]
+    check("registration completes while gateway import is held by another thread",
+          registered_without_gateway_import)
     recall_plugin = os.environ.get("HERMES_RECALL_PLUGIN")
     recall_requests, persistable = {}, []
     if recall_plugin:
@@ -234,7 +263,13 @@ def main():
 
         discord_adapter.DiscordAdapter._dispatch_discord_message = admitted_dispatch
         try:
-            asyncio.run(adapter._dispatch_stock_with_turn_context(alice))
+            async def connect_with_first_message(_self, *, is_reconnect=False):
+                await adapter._dispatch_stock_with_turn_context(alice)
+                return False
+
+            with mock.patch.object(discord_adapter.DiscordAdapter, "connect",
+                                   connect_with_first_message):
+                asyncio.run(adapter.connect())
         finally:
             discord_adapter.DiscordAdapter._dispatch_discord_message = original_dispatch
 
@@ -414,7 +449,13 @@ def main():
         plugins_mod._plugin_manager = second_manager
         runner._adapter_for_source = lambda source: second_adapter
         try:
-            asyncio.run(run_at_real_boundary(second_message, second_source))
+            async def connect_second_profile(_self, *, is_reconnect=False):
+                await run_at_real_boundary(second_message, second_source)
+                return False
+
+            with mock.patch.object(discord_adapter.DiscordAdapter, "connect",
+                                   connect_second_profile):
+                asyncio.run(second_adapter.connect())
         finally:
             plugins_mod._plugin_manager = manager
             runner._adapter_for_source = lambda source: adapter

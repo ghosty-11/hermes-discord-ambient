@@ -82,6 +82,12 @@ Failed binding installation leaves the image gate fail-closed with an explicit
 availability reason. Framework session identity remains distinct from private
 context authorization; the attestation, not blank identity fields, carries proof.
 
+Binding runs at the start of the Discord adapter's `connect()`, before the stock
+connector can admit a message. Plugin discovery never imports `gateway.run` for
+this binding: background discovery and the gateway module's auxiliary-task lookup
+can otherwise wait on each other's locks. The image gate remains unavailable until
+binding succeeds; reconnects retain the same idempotent wrapper.
+
 ## Why this seam
 
 `require_mention` is enforced **twice, independently**: in `_discord_message_admission`
@@ -531,10 +537,12 @@ venv/bin/python /path/to/hermes-discord-ambient/test_image_gate.py
 venv/bin/python /path/to/hermes-discord-ambient/test_turn_privacy.py
 ```
 
-`test_turn_privacy.py` exercises the real gateway turn wrapper, queue helpers,
-profile-qualified plugin loading, hooks and request middleware with local recorders.
-It creates temporary homes and denies network connections. From this checkout,
-include the matching recall plugin to check the cross-module attestation contract:
+`test_turn_privacy.py` holds the gateway module's import lock in another thread
+during registration, then admits the first message inside the stock connector.
+It also exercises queued turns, profile-qualified plugin loading, hooks and request
+middleware with local recorders. Temporary homes and denied network connections
+isolate the fixture. Include the matching recall plugin to check the cross-module
+attestation contract:
 
 ```bash
 env HERMES_FRAMEWORK_PATH=/path/to/hermes-agent \

@@ -1,10 +1,12 @@
 """Regression for AM-01: image gate uses the installed resolver contract."""
 
+import asyncio
 import importlib.util
 import os
 import sys
 import socket
 import tempfile
+from unittest import mock
 
 class _DeniedSocket(socket.socket):
     def connect(self, address):
@@ -73,6 +75,12 @@ def main():
         return block
 
     try:
+        pending = dispatch("42")
+        pending_calls = len(calls)
+        adapter = object.__new__(ambient.AmbientDiscordAdapter)
+        with mock.patch.object(ambient.DiscordAdapter, "connect",
+                               mock.AsyncMock(return_value=False)):
+            asyncio.run(adapter.connect())
         refused = dispatch("99")
         refused_calls = len(calls)
         allowed = dispatch("42")
@@ -81,6 +89,8 @@ def main():
         plugins_mod._plugin_manager = old_manager
         ambient._image_gate_cfg = old_cfg
 
+    check("allowed actor cannot reach backend before identity binding",
+          isinstance(pending, str) and pending_calls == 0, repr((pending, pending_calls)))
     check("unauthorized image call is visibly refused", isinstance(refused, str), repr(refused))
     check("unauthorized image call never reaches backend", refused_calls == 0, repr(calls))
     check("allowed speaker reaches recorder backend", allowed is None and len(calls) == 1, repr((allowed, calls)))

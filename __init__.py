@@ -540,7 +540,7 @@ _verified_run_context: contextvars.ContextVar[dict | None] = contextvars.Context
 _turn_scopes: OrderedDict[str, dict] = OrderedDict()
 _turn_scopes_lock = threading.Lock()
 _TURN_SCOPE_LIMIT = 512
-_turn_binding_error: str | None = None
+_turn_binding_error: str | None = "GatewayNotConnected"
 
 
 _DEFAULT_HINT = (
@@ -5093,6 +5093,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.debug("ambient: presence loop stopped", exc_info=True)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # Discovery may run while another thread imports gateway.run. Bind only
+        # after that import completes, before the connector can admit a message.
+        _install_gateway_turn_scope()
         ok = await super().connect(is_reconnect=is_reconnect)
         if ok:
             cfg = self._ambient_cfg()
@@ -6704,7 +6707,6 @@ def register(ctx) -> None:
     """
     _install_compaction_focus()
     _install_direct_silence_filter()
-    _install_gateway_turn_scope()
 
     _bundled.register(ctx)
 
