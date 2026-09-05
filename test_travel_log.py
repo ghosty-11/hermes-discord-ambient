@@ -82,12 +82,17 @@ class Chan:
         self.guild = guild
         self.topic = topic
         self.parent = parent
+        self.visible_to_everyone = True
+
+    def permissions_for(self, role):
+        return types.SimpleNamespace(view_channel=self.visible_to_everyone)
 
 
 class Guild:
     def __init__(self, gid, name):
         self.id = gid
         self.name = name
+        self.default_role = object()
 
 
 class Message:
@@ -145,13 +150,13 @@ def build_adapter(travel=TRAVEL_ON, room=None):
 def state_home(prefix="travel-state-"):
     """A private HERMES_HOME per case. Travel state is keyed on the bot's own
     id, so without this every case would read and write its siblings' lanes."""
-    home = tempfile.mkdtemp(prefix=prefix)
     old = os.environ["HERMES_HOME"]
-    os.environ["HERMES_HOME"] = home
-    try:
-        yield home
-    finally:
-        os.environ["HERMES_HOME"] = old
+    with tempfile.TemporaryDirectory(prefix=prefix) as home:
+        os.environ["HERMES_HOME"] = home
+        try:
+            yield home
+        finally:
+            os.environ["HERMES_HOME"] = old
 
 
 def state_file(home, name):
@@ -1083,6 +1088,19 @@ with case("v1.33.0: absent channels key keeps every channel in scope"):
         check("default still projects everywhere", bool(ambient._travel_context.get()))
         ambient._travel_context.set("")
 
+
+with case("admitted quote identities survive snapshot reload"):
+    with state_home():
+        a = build_adapter(room={"persist_room_talk": True})
+        arrive(a, Message(3300, ALICE, GENERAL, "ADMITTED_AFTER_RESTART"))
+        a._remember_room_talk(Message(3301, ALICE, GENERAL, "UNADMITTED_AFTER_RESTART"))
+        a._travel_save_state()
+        a._travel_flush_room_talk()
+        restored = build_adapter(room={"persist_room_talk": True})
+        restored._travel_load_state()
+        quoted = "\n".join(restored._travel_close_snippets("501"))
+        check("restored admitted quote remains available", "ADMITTED_AFTER_RESTART" in quoted, quoted)
+        check("restored unadmitted quote remains excluded", "UNADMITTED_AFTER_RESTART" not in quoted, quoted)
 
 if FAILURES:
     print(f"{len(FAILURES)} failure(s): {', '.join(FAILURES)}")

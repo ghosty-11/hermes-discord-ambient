@@ -45,7 +45,7 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 | **Speaker boost** | zero | Per-user overrides of probability / cooldown / daily cap. Cooldown is the load-bearing half. |
 | **Conversation window** | zero | Messages in the bot's wake get a high response chance, bounded by both count and elapsed time. |
 | **Catch-up** | zero per scan; 1 inference on a check-in | Timer scanner. Hands **one** real message to the normal ambient path with a transcript. Same budget as reactive joins. |
-| **Travel log** | zero inference | Durable 32h cross-space visit record; idle-based beats close when both sides go quiet or after `lurk_max_minutes`. Projection is request-only. A lane becomes durable/projectable only after Hermes handles a publicly visible guild source, so passive observation alone is intentionally not retained; direct/private and rejected sources fail closed. `travel_log.channels` further scopes touch points and projection to an allowlist of channel ids; absent means everywhere. |
+| **Travel log** | zero inference | Durable 32h cross-space visits, admitted by handled input or the bot's own public send. Cached permissions must show that all guild members can view the source; direct messages, private threads, role-restricted channels and unknown visibility are excluded. Quotes require per-message admission evidence, retained with the lane across restarts. `travel_log.channels` further scopes admission and projection; passive observation alone does not admit a source. |
 | **Gateway lifecycle** | at most 1 background inference | Independent rolls for private return, cached departure, optional public return. Reconnects stay quiet. |
 | **Rich-embed video** | local STT; video inference only when used | Discord-proxied `video/*` only (`images-ext-*.discordapp.net`). Stock size limits apply. |
 | **Compaction focus** | zero | Standing `focus_topic` for social summaries. Unset leaves stock behaviour. |
@@ -61,9 +61,10 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 
 The plugin scopes each `GatewayRunner._run_agent` invocation, including queued
 recursion, using its current source and exact inbound message id. A reply anchor
-is not an inbound identity. Accepted queued bundles survive dispatch return;
-exact-key consumption and bounded expiry prevent an unused command bundle from
-being reused by a later message.
+is not an inbound identity. Accepted queued bundles survive dispatch return and
+transport cancellation. Exact-key consumption prevents reuse by later messages;
+the 512-entry least-recently-used bound limits storage without expiring a bundle
+while it waits behind a long turn. Exhausting that bound can withhold old context.
 
 The process wrapper dispatches through each adapter's own callback so
 profile-qualified plugin imports keep their own context. It binds a task-local
@@ -72,6 +73,9 @@ memory-recall plugin and restores it on return. Missing attestation withholds
 Discord recall; cached sender fields and environment variables cannot supply it.
 Deploy the matching ambient and memory-policy revisions together before the
 separately approved gateway restart. No framework source file is modified.
+Failed binding installation leaves the image gate fail-closed with an explicit
+availability reason. Framework session identity remains distinct from private
+context authorization; the attestation, not blank identity fields, carries proof.
 
 ## Why this seam
 
@@ -519,6 +523,17 @@ venv/bin/python /path/to/hermes-discord-ambient/test_voice_only.py
 venv/bin/python /path/to/hermes-discord-ambient/test_config_and_persistence.py
 venv/bin/python /path/to/hermes-discord-ambient/test_room_context.py
 venv/bin/python /path/to/hermes-discord-ambient/test_travel_log.py
+```
+
+`test_turn_privacy.py` exercises the real gateway turn wrapper, queue helpers,
+profile-qualified plugin loading, hooks and request middleware with local recorders.
+It creates temporary homes and denies network connections. From this checkout,
+include the matching recall plugin to check the cross-module attestation contract:
+
+```bash
+env HERMES_FRAMEWORK_PATH=/path/to/hermes-agent \
+  HERMES_RECALL_PLUGIN=/path/to/memory-recall/__init__.py \
+  /path/to/hermes-agent/venv/bin/python test_turn_privacy.py
 ```
 
 ## Support development

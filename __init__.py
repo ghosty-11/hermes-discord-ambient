@@ -540,6 +540,7 @@ _verified_run_context: contextvars.ContextVar[dict | None] = contextvars.Context
 _turn_scopes: OrderedDict[str, dict] = OrderedDict()
 _turn_scopes_lock = threading.Lock()
 _TURN_SCOPE_LIMIT = 512
+_turn_binding_error: str | None = None
 
 
 _DEFAULT_HINT = (
@@ -1145,7 +1146,6 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # Exact inbound Discord message id -> immutable prepared bundle, LRU.
         self._prepared_turns: OrderedDict[str, dict] = OrderedDict()
         self._prepared_turn_lock = threading.Lock()
-        self._travel_admitted_messages: dict[str, deque[str]] = {}
 
         # Travel log — cross-session presence memory. One OPEN lane per
         # channel she is present in, one CLOSED beat per finished visit.
@@ -2681,21 +2681,13 @@ class AmbientDiscordAdapter(DiscordAdapter):
             "room_context": room_context,
             "travel_context": travel_context,
             "gif_profile": self._bot_user_id(),
-            "prepared_at": time.monotonic(),
         }
         if not message_id:
             return bundle
         with self._prepared_turn_lock:
             self._prepared_turns[message_id] = bundle
             self._prepared_turns.move_to_end(message_id)
-            cutoff = time.monotonic() - 900.0
-            while self._prepared_turns:
-                first = next(iter(self._prepared_turns))
-                if (
-                    len(self._prepared_turns) <= _TURN_SCOPE_LIMIT
-                    and float(self._prepared_turns[first].get("prepared_at") or 0) >= cutoff
-                ):
-                    break
+            while len(self._prepared_turns) > _TURN_SCOPE_LIMIT:
                 self._prepared_turns.popitem(last=False)
         return bundle
 
@@ -2711,34 +2703,20 @@ class AmbientDiscordAdapter(DiscordAdapter):
         if not message_id:
             return None
         with self._prepared_turn_lock:
-            bundle = self._prepared_turns.pop(message_id, None)
-        if (
-            bundle is not None
-            and time.monotonic() - float(bundle.get("prepared_at") or 0) <= 900.0
-        ):
-            return bundle
-        return None
+            return self._prepared_turns.pop(message_id, None)
 
     async def _dispatch_stock_with_turn_context(self, message: Any) -> bool:
         bundle = self._prepare_turn_context(message)
-        try:
-            handled = await super()._dispatch_discord_message(message)
-        except BaseException:
-            self._discard_prepared_turn(bundle)
-            raise
+        handled = await super()._dispatch_discord_message(message)
         if not handled:
             self._discard_prepared_turn(bundle)
-        # Acceptance can mean queued, not consumed. Exact message keys and the
-        # bounded expiry in _take_prepared_turn prevent orphaned command reuse.
+        # Acceptance and cancellation can both leave an event queued. Exact
+        # message keys prevent reuse; the 512-entry bound limits orphan storage.
         return handled
 
     async def _dispatch_recovered_with_turn_context(self, message: Any) -> bool:
         bundle = self._prepare_turn_context(message)
-        try:
-            handled = await super()._dispatch_recovered_message(message)
-        except BaseException:
-            self._discard_prepared_turn(bundle)
-            raise
+        handled = await super()._dispatch_recovered_message(message)
         if not handled:
             self._discard_prepared_turn(bundle)
         return handled
@@ -3732,11 +3710,27 @@ class AmbientDiscordAdapter(DiscordAdapter):
         except Exception:
             logger.debug("ambient.travel_log: observe failed", exc_info=True)
 
+    @staticmethod
+    def _travel_source_public(channel: Any) -> bool:
+        """Require cached evidence that all guild members can view the source."""
+        try:
+            guild = getattr(channel, "guild", None)
+            role = getattr(guild, "default_role", None)
+            permissions_for = getattr(channel, "permissions_for", None)
+            is_private = getattr(channel, "is_private", None)
+            if guild is None or role is None or not callable(permissions_for):
+                return False
+            if callable(is_private) and is_private():
+                return False
+            return getattr(permissions_for(role), "view_channel", False) is True
+        except Exception:
+            return False
+
     def _travel_admit(self, message: Any) -> None:
         """Mark this source projectable only after public Discord admission."""
         try:
             channel = getattr(message, "channel", None)
-            if getattr(channel, "guild", None) is None:
+            if not self._travel_source_public(channel):
                 return
             channel_id = str(getattr(channel, "id", "") or "")
             if not channel_id:
@@ -3747,10 +3741,12 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 return
             message_id = str(getattr(message, "id", "") or "")
             if message_id:
-                admitted = self._travel_admitted_messages.setdefault(
-                    channel_id, deque(maxlen=128)
-                )
-                admitted.append(message_id)
+                admitted = lane.setdefault("admitted_message_ids", [])
+                if not isinstance(admitted, list):
+                    admitted = lane["admitted_message_ids"] = []
+                if message_id not in admitted:
+                    admitted.append(message_id)
+                del admitted[:-128]
             lane["admitted"] = True
             lane["visibility"] = "public"
         except Exception:
@@ -3795,10 +3791,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
                         "chat_type": "channel",
                     }
                 )
-                public = (
-                    bool(str(meta.get("guild_id") or ""))
-                    and meta.get("chat_type") != "dm"
-                )
+                public = self._travel_source_public(channel)
                 lane = {
                     "channel_id": key,
                     "opened_at": now,
@@ -3818,7 +3811,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
         except Exception:
             logger.debug("ambient.travel_log: spoke note failed", exc_info=True)
 
-    def _travel_close_snippets(self, channel_id: str) -> list:
+    def _travel_close_snippets(self, channel_id: str, lane: dict | None = None) -> list:
         """Up to 4 recent lines from the room-talk buffer, herself excluded.
 
         Newest first — these are the quotes the projection may show later,
@@ -3829,7 +3822,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
         try:
             self_id = self._bot_user_id()
             out = []
-            admitted = set(self._travel_admitted_messages.get(channel_id, ()))
+            lane = lane if lane is not None else self._travel_lanes.get(channel_id, {})
+            admitted_ids = lane.get("admitted_message_ids", [])
+            admitted = set(admitted_ids[-128:]) if isinstance(admitted_ids, list) else set()
             for entry in reversed(self._room_talk.get(channel_id, [])):
                 if str(entry[0]) not in admitted:
                     continue
@@ -3871,7 +3866,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             "her_msg_count": int(lane.get("her_msg_count") or 0),
             "participants": [list(p) for p in (lane.get("participants") or [])[:8]],
             "snippets": self._travel_close_snippets(
-                str(lane.get("channel_id") or key)
+                str(lane.get("channel_id") or key), lane
             ),
         })
         self._travel_seq += 1
@@ -6180,6 +6175,13 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, **_: Any):
     cfg = _image_gate_cfg()
     if not cfg.get("enabled"):
         return None                      # ungated profile (e.g. the operator's own)
+    if _turn_binding_error is not None:
+        return {
+            "action": "block",
+            "message": "Image generation is temporarily unavailable because current-turn "
+                       "identity binding is unavailable. Ask the operator to check the "
+                       "matching ambient and memory-policy deployment; do not retry.",
+        }
 
     allowed = _normalize_ids(cfg.get("allowed_users"))
     turn_id = str(_.get("turn_id") or "").strip()
@@ -6276,6 +6278,7 @@ def _is_resume_turn(user_message: Any, history: Any, depth: int = 3) -> bool:
     return False
 def _install_gateway_turn_scope() -> None:
     """Wrap the real initial/recursive turn boundary once per process."""
+    global _turn_binding_error
     try:
         from gateway.run import GatewayRunner  # type: ignore
         from gateway import session_context as session_ctx  # type: ignore
@@ -6325,26 +6328,16 @@ def _install_gateway_turn_scope() -> None:
                 "HERMES_SESSION_CHAT_TYPE": str(getattr(source, "chat_type", "") or ""),
                 "HERMES_SESSION_CHAT_NAME": str(getattr(source, "chat_name", "") or ""),
                 "HERMES_SESSION_THREAD_ID": str(getattr(source, "thread_id", "") or ""),
-                "HERMES_SESSION_USER_ID": source_user_id if bundle is not None else "",
-                "HERMES_SESSION_USER_ID_ALT": (
-                    str(getattr(source, "user_id_alt", "") or "") if bundle is not None else ""
-                ),
-                "HERMES_SESSION_USER_NAME": (
-                    str(getattr(source, "user_name", "") or "") if bundle is not None else ""
-                ),
-                "HERMES_SESSION_SCOPE_ID": str(
-                    getattr(source, "scope_id", "")
-                    or getattr(source, "guild_id", "")
-                    or ""
-                ),
-                "HERMES_SESSION_KEY": str(
-                    kwargs.get("session_key")
-                    or (args[5] if len(args) > 5 else "")
-                    or ""
-                ),
-                "HERMES_SESSION_MESSAGE_ID": message_id if bundle is not None else "",
+                "HERMES_SESSION_USER_ID": source_user_id,
+                "HERMES_SESSION_USER_ID_ALT": str(getattr(source, "user_id_alt", "") or ""),
+                "HERMES_SESSION_USER_NAME": str(getattr(source, "user_name", "") or ""),
+                "HERMES_SESSION_SCOPE_ID": str(getattr(source, "scope_id", "") or ""),
+                "HERMES_SESSION_MESSAGE_ID": message_id,
                 "HERMES_SESSION_PROFILE": str(getattr(source, "profile", "") or ""),
             }
+            supplied_key = kwargs.get("session_key", args[5] if len(args) > 5 else None)
+            if supplied_key is not None:
+                values["HERMES_SESSION_KEY"] = str(supplied_key)
             bindings = [(session_ctx._VAR_MAP[name], value) for name, value in values.items()]
             session_tokens = [variable.set(value) for variable, value in bindings]
             scope_token = _verified_run_context.set(bundle)
@@ -6364,6 +6357,7 @@ def _install_gateway_turn_scope() -> None:
         AmbientDiscordAdapter._ambient_scoped_gateway_turn = scoped_adapter_run
         original = GatewayRunner._run_agent
         if getattr(original, "_ambient_turn_scope_wrapper", False):
+            _turn_binding_error = None
             return
 
         @wraps(original)
@@ -6387,7 +6381,9 @@ def _install_gateway_turn_scope() -> None:
 
         scoped_run_agent._ambient_turn_scope_wrapper = True
         GatewayRunner._run_agent = scoped_run_agent
-    except Exception:
+        _turn_binding_error = None
+    except Exception as exc:
+        _turn_binding_error = type(exc).__name__
         logger.exception("ambient: could not install GatewayRunner turn scope")
 
 

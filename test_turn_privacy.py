@@ -6,6 +6,7 @@ import socket
 import sys
 import tempfile
 import types
+from unittest import mock
 
 
 class _DeniedSocket(socket.socket):
@@ -17,8 +18,10 @@ class _DeniedSocket(socket.socket):
 
 
 socket.socket = _DeniedSocket
-os.environ["HOME"] = tempfile.mkdtemp(prefix="ambient-turn-home-")
-os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="ambient-turn-hermes-")
+_fixture_home = tempfile.TemporaryDirectory(prefix="ambient-turn-home-")
+_fixture_hermes = tempfile.TemporaryDirectory(prefix="ambient-turn-hermes-")
+os.environ["HOME"] = _fixture_home.name
+os.environ["HERMES_HOME"] = _fixture_hermes.name
 sys.path.insert(0, os.environ.get("HERMES_FRAMEWORK_PATH", "/var/lib/hermes/.hermes/hermes-agent"))
 
 import plugins.platforms.discord.adapter as discord_adapter  # noqa: E402
@@ -27,6 +30,7 @@ from hermes_cli.middleware import apply_llm_request_middleware  # noqa: E402
 from gateway.config import Platform  # noqa: E402
 from gateway.run import GatewayRunner, _dequeue_pending_event  # noqa: E402
 from gateway.session import SessionSource  # noqa: E402
+from gateway import session_context  # noqa: E402
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest  # noqa: E402
 
 
@@ -51,6 +55,7 @@ class Guild:
     def __init__(self, gid, name):
         self.id = gid
         self.name = name
+        self.default_role = object()
 
 
 class Channel:
@@ -60,6 +65,10 @@ class Channel:
         self.guild = guild
         self.topic = None
         self.parent = None
+        self.visible_to_everyone = True
+
+    def permissions_for(self, role):
+        return types.SimpleNamespace(view_channel=self.visible_to_everyone)
 
 
 class Message:
@@ -74,9 +83,13 @@ class Message:
         self.attachments = []
 
 
+FAILURES = []
+
 def check(name, condition, detail=""):
     if not condition:
-        raise AssertionError(f"{name}: {detail}")
+        FAILURES.append(name)
+        print(f"  FAIL  {name}: {detail}")
+        return
     print(f"  PASS  {name}")
 
 
@@ -113,6 +126,32 @@ def main():
     )
     ctx = PluginContext(manifest, manager)
     ambient.register(ctx)
+    recall_plugin = os.environ.get("HERMES_RECALL_PLUGIN")
+    recall_requests, persistable = {}, []
+    if recall_plugin:
+        recall_spec = importlib.util.spec_from_file_location("coupled_recall_fixture", recall_plugin)
+        recall = importlib.util.module_from_spec(recall_spec)
+        recall_spec.loader.exec_module(recall)
+        recall._available = lambda: True
+        recall._cfg = lambda: {"speaker_scoped": True}
+        recall._run = lambda args, cap: {
+            "id:101": "ALICE_PRIVATE_RECALL", "id:202": "BOB_PRIVATE_RECALL"
+        }.get(args[-1], "")
+        stage, inject = recall.on_pre_llm_call, recall.on_llm_request
+
+        def capture_stage(**kwargs):
+            result = stage(**kwargs)
+            persistable.append(result)
+            return result
+
+        def capture_request(**kwargs):
+            result = inject(**kwargs)
+            recall_requests[kwargs.get("turn_id")] = repr(result or kwargs.get("request"))
+            return result
+
+        recall.on_pre_llm_call = capture_stage
+        recall.on_llm_request = capture_request
+        recall.register(ctx)
     old_manager = plugins_mod._plugin_manager
     plugins_mod._plugin_manager = manager
     old_cfg = ambient._image_gate_cfg
@@ -136,7 +175,11 @@ def main():
         gate, _ = plugins_mod._dispatch_pre_tool_call_hooks(
             "image_generate", {"prompt": "x"}, turn_id=f"runner-{source.message_id}"
         )
-        observed[source.message_id] = {"request": request, "gate": gate}
+        observed[source.message_id] = {
+            "request": request, "gate": gate,
+            "framework_user": session_context.get_session_env("HERMES_SESSION_USER_ID"),
+            "framework_key": session_context.get_session_env("HERMES_SESSION_KEY"),
+        }
         if source.message_id == "1" and not kwargs.get("_interrupt_depth"):
             # Match gateway admission: the second dispatch returns after enqueue,
             # before the first run recurses into the pending event's own turn.
@@ -256,6 +299,53 @@ def main():
             "missing inbound identity", "", [], anchor_only_source, "shared-session",
             session_key="shared-session", event_message_id="3",
         ))
+        delayed = Message(80, Author(101, "alice"), channel_a, "queued for a long turn")
+        adapter._prepare_turn_context(delayed)
+        delayed_source = SessionSource(
+            platform=Platform.DISCORD, chat_id="10", user_id="101", message_id="80")
+        clock = ambient.time.monotonic
+        with mock.patch.object(ambient.time, "monotonic", side_effect=lambda: clock() + 3600):
+            asyncio.run(run_at_real_boundary(delayed, delayed_source))
+
+        no_key = Message(81, Author(101, "alice"), channel_a, "keep the session key")
+        adapter._prepare_turn_context(no_key)
+        key_token = session_context._VAR_MAP["HERMES_SESSION_KEY"].set("kept-session")
+        try:
+            asyncio.run(runner._run_agent(
+                no_key.content, "", [], SessionSource(
+                    platform=Platform.DISCORD, chat_id="10", user_id="101", message_id="81"),
+                "shared-session"))
+        finally:
+            key_token.var.reset(key_token)
+
+        cancelled = Message(82, Author(101, "alice"), channel_a, "accepted before cancellation")
+        cancelled_source = SessionSource(
+            platform=Platform.DISCORD, chat_id="10", user_id="101", message_id="82")
+        original_dispatch = discord_adapter.DiscordAdapter._dispatch_discord_message
+        async def enqueue_then_cancel(_self, message):
+            runner._enqueue_fifo("shared-session", discord_adapter.MessageEvent(
+                text=message.content, source=cancelled_source,
+                message_id=str(message.id), raw_message=message), adapter)
+            raise asyncio.CancelledError()
+        discord_adapter.DiscordAdapter._dispatch_discord_message = enqueue_then_cancel
+        try:
+            try:
+                asyncio.run(adapter._dispatch_stock_with_turn_context(cancelled))
+            except asyncio.CancelledError:
+                pass
+        finally:
+            discord_adapter.DiscordAdapter._dispatch_discord_message = original_dispatch
+        pending = _dequeue_pending_event(adapter, "shared-session")
+        assert pending is not None
+        asyncio.run(run_at_real_boundary(cancelled, pending.source))
+
+        with mock.patch("gateway.run.GatewayRunner", None):
+            ambient._install_gateway_turn_scope()
+            broken_gate, _ = plugins_mod._dispatch_pre_tool_call_hooks(
+                "image_generate", {"prompt": "x"}, turn_id="runner-1")
+        ambient._install_gateway_turn_scope()
+        observed["binding-error"] = {"gate": broken_gate}
+
         presence["speaker_identity"] = False
         old_dispatch = discord_adapter.DiscordAdapter._dispatch_discord_message
         old_recovered = discord_adapter.DiscordAdapter._dispatch_recovered_message
@@ -348,6 +438,16 @@ def main():
         wire = repr(observed[message_id]["request"])
         check(f"verified turn {message_id} authorizes with speaker tags disabled",
               observed[message_id]["gate"] is None and "[speaker " not in wire, wire)
+    check("long queued wait retains exact turn authorization", observed["80"]["gate"] is None)
+    check("accepted event survives transport cancellation", observed["82"]["gate"] is None)
+    check("unbound ambient context does not erase framework user identity",
+          observed["99"]["framework_user"] == "101", observed["99"]["framework_user"])
+    check("omitted session key preserves the existing binding",
+          observed["81"]["framework_key"] == "kept-session", observed["81"]["framework_key"])
+    check("binding failure is an availability refusal, not user denial",
+          isinstance(observed["binding-error"]["gate"], str)
+          and "identity binding" in observed["binding-error"]["gate"].lower(),
+          repr(observed["binding-error"]["gate"]))
 
     # No verified actor for a new turn must clear, not inherit, authorization.
     plugins_mod._plugin_manager = manager
@@ -375,6 +475,40 @@ def main():
     rendered = "\n".join(rows)
     check("admitted public cross-guild travel remains visible", "Guild B" in rendered and "PUBLIC_SENTINEL" in rendered, rendered)
     check("private and unadmitted travel stay absent", "PRIVATE_SENTINEL" not in rendered and "UNADMITTED_SENTINEL" not in rendered, rendered)
+    restricted = Channel(400, "staff-private", guild_a)
+    restricted.visible_to_everyone = False
+    restricted_message = Message(400, Author(101, "alice"), restricted, "PRIVATE_ROLE_SENTINEL")
+    adapter._remember_room_talk(restricted_message)
+    adapter._travel_admit(restricted_message)
+    restricted_lane = adapter._travel_lanes.get("400")
+    if restricted_lane is not None:
+        adapter._travel_close_lane("400", restricted_lane, ambient.time.time(), "quiet")
+    projected = "\n".join(adapter._travel_rows(alice))
+    check("role-restricted guild source never projects as public",
+          "staff-private" not in projected and "PRIVATE_ROLE_SENTINEL" not in projected,
+          projected)
+
+    private_thread = Channel(401, "private-thread", guild_a)
+    private_thread.is_private = lambda: True
+    adapter._travel_admit(Message(401, Author(101, "alice"), private_thread, "thread secret"))
+    lane = adapter._travel_lanes.get("401")
+    if lane is not None:
+        adapter._travel_close_lane("401", lane, ambient.time.time(), "quiet")
+    check("private thread never projects through public parent permissions",
+          "private-thread" not in "\n".join(adapter._travel_rows(alice)))
+
+    public_send = Channel(410, "public-self-start", guild_a)
+    private_send = Channel(411, "private-self-start", guild_a)
+    private_send.visible_to_everyone = False
+    adapter._client.get_channel = lambda cid: {410: public_send, 411: private_send}.get(cid)
+    for cid in (410, 411):
+        adapter._travel_spoke(str(cid))
+        lane = adapter._travel_lanes[str(cid)]
+        adapter._travel_close_lane(str(cid), lane, ambient.time.time(), "quiet")
+    projected = "\n".join(adapter._travel_rows(alice))
+    check("own public send admits presence without admitting a private send",
+          "public-self-start" in projected and "private-self-start" not in projected, projected)
+
     presence["travel_log"]["channels"] = ["10"]
     excluded = Message(100, Author(101, "alice"), Channel(11, "excluded", guild_a), "work")
     excluded_bundle = adapter._prepare_turn_context(excluded)
@@ -392,6 +526,20 @@ def main():
             {"room_context": f"line {channel_number}\nother {channel_number}"},
         )
     check("channel echo map stays bounded", len(adapter._room_echo) == 128, len(adapter._room_echo))
+    if recall_plugin:
+        check("coupled recall returns no persistable hook context",
+              bool(persistable) and all(value is None for value in persistable))
+        check("coupled first turn recalls only Alice",
+              "ALICE_PRIVATE_RECALL" in recall_requests["runner-1"]
+              and "BOB_PRIVATE_RECALL" not in recall_requests["runner-1"])
+        check("coupled queued turn recalls only Bob",
+              "BOB_PRIVATE_RECALL" in recall_requests["runner-2"]
+              and "ALICE_PRIVATE_RECALL" not in recall_requests["runner-2"])
+        check("coupled unbound turns withhold recalled facts",
+              all("PRIVATE_RECALL" not in recall_requests[turn]
+                  for turn in ("runner-99", "runner-None")))
+    if FAILURES:
+        raise AssertionError("; ".join(FAILURES))
     print("turn privacy regression passed")
 
 
