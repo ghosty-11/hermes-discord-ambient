@@ -60,13 +60,14 @@ def main():
 
     try:
         refused = dispatch("99")
+        refused_calls = len(calls)
         allowed = dispatch("42")
     finally:
         plugins_mod._plugin_manager = old_manager
         ambient._image_gate_cfg = old_cfg
 
     check("unauthorized image call is visibly refused", isinstance(refused, str), repr(refused))
-    check("unauthorized image call never reaches backend", len(calls) == 1, repr(calls))
+    check("unauthorized image call never reaches backend", refused_calls == 0, repr(calls))
     check("allowed speaker reaches recorder backend", allowed is None and len(calls) == 1, repr((allowed, calls)))
     if FAILURES:
         raise SystemExit(f"{len(FAILURES)} failure(s): {', '.join(FAILURES)}")
