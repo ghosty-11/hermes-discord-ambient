@@ -53,7 +53,7 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 | **Media URL isolation** | zero | Prose first, each media URL as its own bare message so Discord renders it clean. |
 | **Mention resolution** | usually zero | Known unambiguous `@display-name` → `<@id>`, at channel scope first and guild scope second (a person met in one channel is pingable across the guild). Collisions stay plain text. Channel history is re-observed after `text_hygiene.mention_rescan_seconds` so newcomers become pingable on a long-lived gateway. |
 | **Slash-command policy** | zero | Restrict `/model`, `/reset`, … to listed channels/users. Chat is untouched. |
-| **Image gate** | zero | `pre_tool_call` refuse of `image_generate` unless the speaker is allow-listed. Fails closed. |
+| **Image gate** | zero | The registered `pre_tool_call` hook returns Hermes' canonical `{"action": "block", "message": "…"}` directive for `image_generate` unless the speaker is allow-listed. The framework resolver blocks the call before the provider is invoked; unknown speakers fail closed. |
 | **Voice hygiene** | zero | Kaomoji stripped from speech only. `voice_only_replies` drops the text twin (45s tool-path window, consume-once, reply-anchored). |
 | **Quiet resume** | zero | Request-only: do not announce a gateway restart into a public room. |
 
@@ -316,7 +316,16 @@ id as a request-only prefix.
 - Gate slash commands (`slash_commands` here **and** Hermes `allow_admin_from` —
   unset means everyone is admin).
 - Point `home_channel` and `system_notices.reroute_channel` at a private channel.
-- Gate `image_generate` with `image_gen_gate`. Fails closed on an unknown speaker.
+- Gate `image_generate` with `image_gen_gate`. Its `pre_tool_call` directive is resolved by Hermes before the provider runs, and an unknown speaker fails closed.
+
+### Image-generation gate
+
+`image_gen_gate` is enforced at Hermes' `pre_tool_call` resolver boundary, not by
+prompt instructions. When enabled, the hook allows only IDs in `allowed_users` and
+returns the canonical Hermes directive `{"action": "block", "message": "…"}` for
+every other speaker (including an unknown speaker). The resolver turns that directive
+into the visible refusal and stops `image_generate` before the image provider is
+called. When disabled, the profile retains the framework's normal image behavior.
 
 ### 6. Presence and rare sparks
 
@@ -359,7 +368,7 @@ bug, not a style choice.
 - **One check-in per pass.** `channels: ["*"]` changes where a check-in may happen, never
   how often.
 - **Standby delays, never mutes.** A busy-probe failure answers "not busy".
-- **Image gate fails closed.** Unknown speaker → refuse, before the provider is called.
+- **Image gate is resolver-enforced.** Unknown speaker → the hook returns Hermes' canonical block directive, and the framework refuses the call before the provider is invoked.
 - **GIF state is per profile.** Pending URL and rate limits do not cross seats.
 - **Last-seen, catch-up budgets and travel-log state are keyed on the bot's Discord
   user id**, because under multiplex `HERMES_HOME` is root's for every profile.

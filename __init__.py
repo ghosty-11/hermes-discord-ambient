@@ -6038,8 +6038,8 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, **_: Any):
     reason = "speaker unknown" if not speaker else f"speaker id:{speaker} not allowed"
     logger.info("ambient.image_gate: refused %s (%s)", tool_name, reason)
     return {
-        "decision": "block",
-        "reason": (
+        "action": "block",
+        "message": (
             "Image generation is not available to this user. Say so plainly and "
             "briefly, offer nothing else, and do not retry."
         ),
