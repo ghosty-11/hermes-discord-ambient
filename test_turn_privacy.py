@@ -472,6 +472,10 @@ def main():
           and observed["84"]["framework_message"] == "84", observed["84"]["framework_message"])
     check("dedup-refused redelivery cannot strand a queued turn",
           observed["90"]["gate"] is None, repr(observed["90"]["gate"]))
+    anchor_wire = repr(observed[None]["request"])
+    check("reply anchor turn receives no retained private context",
+          "[speaker " not in anchor_wire and "dm" not in anchor_wire.lower(),
+          anchor_wire[:200])
     check("binding failure is an availability refusal, not user denial",
           isinstance(observed["binding-error"]["gate"], str)
           and "identity binding" in observed["binding-error"]["gate"].lower(),

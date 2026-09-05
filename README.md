@@ -527,7 +527,8 @@ venv/bin/python /path/to/hermes-discord-ambient/test_lifecycle_embed_media.py
 venv/bin/python /path/to/hermes-discord-ambient/test_voice_only.py
 venv/bin/python /path/to/hermes-discord-ambient/test_config_and_persistence.py
 venv/bin/python /path/to/hermes-discord-ambient/test_room_context.py
-venv/bin/python /path/to/hermes-discord-ambient/test_travel_log.py
+venv/bin/python /path/to/hermes-discord-ambient/test_image_gate.py
+venv/bin/python /path/to/hermes-discord-ambient/test_turn_privacy.py
 ```
 
 `test_turn_privacy.py` exercises the real gateway turn wrapper, queue helpers,
