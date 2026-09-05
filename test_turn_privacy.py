@@ -179,6 +179,7 @@ def main():
             "request": request, "gate": gate,
             "framework_user": session_context.get_session_env("HERMES_SESSION_USER_ID"),
             "framework_key": session_context.get_session_env("HERMES_SESSION_KEY"),
+            "framework_message": session_context.get_session_env("HERMES_SESSION_MESSAGE_ID"),
         }
         if source.message_id == "1" and not kwargs.get("_interrupt_depth"):
             # Match gateway admission: the second dispatch returns after enqueue,
@@ -299,6 +300,13 @@ def main():
             "missing inbound identity", "", [], anchor_only_source, "shared-session",
             session_key="shared-session", event_message_id="3",
         ))
+        conflict = Message(84, Author(101, "alice"), channel_a, "conflicting inbound id")
+        adapter._prepare_turn_context(conflict)
+        asyncio.run(runner._run_agent(
+            conflict.content, "", [], SessionSource(
+                platform=Platform.DISCORD, chat_id="10", user_id="101", message_id="84"),
+            "shared-session", inbound_message_id="85"))
+
         delayed = Message(80, Author(101, "alice"), channel_a, "queued for a long turn")
         adapter._prepare_turn_context(delayed)
         delayed_source = SessionSource(
@@ -444,6 +452,9 @@ def main():
           observed["99"]["framework_user"] == "101", observed["99"]["framework_user"])
     check("omitted session key preserves the existing binding",
           observed["81"]["framework_key"] == "kept-session", observed["81"]["framework_key"])
+    check("conflicting ids deny private authority without erasing source metadata",
+          isinstance(observed["84"]["gate"], str)
+          and observed["84"]["framework_message"] == "84", observed["84"]["framework_message"])
     check("binding failure is an availability refusal, not user denial",
           isinstance(observed["binding-error"]["gate"], str)
           and "identity binding" in observed["binding-error"]["gate"].lower(),

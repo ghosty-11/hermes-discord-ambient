@@ -6332,7 +6332,7 @@ def _install_gateway_turn_scope() -> None:
                 "HERMES_SESSION_USER_ID_ALT": str(getattr(source, "user_id_alt", "") or ""),
                 "HERMES_SESSION_USER_NAME": str(getattr(source, "user_name", "") or ""),
                 "HERMES_SESSION_SCOPE_ID": str(getattr(source, "scope_id", "") or ""),
-                "HERMES_SESSION_MESSAGE_ID": message_id,
+                "HERMES_SESSION_MESSAGE_ID": source_message_id or inbound_message_id,
                 "HERMES_SESSION_PROFILE": str(getattr(source, "profile", "") or ""),
             }
             supplied_key = kwargs.get("session_key", args[5] if len(args) > 5 else None)

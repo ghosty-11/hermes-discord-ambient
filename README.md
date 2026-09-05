@@ -65,6 +65,11 @@ is not an inbound identity. Accepted queued bundles survive dispatch return and
 transport cancellation. Exact-key consumption prevents reuse by later messages;
 the 512-entry least-recently-used bound limits storage without expiring a bundle
 while it waits behind a long turn. Exhausting that bound can withhold old context.
+On a quiet profile, unconsumed bundle content can remain in process memory until
+consumption, eviction or shutdown; the bound limits capacity, not retention time.
+Travel visibility is classified at admission, not continuously monitored.
+Later permission changes do not revoke existing records automatically; normal
+32-hour closed-beat retention still applies.
 
 The process wrapper dispatches through each adapter's own callback so
 profile-qualified plugin imports keep their own context. It binds a task-local
