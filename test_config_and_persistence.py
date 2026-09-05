@@ -195,7 +195,7 @@ def check_image_authorization_is_dispatch_scoped():
     )
     check(
         "the next unauthorized author cannot inherit authorization",
-        isinstance(decisions[1], dict) and decisions[1].get("decision") == "block",
+        isinstance(decisions[1], dict) and decisions[1].get("action") == "block",
         repr(decisions[1]),
     )
     check(
