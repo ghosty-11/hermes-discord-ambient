@@ -306,6 +306,21 @@ def main():
             conflict.content, "", [], SessionSource(
                 platform=Platform.DISCORD, chat_id="10", user_id="101", message_id="84"),
             "shared-session", inbound_message_id="85"))
+        redelivered = Message(90, Author(101, "alice"), channel_a, "redelivered while queued")
+        adapter._prepare_turn_context(redelivered)
+        refuse_dispatch = discord_adapter.DiscordAdapter._dispatch_discord_message
+
+        async def dedup_refuses(_self, _message):
+            return False
+
+        discord_adapter.DiscordAdapter._dispatch_discord_message = dedup_refuses
+        try:
+            asyncio.run(adapter._dispatch_stock_with_turn_context(redelivered))
+        finally:
+            discord_adapter.DiscordAdapter._dispatch_discord_message = refuse_dispatch
+        asyncio.run(run_at_real_boundary(redelivered, SessionSource(
+            platform=Platform.DISCORD, chat_id="10", user_id="101", message_id="90")))
+
 
         delayed = Message(80, Author(101, "alice"), channel_a, "queued for a long turn")
         adapter._prepare_turn_context(delayed)
@@ -455,6 +470,8 @@ def main():
     check("conflicting ids deny private authority without erasing source metadata",
           isinstance(observed["84"]["gate"], str)
           and observed["84"]["framework_message"] == "84", observed["84"]["framework_message"])
+    check("dedup-refused redelivery cannot strand a queued turn",
+          observed["90"]["gate"] is None, repr(observed["90"]["gate"]))
     check("binding failure is an availability refusal, not user denial",
           isinstance(observed["binding-error"]["gate"], str)
           and "identity binding" in observed["binding-error"]["gate"].lower(),

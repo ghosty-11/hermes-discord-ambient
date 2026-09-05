@@ -2685,7 +2685,12 @@ class AmbientDiscordAdapter(DiscordAdapter):
         if not message_id:
             return bundle
         with self._prepared_turn_lock:
-            self._prepared_turns[message_id] = bundle
+            # A redelivery must not replace the bundle a queued turn still
+            # waits on: dedup refuses the duplicate and the discard that
+            # follows is identity-checked against THIS fresh bundle, so the
+            # stored original survives and the queued turn stays bound.
+            if message_id not in self._prepared_turns:
+                self._prepared_turns[message_id] = bundle
             self._prepared_turns.move_to_end(message_id)
             while len(self._prepared_turns) > _TURN_SCOPE_LIMIT:
                 self._prepared_turns.popitem(last=False)
