@@ -40,12 +40,12 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 | **Fallback-notice routing** | zero | Parses both framework fallback formats for standby. Sends the notice to `system_notices.reroute_channel` when configured; otherwise `suppress_fallback_notice` drops it. |
 | **Group-address greetings** | 1 inference when it answers | "good morning agents" / "hello everyone" at its own probability and cooldown, exempt from the daily cap. |
 | **System-notice rerouting** | zero | Compression, provider, fallback, reset and cron diagnostics go to a private channel. Drain and stall notices can be rewritten in-character. Routine progress plumbing is dropped. |
-| **Speaker identity** | zero | Request-only `[speaker @handle id:123]` so memory can key on a stable id. Not written onto the persisted user turn. |
-| **Room context** | zero | Request-only `[ambient room: …]` — server, channel, topic, thread, optional operator notes per guild and per channel — plus a roster of recently-present people and the last few lines of room talk with reply refs (`→ @author`; the bot's own messages ride as `you`, so a populated buffer preserves its side of the conversation across sessions — with `persist_room_talk` on it survives restarts from disk; otherwise it repopulates via live traffic or eligible catch-up). Never written onto the persisted user turn; echoing it back is suppressed like the catch-up transcript. |
+| **Speaker identity** | zero | Request-only `[speaker @handle id:123]` so memory can key on a stable id. Queued messages bind the verified framework `sender_id` to the actual `turn_id`; missing identity clears the scope instead of inheriting another speaker. Not written onto the persisted user turn. |
+| **Room context** | zero | Request-only `[ambient room: …]` — server, channel, topic, thread, optional operator notes per guild and per channel — plus a roster of recently-present people and the last few lines of room talk with reply refs (`→ @author`; the bot's own messages ride as `you`, so a populated buffer preserves its side of the conversation across sessions — with `persist_room_talk` on it survives restarts from disk; otherwise it repopulates via live traffic or eligible catch-up). Bound to the actual `turn_id`, never written onto the persisted user turn; echo suppression is scoped to the destination channel. |
 | **Speaker boost** | zero | Per-user overrides of probability / cooldown / daily cap. Cooldown is the load-bearing half. |
 | **Conversation window** | zero | Messages in the bot's wake get a high response chance, bounded by both count and elapsed time. |
 | **Catch-up** | zero per scan; 1 inference on a check-in | Timer scanner. Hands **one** real message to the normal ambient path with a transcript. Same budget as reactive joins. |
-| **Travel log** | zero inference | Durable 32h cross-space visit record; idle-based beats (her participation or the room's life keep a visit open; both quiet, or she stops joining for `lurk_max_minutes`, closes it); projected request-only so she narrates her own continuity. `travel_log.channels` scopes every touch point — inbound observation, her own sends (cron deliveries included), and which turns get the projection — to an allowlist of channel ids; absent means everywhere. |
+| **Travel log** | zero inference | Durable 32h cross-space visits, admitted by handled input or the bot's own public send. Cached permissions must show that all guild members can view the source; direct messages, private threads, role-restricted channels and unknown visibility are excluded. Quotes require per-message admission evidence, retained with the lane across restarts. `travel_log.channels` further scopes admission and projection; passive observation alone does not admit a source. |
 | **Gateway lifecycle** | at most 1 background inference | Independent rolls for private return, cached departure, optional public return. Reconnects stay quiet. |
 | **Rich-embed video** | local STT; video inference only when used | Discord-proxied `video/*` only (`images-ext-*.discordapp.net`). Stock size limits apply. |
 | **Compaction focus** | zero | Standing `focus_topic` for social summaries. Unset leaves stock behaviour. |
@@ -53,9 +53,34 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 | **Media URL isolation** | zero | Prose first, each media URL as its own bare message so Discord renders it clean. |
 | **Mention resolution** | usually zero | Known unambiguous `@display-name` → `<@id>`, at channel scope first and guild scope second (a person met in one channel is pingable across the guild). Collisions stay plain text. Channel history is re-observed after `text_hygiene.mention_rescan_seconds` so newcomers become pingable on a long-lived gateway. |
 | **Slash-command policy** | zero | Restrict `/model`, `/reset`, … to listed channels/users. Chat is untouched. |
-| **Image gate** | zero | The registered `pre_tool_call` hook returns Hermes' canonical `{"action": "block", "message": "…"}` directive for `image_generate` unless the speaker is allow-listed. The framework resolver blocks the call before the provider is invoked; unknown speakers fail closed. |
+| **Image gate** | zero | The registered `pre_tool_call` hook returns Hermes' canonical `{"action": "block", "message": "…"}` directive for `image_generate` unless the speaker bound to that exact `turn_id` is allow-listed. The framework resolver blocks the call before the provider is invoked; missing or unknown turn identity fails closed. |
 | **Voice hygiene** | zero | Kaomoji stripped from speech only. `voice_only_replies` drops the text twin (45s tool-path window, consume-once, reply-anchored). |
 | **Quiet resume** | zero | Request-only: do not announce a gateway restart into a public room. |
+
+## Turn identity boundary
+
+The plugin scopes each `GatewayRunner._run_agent` invocation, including queued
+recursion, using its current source and exact inbound message id. A reply anchor
+is not an inbound identity. Accepted queued bundles survive dispatch return and
+transport cancellation. Exact-key consumption prevents reuse by later messages;
+the 512-entry least-recently-used bound limits storage without expiring a bundle
+while it waits behind a long turn. Exhausting that bound can withhold old context.
+On a quiet profile, unconsumed bundle content can remain in process memory until
+consumption, eviction or shutdown; the bound limits capacity, not retention time.
+Travel visibility is classified at admission, not continuously monitored.
+Later permission changes do not revoke existing records automatically; normal
+32-hour closed-beat retention still applies.
+
+The process wrapper dispatches through each adapter's own callback so
+profile-qualified plugin imports keep their own context. It binds a task-local
+`gateway.session_context._ambient_turn_identity` attestation for the matching
+memory-recall plugin and restores it on return. Missing attestation withholds
+Discord recall; cached sender fields and environment variables cannot supply it.
+Deploy the matching ambient and memory-policy revisions together before the
+separately approved gateway restart. No framework source file is modified.
+Failed binding installation leaves the image gate fail-closed with an explicit
+availability reason. Framework session identity remains distinct from private
+context authorization; the attestation, not blank identity fields, carries proof.
 
 ## Why this seam
 
@@ -503,6 +528,17 @@ venv/bin/python /path/to/hermes-discord-ambient/test_voice_only.py
 venv/bin/python /path/to/hermes-discord-ambient/test_config_and_persistence.py
 venv/bin/python /path/to/hermes-discord-ambient/test_room_context.py
 venv/bin/python /path/to/hermes-discord-ambient/test_travel_log.py
+```
+
+`test_turn_privacy.py` exercises the real gateway turn wrapper, queue helpers,
+profile-qualified plugin loading, hooks and request middleware with local recorders.
+It creates temporary homes and denies network connections. From this checkout,
+include the matching recall plugin to check the cross-module attestation contract:
+
+```bash
+env HERMES_FRAMEWORK_PATH=/path/to/hermes-agent \
+  HERMES_RECALL_PLUGIN=/path/to/memory-recall/__init__.py \
+  /path/to/hermes-agent/venv/bin/python test_turn_privacy.py
 ```
 
 ## Support development
