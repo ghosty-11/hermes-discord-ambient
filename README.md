@@ -57,6 +57,22 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 | **Voice hygiene** | zero | Kaomoji stripped from speech only. `voice_only_replies` drops the text twin (45s tool-path window, consume-once, reply-anchored). |
 | **Quiet resume** | zero | Request-only: do not announce a gateway restart into a public room. |
 
+## Turn identity boundary
+
+The plugin scopes each `GatewayRunner._run_agent` invocation, including queued
+recursion, using its current source and exact inbound message id. A reply anchor
+is not an inbound identity. Accepted queued bundles survive dispatch return;
+exact-key consumption and bounded expiry prevent an unused command bundle from
+being reused by a later message.
+
+The process wrapper dispatches through each adapter's own callback so
+profile-qualified plugin imports keep their own context. It binds a task-local
+`gateway.session_context._ambient_turn_identity` attestation for the matching
+memory-recall plugin and restores it on return. Missing attestation withholds
+Discord recall; cached sender fields and environment variables cannot supply it.
+Deploy the matching ambient and memory-policy revisions together before the
+separately approved gateway restart. No framework source file is modified.
+
 ## Why this seam
 
 `require_mention` is enforced **twice, independently**: in `_discord_message_admission`

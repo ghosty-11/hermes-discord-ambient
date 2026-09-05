@@ -143,71 +143,6 @@ def check_name_triggers_are_normalized_and_bounded():
     )
 
 
-def check_image_authorization_is_dispatch_scoped():
-    print("\n-- image authorization uses the current author, not speaker presentation --")
-    original_cfg = ambient._image_gate_cfg
-    original_recovered = discord_adapter.DiscordAdapter._dispatch_recovered_message
-    ambient._image_gate_cfg = lambda: {
-        "enabled": True,
-        "allowed_users": ["42"],
-    }
-    decisions = []
-
-    async def inspect(message):
-        decisions.append(
-            ambient._on_pre_tool_call("image_generate", {"prompt": "test"})
-        )
-        return True
-
-    async def exercise():
-        adapter = make_adapter({"speaker_identity": False})
-        adapter._dispatch_inner = inspect
-        await adapter._dispatch_discord_message(message_in(1, author_id=42))
-        await adapter._dispatch_discord_message(message_in(1, author_id=99))
-
-        async def recovered(_self, _message):
-            decisions.append(
-                ambient._on_pre_tool_call("image_generate", {"prompt": "test"})
-            )
-            return True
-
-        discord_adapter.DiscordAdapter._dispatch_recovered_message = recovered
-        adapter._bounce_pre_dispatch = lambda message: None
-
-        async def no_wait(message):
-            return False
-
-        adapter._standby_wait = no_wait
-        await adapter._dispatch_recovered_message(message_in(1, author_id=42))
-
-    token = ambient._current_speaker_id.set("")
-    try:
-        asyncio.run(exercise())
-    finally:
-        ambient._current_speaker_id.reset(token)
-        ambient._image_gate_cfg = original_cfg
-        discord_adapter.DiscordAdapter._dispatch_recovered_message = original_recovered
-
-    check(
-        "an allowed author is authorized with speaker tags disabled",
-        decisions[0] is None,
-        repr(decisions[0]),
-    )
-    check(
-        "the next unauthorized author cannot inherit authorization",
-        isinstance(decisions[1], dict) and decisions[1].get("action") == "block",
-        repr(decisions[1]),
-    )
-    check(
-        "recovered dispatch authorizes independently of speaker tags",
-        decisions[2] is None,
-        repr(decisions[2]),
-    )
-    check(
-        "authorization identity is cleared after dispatch",
-        ambient._current_speaker_id.get("") == "",
-        repr(ambient._current_speaker_id.get("")),
-    )
 
 
 def check_last_seen_is_per_bot():
@@ -434,7 +369,6 @@ def check_local_fallback_window_covers_the_local_floor():
 def main():
     check_channel_allowlist()
     check_name_triggers_are_normalized_and_bounded()
-    check_image_authorization_is_dispatch_scoped()
     check_last_seen_is_per_bot()
     check_gif_state_is_per_profile()
     check_gif_state_uses_turn_profile()

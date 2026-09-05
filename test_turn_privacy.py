@@ -25,7 +25,7 @@ import plugins.platforms.discord.adapter as discord_adapter  # noqa: E402
 from hermes_cli import plugins as plugins_mod  # noqa: E402
 from hermes_cli.middleware import apply_llm_request_middleware  # noqa: E402
 from gateway.config import Platform  # noqa: E402
-from gateway.run import GatewayRunner  # noqa: E402
+from gateway.run import GatewayRunner, _dequeue_pending_event  # noqa: E402
 from gateway.session import SessionSource  # noqa: E402
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest  # noqa: E402
 
@@ -120,12 +120,13 @@ def main():
     runner.config = types.SimpleNamespace(multiplex_profiles=False)
     runner.adapters = {Platform.DISCORD: adapter}
     observed = {}
+    adapter._pending_messages = {}
 
     async def fake_run_agent_inner(message, context_prompt, history, source, session_id, **kwargs):
         plugins_mod.invoke_hook(
             "pre_llm_call",
             turn_id=f"runner-{source.message_id}",
-            sender_id="101",
+            sender_id="101", platform="discord",
         )
         request = apply_llm_request_middleware(
             {"messages": [{"role": "user", "content": message}]},
@@ -136,6 +137,18 @@ def main():
             "image_generate", {"prompt": "x"}, turn_id=f"runner-{source.message_id}"
         )
         observed[source.message_id] = {"request": request, "gate": gate}
+        if source.message_id == "1" and not kwargs.get("_interrupt_depth"):
+            # Match gateway admission: the second dispatch returns after enqueue,
+            # before the first run recurses into the pending event's own turn.
+            await adapter._dispatch_stock_with_turn_context(bob)
+            pending = _dequeue_pending_event(adapter, "shared-session")
+            assert pending is not None
+            await runner._run_agent(
+                message=pending.text, context_prompt="", history=[],
+                source=pending.source, session_id="shared-session",
+                session_key="shared-session", _interrupt_depth=1,
+                event_message_id=pending.message_id,
+            )
         return {"final_response": "ok"}
 
     runner._run_agent_inner = fake_run_agent_inner
@@ -157,10 +170,29 @@ def main():
     )
     import asyncio
     try:
-        adapter._prepare_turn_context(alice)
-        asyncio.run(run_at_real_boundary(alice, alice_source))
-        adapter._prepare_turn_context(bob)
-        asyncio.run(run_at_real_boundary(bob, bob_source))
+        original_dispatch = discord_adapter.DiscordAdapter._dispatch_discord_message
+
+        async def admitted_dispatch(_self, message):
+            if message.id == alice.id:
+                await run_at_real_boundary(message, alice_source)
+                plugins_mod.invoke_hook(
+                    "pre_llm_call", turn_id="after-return", sender_id="101", platform="discord")
+                gate, _ = plugins_mod._dispatch_pre_tool_call_hooks(
+                    "image_generate", {"prompt": "x"}, turn_id="after-return")
+                observed["after-return"] = {"gate": gate}
+            else:
+                event = discord_adapter.MessageEvent(
+                    text=message.content, source=bob_source,
+                    message_id=str(message.id), raw_message=message,
+                )
+                runner._enqueue_fifo("shared-session", event, adapter)
+            return True
+
+        discord_adapter.DiscordAdapter._dispatch_discord_message = admitted_dispatch
+        try:
+            asyncio.run(adapter._dispatch_stock_with_turn_context(alice))
+        finally:
+            discord_adapter.DiscordAdapter._dispatch_discord_message = original_dispatch
 
         original_dispatch = discord_adapter.DiscordAdapter._dispatch_discord_message
         async def handled_command(_self, _message):
@@ -214,6 +246,65 @@ def main():
             "no bundle", "", [], missing_source, "shared-session",
             session_key="shared-session", inbound_message_id="99",
         ))
+        # A reply anchor is not the id of the incoming message. It must not
+        # consume a retained private command's bundle as current authorization.
+        anchor_only_source = SessionSource(
+            platform=Platform.DISCORD, chat_id="10", chat_type="channel",
+            user_id="101", scope_id="1",
+        )
+        asyncio.run(runner._run_agent(
+            "missing inbound identity", "", [], anchor_only_source, "shared-session",
+            session_key="shared-session", event_message_id="3",
+        ))
+        presence["speaker_identity"] = False
+        old_dispatch = discord_adapter.DiscordAdapter._dispatch_discord_message
+        old_recovered = discord_adapter.DiscordAdapter._dispatch_recovered_message
+
+        async def unlabelled_dispatch(_self, message):
+            source = SessionSource(
+                platform=Platform.DISCORD, chat_id="10", chat_type="channel",
+                user_id=str(message.author.id), message_id=str(message.id))
+            await run_at_real_boundary(message, source)
+            return True
+
+        discord_adapter.DiscordAdapter._dispatch_discord_message = unlabelled_dispatch
+        discord_adapter.DiscordAdapter._dispatch_recovered_message = unlabelled_dispatch
+        try:
+            asyncio.run(adapter._dispatch_stock_with_turn_context(
+                Message(77, Author(101, "alice"), channel_a, "without a speaker tag")))
+            asyncio.run(adapter._dispatch_recovered_with_turn_context(
+                Message(78, Author(101, "alice"), channel_a, "recovered without a tag")))
+        finally:
+            discord_adapter.DiscordAdapter._dispatch_discord_message = old_dispatch
+            discord_adapter.DiscordAdapter._dispatch_recovered_message = old_recovered
+            presence["speaker_identity"] = True
+
+        second_manager = PluginManager(
+            scope_key=os.path.join(os.environ["HERMES_HOME"], "second-profile"))
+        second_manifest = PluginManifest(
+            name="ambient-turn-test", key="ambient-turn-test",
+            path=os.path.dirname(PLUGIN),
+            provides_hooks=["pre_llm_call", "pre_tool_call"],
+        )
+        second_module = second_manager._load_directory_module(second_manifest)
+        second_module.register(PluginContext(second_manifest, second_manager))
+        second_module._image_gate_cfg = ambient._image_gate_cfg
+        second_adapter = second_module.AmbientDiscordAdapter(
+            types.SimpleNamespace(extra={"ambient_presence": presence}))
+        second_adapter._client = types.SimpleNamespace(user=Author(888, "other-agent"))
+        second_message = Message(88, Author(202, "bob"), channel_a, "second profile")
+        second_adapter._prepare_turn_context(second_message)
+        second_source = SessionSource(
+            platform=Platform.DISCORD, chat_id="10", chat_type="channel",
+            user_id="202", scope_id="1", message_id="88",
+        )
+        plugins_mod._plugin_manager = second_manager
+        runner._adapter_for_source = lambda source: second_adapter
+        try:
+            asyncio.run(run_at_real_boundary(second_message, second_source))
+        finally:
+            plugins_mod._plugin_manager = manager
+            runner._adapter_for_source = lambda source: adapter
     finally:
         ambient._image_gate_cfg = old_cfg
         plugins_mod._plugin_manager = old_manager
@@ -245,6 +336,18 @@ def main():
     check("thread echo binds actual delivery thread", "8008" in adapter._room_echo, repr(adapter._room_echo))
     missing_wire = "\n".join(str(r.get("content", "")) for r in observed["99"]["request"]["messages"])
     check("no-bundle turn withholds private context", "[speaker " not in missing_wire and isinstance(observed["99"]["gate"], str), missing_wire)
+    check("reply anchor cannot substitute for incoming identity",
+          isinstance(observed[None]["gate"], str), repr(observed[None]["gate"]))
+    second_wire = "\n".join(str(row.get("content", ""))
+                            for row in observed["88"]["request"]["messages"])
+    check("profile-qualified plugin import binds its own turn",
+          "id:202" in second_wire, second_wire)
+    check("completed dispatch cannot authorize a later unbound turn",
+          isinstance(observed["after-return"]["gate"], str))
+    for message_id in ("77", "78"):
+        wire = repr(observed[message_id]["request"])
+        check(f"verified turn {message_id} authorizes with speaker tags disabled",
+              observed[message_id]["gate"] is None and "[speaker " not in wire, wire)
 
     # No verified actor for a new turn must clear, not inherit, authorization.
     plugins_mod._plugin_manager = manager

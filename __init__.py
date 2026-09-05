@@ -2722,16 +2722,26 @@ class AmbientDiscordAdapter(DiscordAdapter):
     async def _dispatch_stock_with_turn_context(self, message: Any) -> bool:
         bundle = self._prepare_turn_context(message)
         try:
-            return await super()._dispatch_discord_message(message)
-        finally:
+            handled = await super()._dispatch_discord_message(message)
+        except BaseException:
             self._discard_prepared_turn(bundle)
+            raise
+        if not handled:
+            self._discard_prepared_turn(bundle)
+        # Acceptance can mean queued, not consumed. Exact message keys and the
+        # bounded expiry in _take_prepared_turn prevent orphaned command reuse.
+        return handled
 
     async def _dispatch_recovered_with_turn_context(self, message: Any) -> bool:
         bundle = self._prepare_turn_context(message)
         try:
-            return await super()._dispatch_recovered_message(message)
-        finally:
+            handled = await super()._dispatch_recovered_message(message)
+        except BaseException:
             self._discard_prepared_turn(bundle)
+            raise
+        if not handled:
+            self._discard_prepared_turn(bundle)
+        return handled
 
     async def _dispatch_discord_message(self, message: Any) -> bool:
         token = self._ambient_no_thread_token(message)
@@ -6270,27 +6280,17 @@ def _install_gateway_turn_scope() -> None:
         from gateway.run import GatewayRunner  # type: ignore
         from gateway import session_context as session_ctx  # type: ignore
 
-        original = GatewayRunner._run_agent
-        if getattr(original, "_ambient_turn_scope_wrapper", False):
-            return
+        # One task-local attestation is shared across profile-qualified plugin
+        # imports. Recall reads it directly, never through environment fallback.
+        identity_context = getattr(session_ctx, "_ambient_turn_identity", None)
+        if identity_context is None:
+            identity_context = contextvars.ContextVar("ambient_turn_identity", default=None)
+            session_ctx._ambient_turn_identity = identity_context
 
-        @wraps(original)
-        async def scoped_run_agent(runner, *args, **kwargs):
-            source = kwargs.get("source")
-            if source is None and len(args) > 3:
-                source = args[3]
-            platform = getattr(getattr(source, "platform", None), "value", "")
-            try:
-                adapter = runner._adapter_for_source(source)
-            except Exception:
-                adapter = None
-            if platform != "discord" or not isinstance(adapter, AmbientDiscordAdapter):
-                return await original(runner, *args, **kwargs)
-
+        async def scoped_adapter_run(adapter, original, runner, source, /, *args, **kwargs):
             source_message_id = str(getattr(source, "message_id", "") or "")
             inbound_message_id = str(kwargs.get("inbound_message_id") or "")
-            event_message_id = str(kwargs.get("event_message_id") or "")
-            message_id = source_message_id or inbound_message_id or event_message_id
+            message_id = source_message_id or inbound_message_id
             if (
                 source_message_id
                 and inbound_message_id
@@ -6345,17 +6345,45 @@ def _install_gateway_turn_scope() -> None:
                 "HERMES_SESSION_MESSAGE_ID": message_id if bundle is not None else "",
                 "HERMES_SESSION_PROFILE": str(getattr(source, "profile", "") or ""),
             }
-            session_tokens = [
-                session_ctx._VAR_MAP[name].set(value)
-                for name, value in values.items()
-            ]
+            bindings = [(session_ctx._VAR_MAP[name], value) for name, value in values.items()]
+            session_tokens = [variable.set(value) for variable, value in bindings]
             scope_token = _verified_run_context.set(bundle)
+            identity_token = identity_context.set(
+                (message_id, source_user_id) if bundle is not None else None)
             try:
                 return await original(runner, *args, **kwargs)
             finally:
+                identity_context.reset(identity_token)
                 _verified_run_context.reset(scope_token)
                 for token in reversed(session_tokens):
                     token.var.reset(token)
+
+        # The callback belongs to this import's adapter class and ContextVars.
+        # Capturing the first profile's class in the global wrapper breaks all
+        # later profile-qualified imports of this plugin.
+        AmbientDiscordAdapter._ambient_scoped_gateway_turn = scoped_adapter_run
+        original = GatewayRunner._run_agent
+        if getattr(original, "_ambient_turn_scope_wrapper", False):
+            return
+
+        @wraps(original)
+        async def scoped_run_agent(runner, *args, **kwargs):
+            source = kwargs.get("source")
+            if source is None and len(args) > 3:
+                source = args[3]
+            platform = getattr(getattr(source, "platform", None), "value", "")
+            try:
+                adapter = runner._adapter_for_source(source)
+            except Exception:
+                adapter = None
+            callback = getattr(adapter, "_ambient_scoped_gateway_turn", None)
+            if platform == "discord" and callable(callback):
+                return await callback(original, runner, source, *args, **kwargs)
+            token = identity_context.set(None)
+            try:
+                return await original(runner, *args, **kwargs)
+            finally:
+                identity_context.reset(token)
 
         scoped_run_agent._ambient_turn_scope_wrapper = True
         GatewayRunner._run_agent = scoped_run_agent
@@ -6371,7 +6399,12 @@ def _on_pre_llm_call_turn_scope(**kwargs: Any):
         if not turn_id:
             return None
         bundle = _verified_run_context.get(None)
-        if not isinstance(bundle, dict):
+        from gateway import session_context
+        identity_context = getattr(session_context, "_ambient_turn_identity", None)
+        identity = identity_context.get(None) if identity_context is not None else None
+        if not isinstance(bundle, dict) or identity != (
+            bundle.get("message_id"), bundle.get("speaker_id")
+        ):
             bundle = {
                 "speaker_id": "",
                 "ambient_hint": "",
