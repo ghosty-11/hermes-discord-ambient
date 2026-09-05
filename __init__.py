@@ -171,9 +171,12 @@ import logging
 import os
 import random
 import re
+import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
+from functools import wraps
 from pathlib import Path as _Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse
 
@@ -526,6 +529,17 @@ _room_context: contextvars.ContextVar[str] = contextvars.ContextVar(
 _travel_context: contextvars.ContextVar[str] = contextvars.ContextVar(
     "hermes_ambient_travel_context", default=""
 )
+
+# GatewayRunner._run_agent is the first boundary entered for both an initial
+# Discord turn and every recursive queued turn. Its current SessionSource is
+# authoritative; cached agent identity and inherited outer session variables
+# are not.
+_verified_run_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "ambient_verified_run_context", default=None
+)
+_turn_scopes: OrderedDict[str, dict] = OrderedDict()
+_turn_scopes_lock = threading.Lock()
+_TURN_SCOPE_LIMIT = 512
 
 
 _DEFAULT_HINT = (
@@ -1126,9 +1140,12 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # last time each channel was appended to, for eviction.
         self._room_talk: dict[str, list[tuple]] = {}
         self._room_talk_touched: dict[str, float] = {}
-        # (set_at, the room-context lines most recently handed to the model).
-        # The echo guard reads it in send(); see _room_echo_leak.
-        self._room_echo: tuple[float, set] = (0.0, set())
+        # Delivery channel -> (set_at, lines handed to the model there), LRU.
+        self._room_echo: OrderedDict[str, tuple[float, set]] = OrderedDict()
+        # Exact inbound Discord message id -> immutable prepared bundle, LRU.
+        self._prepared_turns: OrderedDict[str, dict] = OrderedDict()
+        self._prepared_turn_lock = threading.Lock()
+        self._travel_admitted_messages: dict[str, deque[str]] = {}
 
         # Travel log — cross-session presence memory. One OPEN lane per
         # channel she is present in, one CLOSED beat per finished visit.
@@ -2628,17 +2645,99 @@ class AmbientDiscordAdapter(DiscordAdapter):
         except Exception:
             return None
 
+    def _raw_message_is_direct(self, message: Any) -> bool:
+        channel = getattr(message, "channel", None)
+        source = SimpleNamespace(
+            chat_type="dm" if getattr(channel, "guild", None) is None else "group"
+        )
+        event = SimpleNamespace(
+            raw_message=message,
+            source=source,
+            reply_to_is_own_message=False,
+            reply_to_author_id=None,
+        )
+        self._annotate_reply_context(event)
+        return self._ambient_enabled() and self._event_is_direct(event)
+
+    def _prepare_turn_context(self, message: Any) -> dict:
+        """Prepare context keyed only by the exact inbound Discord message id."""
+        author = getattr(message, "author", None)
+        speaker_id = str(getattr(author, "id", "") or "")
+        message_id = str(getattr(message, "id", "") or "")
+        tag = self._speaker_tag(message)
+        known = self._speaker_memory(speaker_id) if tag else None
+        room_context = "\n".join(self._room_context_rows(message))
+        channel = getattr(message, "channel", None)
+        channel_id = str(getattr(channel, "id", "") or "")
+        travel_context = ""
+        if self._travel_channel_allowed(channel_id):
+            travel_context = "\n".join(self._travel_rows(message))
+        bundle = {
+            "message_id": message_id,
+            "speaker_id": speaker_id,
+            "ambient_hint": _ambient_hint.get(""),
+            "direct_address": self._raw_message_is_direct(message),
+            "speaker_context": (tag, known),
+            "room_context": room_context,
+            "travel_context": travel_context,
+            "gif_profile": self._bot_user_id(),
+            "prepared_at": time.monotonic(),
+        }
+        if not message_id:
+            return bundle
+        with self._prepared_turn_lock:
+            self._prepared_turns[message_id] = bundle
+            self._prepared_turns.move_to_end(message_id)
+            cutoff = time.monotonic() - 900.0
+            while self._prepared_turns:
+                first = next(iter(self._prepared_turns))
+                if (
+                    len(self._prepared_turns) <= _TURN_SCOPE_LIMIT
+                    and float(self._prepared_turns[first].get("prepared_at") or 0) >= cutoff
+                ):
+                    break
+                self._prepared_turns.popitem(last=False)
+        return bundle
+
+    def _discard_prepared_turn(self, bundle: dict) -> None:
+        message_id = str(bundle.get("message_id") or "")
+        if not message_id:
+            return
+        with self._prepared_turn_lock:
+            if self._prepared_turns.get(message_id) is bundle:
+                self._prepared_turns.pop(message_id, None)
+
+    def _take_prepared_turn(self, message_id: str) -> dict | None:
+        if not message_id:
+            return None
+        with self._prepared_turn_lock:
+            bundle = self._prepared_turns.pop(message_id, None)
+        if (
+            bundle is not None
+            and time.monotonic() - float(bundle.get("prepared_at") or 0) <= 900.0
+        ):
+            return bundle
+        return None
+
+    async def _dispatch_stock_with_turn_context(self, message: Any) -> bool:
+        bundle = self._prepare_turn_context(message)
+        try:
+            return await super()._dispatch_discord_message(message)
+        finally:
+            self._discard_prepared_turn(bundle)
+
+    async def _dispatch_recovered_with_turn_context(self, message: Any) -> bool:
+        bundle = self._prepare_turn_context(message)
+        try:
+            return await super()._dispatch_recovered_message(message)
+        finally:
+            self._discard_prepared_turn(bundle)
+
     async def _dispatch_discord_message(self, message: Any) -> bool:
         token = self._ambient_no_thread_token(message)
-        # Authorization is transport identity, not optional prompt decoration.
-        # Scope it at every dispatch entry so disabled speaker tags cannot cause
-        # false denies and a reused task cannot retain the previous author.
-        authorization_token = _current_speaker_id.set(
-            str(getattr(getattr(message, "author", None), "id", "") or "")
-        )
-        # Open a fresh directive scope per dispatch and close it here. Both the
-        # ambient and the bot-bounce goodbye path set the hint somewhere inside,
-        # and neither should be able to leak one into the NEXT message's turn.
+        # Open a fresh directive scope per dispatch and close it here. The
+        # request middleware rebinds these again from Hermes' actual turn_id.
+        authorization_token = _current_speaker_id.set("")
         hint_token = _ambient_hint.set("")
         speaker_token = _speaker_context.set(("", None))
         room_token = _room_context.set("")
@@ -2666,22 +2765,16 @@ class AmbientDiscordAdapter(DiscordAdapter):
         everything else runs the stock recovery gates untouched.
         """
         token = self._ambient_no_thread_token(message)
-        authorization_token = _current_speaker_id.set(
-            str(getattr(getattr(message, "author", None), "id", "") or "")
-        )
+        authorization_token = _current_speaker_id.set("")
         gif_token = _gif_profile_context.set(self._bot_user_id())
         try:
             verdict = self._bounce_pre_dispatch(message)
             if verdict == "suppress":
                 return False
-            # Presence truth on replay: a recovered message is real inbound
-            # traffic she witnesses, and the restart that made it "missed"
-            # must not erase the visit from her history. Observe only -- no
-            # directive staging, a burst of replays must not multiply travel
-            # blocks into turns that are auto-continuations.
-            self._travel_observe(message)
             await self._standby_wait(message)  # backfill replays queue behind the slot too
-            handled = await super()._dispatch_recovered_message(message)
+            handled = await self._dispatch_recovered_with_turn_context(message)
+            if handled:
+                self._travel_admit(message)
             if handled and verdict in ("goodbye", "count"):
                 self._bounce_note_dispatch(message)
             return handled
@@ -2703,11 +2796,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
         self._stage_room_context(message)
         self._remember_room_talk(message)
 
-        # Travel log, same site and same reasoning as the two lines above:
-        # presence is a fact about ARRIVAL, not about admission — recorded
-        # before any gate can refuse the message, then shown to her as where
-        # she has been, not only where she is.
-        self._travel_observe(message)
+        # Project only continuity already admitted by an earlier handled public
+        # source. The current arrival is recorded later by `_travel_admit`.
         self._stage_travel_log(message)
 
         # Bot bounce first: a tripped pair must cost NOTHING, so it returns
@@ -2724,8 +2814,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # optional dice-roll joins below consult it.
         still_busy = await self._standby_wait(message)
 
-        # Stock path first: preserves the dedup claim and every auth gate.
-        if await super()._dispatch_discord_message(message):
+        if await self._dispatch_stock_with_turn_context(message):
+            self._travel_admit(message)
             if verdict in ("goodbye", "count"):
                 self._bounce_note_dispatch(message)
             return True
@@ -2775,9 +2865,11 @@ class AmbientDiscordAdapter(DiscordAdapter):
 
             token = _ambient_open.set(True)
             try:
-                handled = await super()._dispatch_discord_message(message)
+                handled = await self._dispatch_stock_with_turn_context(message)
             finally:
                 _ambient_open.reset(token)
+            if handled:
+                self._travel_admit(message)
 
             # Charge the budget ONLY for a join that actually reached the agent.
             # The re-dispatch re-runs every auth gate, so it can still be
@@ -3233,25 +3325,32 @@ class AmbientDiscordAdapter(DiscordAdapter):
         if not rows:
             return
         _room_context.set("\n".join(rows))
-        # Same acceptance as the catch-up transcript: the echo guard compares
-        # the reply against exactly what we know we handed over.
-        self._room_echo = (
-            time.time(),
-            {" ".join(ln.split()) for ln in rows},
-        )
 
-    def _room_echo_leak(self, content: Any) -> bool:
-        """True when a reply repeats the room block we just fed the model.
+    def _bind_room_echo(self, delivery_channel: str, bundle: dict) -> None:
+        """File model-visible rows under the actual reply destination."""
+        if not delivery_channel:
+            return
+        rows = []
+        for field in ("room_context", "travel_context"):
+            rows.extend(str(bundle.get(field) or "").splitlines())
+        lines = {" ".join(line.split()) for line in rows if line.strip()}
+        if not lines:
+            return
+        prior = self._room_echo.get(delivery_channel, (0.0, set()))[1]
+        self._room_echo[delivery_channel] = (time.time(), set(prior) | lines)
+        self._room_echo.move_to_end(delivery_channel)
+        while len(self._room_echo) > 128:
+            self._room_echo.popitem(last=False)
 
-        Same threshold and reasoning as `_catchup_echo_leak`: two verbatim
-        lines is regurgitation, one is plausibly a deliberate quote.
-        Over-suppressing costs one reply; under-suppressing reposts the
-        room's conversation back at itself.
-        """
+    def _room_echo_leak(self, content: Any, chat_id: Any) -> bool:
+        """True when a reply repeats context staged for its destination channel."""
         try:
-            set_at, lines = self._room_echo
+            key = str(chat_id or "")
+            set_at, lines = self._room_echo.get(key, (0.0, set()))
             if not lines or time.time() - set_at > 900:
+                self._room_echo.pop(key, None)
                 return False
+            self._room_echo.move_to_end(key)
             body = [" ".join(ln.split()) for ln in str(content or "").splitlines()]
             hits = sum(1 for ln in body if ln and ln in lines)
             return hits >= 2
@@ -3552,13 +3651,10 @@ class AmbientDiscordAdapter(DiscordAdapter):
         }
 
     def _travel_observe(self, message: Any) -> None:
-        """Inbound touch point: arrival opens a lane, traffic keeps it warm.
+        """Record bounded presence after public source admission.
 
-        Runs for EVERY inbound message before any admission gate (same site
-        as _remember_room_talk), because presence is a fact about arrival —
-        a message she reads and never answers is still a visit, and lurking
-        is half the point. O(1) memory only, never disk: persistence happens
-        on the sweep tick.
+        Direct/private and rejected sources never reach this method in the live
+        dispatch path. Tests may call it directly to exercise lane mechanics.
         """
         cfg = self._travel_cfg()
         if not (self._ambient_enabled() and cfg):
@@ -3583,6 +3679,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     "last_spoke_at": None,
                     "her_msg_count": 0,
                     "participants": [],
+                    "admitted": False,
+                    "visibility": "private",
                 }
                 lane.update(self._travel_lane_meta(channel))
                 # Bounded like room-talk's 128-LRU: channels are attacker-
@@ -3624,6 +3722,30 @@ class AmbientDiscordAdapter(DiscordAdapter):
         except Exception:
             logger.debug("ambient.travel_log: observe failed", exc_info=True)
 
+    def _travel_admit(self, message: Any) -> None:
+        """Mark this source projectable only after public Discord admission."""
+        try:
+            channel = getattr(message, "channel", None)
+            if getattr(channel, "guild", None) is None:
+                return
+            channel_id = str(getattr(channel, "id", "") or "")
+            if not channel_id:
+                return
+            self._travel_observe(message)
+            lane = self._travel_lanes.get(channel_id)
+            if lane is None:
+                return
+            message_id = str(getattr(message, "id", "") or "")
+            if message_id:
+                admitted = self._travel_admitted_messages.setdefault(
+                    channel_id, deque(maxlen=128)
+                )
+                admitted.append(message_id)
+            lane["admitted"] = True
+            lane["visibility"] = "public"
+        except Exception:
+            logger.debug("ambient.travel_log: admission mark failed", exc_info=True)
+
     def _travel_spoke(self, chat_id: Any) -> None:
         """Her own send: both clocks move, because the echo cannot be trusted.
 
@@ -3663,6 +3785,10 @@ class AmbientDiscordAdapter(DiscordAdapter):
                         "chat_type": "channel",
                     }
                 )
+                public = (
+                    bool(str(meta.get("guild_id") or ""))
+                    and meta.get("chat_type") != "dm"
+                )
                 lane = {
                     "channel_id": key,
                     "opened_at": now,
@@ -3671,6 +3797,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     "last_spoke_at": None,
                     "her_msg_count": 0,
                     "participants": [],
+                    "admitted": public,
+                    "visibility": "public" if public else "private",
                 }
                 lane.update(meta)
                 self._travel_lanes[key] = lane
@@ -3691,7 +3819,10 @@ class AmbientDiscordAdapter(DiscordAdapter):
         try:
             self_id = self._bot_user_id()
             out = []
+            admitted = set(self._travel_admitted_messages.get(channel_id, ()))
             for entry in reversed(self._room_talk.get(channel_id, [])):
+                if str(entry[0]) not in admitted:
+                    continue
                 if self_id and str(entry[1]) == self_id:
                     continue
                 snippet = self._flatten_room_line(entry[4], self._ROOM_SNIPPET_CHARS)
@@ -3720,6 +3851,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
             "channel_id": lane.get("channel_id", key),
             "channel_name": lane.get("channel_name", ""),
             "chat_type": lane.get("chat_type", "channel"),
+            "admitted": bool(lane.get("admitted")),
+            "visibility": str(lane.get("visibility") or "private"),
             "thread_parent": lane.get("thread_parent"),
             "opened_at": lane.get("opened_at", closed_at),
             "closed_at": closed_at,
@@ -3810,8 +3943,18 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 b for b in self._travel_beats
                 if float(b.get("closed_at") or 0.0) >= cutoff
             ]
+            admitted_beats = [
+                b for b in self._travel_beats
+                if b.get("admitted") is True
+                and str(b.get("visibility") or "") == "public"
+            ]
+            admitted_lanes = {
+                key: lane for key, lane in self._travel_lanes.items()
+                if lane.get("admitted") is True
+                and str(lane.get("visibility") or "") == "public"
+            }
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            payload = {"beats": self._travel_beats, "lanes": self._travel_lanes}
+            payload = {"beats": admitted_beats, "lanes": admitted_lanes}
             tmp = f"{path}.tmp"
             # 0640: drop group-write. Every seat runs as hermes, so a
             # group-writable store is writable by anything on the host, and
@@ -3959,6 +4102,10 @@ class AmbientDiscordAdapter(DiscordAdapter):
             beats = [
                 b for b in self._travel_beats
                 if now - float(b.get("closed_at") or 0.0) <= horizon
+                and b.get("admitted") is True
+                and str(b.get("visibility") or "") == "public"
+                and str(b.get("chat_type") or "") in {"channel", "group", "thread"}
+                and bool(str(b.get("guild_id") or ""))
             ]
             header = (
                 "[ambient travel log — where you have been in the last "
@@ -4024,7 +4171,11 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 getattr(getattr(message, "channel", None), "id", "") or ""
             )
             lane = self._travel_lanes.get(channel_id)
-            if lane is not None:
+            if (
+                lane is not None
+                and lane.get("admitted") is True
+                and str(lane.get("visibility") or "") == "public"
+            ):
                 tail = (
                     "you have been in this room since "
                     f"{self._travel_span(now - float(lane.get('opened_at') or now))}"
@@ -4057,16 +4208,6 @@ class AmbientDiscordAdapter(DiscordAdapter):
         if not rows:
             return
         _travel_context.set("\n".join(rows))
-        # The snippet lines are other people's sentences handed to the model,
-        # so they join the room block's acceptance set: a reply repeating
-        # two of them verbatim never reaches the room (see _room_echo_leak).
-        # Union, not replace — the room block staged moments ago stays
-        # guarded too.
-        _, existing = self._room_echo
-        self._room_echo = (
-            time.time(),
-            set(existing) | {" ".join(ln.split()) for ln in rows},
-        )
 
     def _resolve_plain_mentions(self, content: str, chat_id: Any) -> str:
         """Convert known, unambiguous ``@aliases`` to Discord mention syntax.
@@ -4742,7 +4883,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
         open_token = _ambient_open.set(True)
         gif_token = _gif_profile_context.set(self._bot_user_id())
         try:
-            handled = await super()._dispatch_discord_message(target)
+            handled = await self._dispatch_stock_with_turn_context(target)
+            if handled:
+                self._travel_admit(target)
         finally:
             _ambient_open.reset(open_token)
             _ambient_hint.reset(hint_token)
@@ -5425,7 +5568,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # Room-context echo guard, same reasoning: the recent-talk lines are
         # other people's sentences, indistinguishable from ordinary speech by
         # any pattern — matched against exactly what we handed the model.
-        if self._ambient_enabled() and isinstance(content, str) and self._room_echo_leak(content):
+        if self._ambient_enabled() and isinstance(content, str) and self._room_echo_leak(content, chat_id):
             logger.warning(
                 "ambient.room: suppressed a reply that repeated the recent-talk "
                 "block back into the room: %r", content[:200],
@@ -5949,7 +6092,6 @@ def _is_self_portrait(text: str, triggers: Any) -> bool:
             return True
     return False
 
-
 def _on_pre_tool_call(tool_name: str = "", args: Any = None, **_: Any):
     """Refuse image generation for anyone but the allowed users.
 
@@ -6030,7 +6172,10 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, **_: Any):
         return None                      # ungated profile (e.g. the operator's own)
 
     allowed = _normalize_ids(cfg.get("allowed_users"))
-    speaker = (_current_speaker_id.get() or "").strip()
+    turn_id = str(_.get("turn_id") or "").strip()
+    with _turn_scopes_lock:
+        turn_scope = _turn_scopes.get(turn_id) if turn_id else None
+    speaker = str((turn_scope or {}).get("speaker_id") or "").strip()
 
     if speaker and speaker in allowed:
         return None
@@ -6112,12 +6257,140 @@ def _is_resume_turn(user_message: Any, history: Any, depth: int = 3) -> bool:
             continue
         content = row.get("content")
         if isinstance(content, list):  # some providers send content as parts
+
             content = " ".join(
                 str(p.get("text", "")) for p in content if isinstance(p, dict)
             )
         if _looks_like_resume(content):
             return True
     return False
+def _install_gateway_turn_scope() -> None:
+    """Wrap the real initial/recursive turn boundary once per process."""
+    try:
+        from gateway.run import GatewayRunner  # type: ignore
+        from gateway import session_context as session_ctx  # type: ignore
+
+        original = GatewayRunner._run_agent
+        if getattr(original, "_ambient_turn_scope_wrapper", False):
+            return
+
+        @wraps(original)
+        async def scoped_run_agent(runner, *args, **kwargs):
+            source = kwargs.get("source")
+            if source is None and len(args) > 3:
+                source = args[3]
+            platform = getattr(getattr(source, "platform", None), "value", "")
+            try:
+                adapter = runner._adapter_for_source(source)
+            except Exception:
+                adapter = None
+            if platform != "discord" or not isinstance(adapter, AmbientDiscordAdapter):
+                return await original(runner, *args, **kwargs)
+
+            source_message_id = str(getattr(source, "message_id", "") or "")
+            inbound_message_id = str(kwargs.get("inbound_message_id") or "")
+            event_message_id = str(kwargs.get("event_message_id") or "")
+            message_id = source_message_id or inbound_message_id or event_message_id
+            if (
+                source_message_id
+                and inbound_message_id
+                and source_message_id != inbound_message_id
+            ):
+                message_id = ""
+
+            bundle = adapter._take_prepared_turn(message_id)
+            source_user_id = str(getattr(source, "user_id", "") or "")
+            if (
+                not isinstance(bundle, dict)
+                or not source_user_id
+                or str(bundle.get("message_id") or "") != message_id
+                or str(bundle.get("speaker_id") or "") != source_user_id
+            ):
+                bundle = None
+            if bundle is not None:
+                delivery_channel = str(
+                    getattr(source, "thread_id", "")
+                    or getattr(source, "prospective_thread_id", "")
+                    or getattr(source, "chat_id", "")
+                    or ""
+                )
+                bundle = dict(bundle)
+                bundle["delivery_channel"] = delivery_channel
+                bundle["source_user_id"] = source_user_id
+                adapter._bind_room_echo(delivery_channel, bundle)
+
+            values = {
+                "HERMES_SESSION_PLATFORM": "discord",
+                "HERMES_SESSION_CHAT_ID": str(getattr(source, "chat_id", "") or ""),
+                "HERMES_SESSION_CHAT_TYPE": str(getattr(source, "chat_type", "") or ""),
+                "HERMES_SESSION_CHAT_NAME": str(getattr(source, "chat_name", "") or ""),
+                "HERMES_SESSION_THREAD_ID": str(getattr(source, "thread_id", "") or ""),
+                "HERMES_SESSION_USER_ID": source_user_id if bundle is not None else "",
+                "HERMES_SESSION_USER_ID_ALT": (
+                    str(getattr(source, "user_id_alt", "") or "") if bundle is not None else ""
+                ),
+                "HERMES_SESSION_USER_NAME": (
+                    str(getattr(source, "user_name", "") or "") if bundle is not None else ""
+                ),
+                "HERMES_SESSION_SCOPE_ID": str(
+                    getattr(source, "scope_id", "")
+                    or getattr(source, "guild_id", "")
+                    or ""
+                ),
+                "HERMES_SESSION_KEY": str(
+                    kwargs.get("session_key")
+                    or (args[5] if len(args) > 5 else "")
+                    or ""
+                ),
+                "HERMES_SESSION_MESSAGE_ID": message_id if bundle is not None else "",
+                "HERMES_SESSION_PROFILE": str(getattr(source, "profile", "") or ""),
+            }
+            session_tokens = [
+                session_ctx._VAR_MAP[name].set(value)
+                for name, value in values.items()
+            ]
+            scope_token = _verified_run_context.set(bundle)
+            try:
+                return await original(runner, *args, **kwargs)
+            finally:
+                _verified_run_context.reset(scope_token)
+                for token in reversed(session_tokens):
+                    token.var.reset(token)
+
+        scoped_run_agent._ambient_turn_scope_wrapper = True
+        GatewayRunner._run_agent = scoped_run_agent
+    except Exception:
+        logger.exception("ambient: could not install GatewayRunner turn scope")
+
+
+
+def _on_pre_llm_call_turn_scope(**kwargs: Any):
+    """Bind only the exact current GatewayRunner source to its turn_id."""
+    try:
+        turn_id = str(kwargs.get("turn_id") or "").strip()
+        if not turn_id:
+            return None
+        bundle = _verified_run_context.get(None)
+        if not isinstance(bundle, dict):
+            bundle = {
+                "speaker_id": "",
+                "ambient_hint": "",
+                "direct_address": False,
+                "speaker_context": ("", None),
+                "room_context": "",
+                "travel_context": "",
+                "gif_profile": "",
+                "delivery_channel": "",
+            }
+        with _turn_scopes_lock:
+            _turn_scopes[turn_id] = bundle
+            _turn_scopes.move_to_end(turn_id)
+            while len(_turn_scopes) > _TURN_SCOPE_LIMIT:
+                _turn_scopes.popitem(last=False)
+        return None
+    except Exception:
+        logger.debug("ambient: turn scope binding failed", exc_info=True)
+        return None
 
 
 def _on_llm_request_ambient_hint(**kwargs: Any):
@@ -6127,6 +6400,25 @@ def _on_llm_request_ambient_hint(**kwargs: Any):
     all append here. Nothing is written onto the persisted user turn.
     """
     try:
+        turn_id = str(kwargs.get("turn_id") or "").strip()
+        if turn_id:
+            with _turn_scopes_lock:
+                scope = _turn_scopes.get(turn_id)
+            if not isinstance(scope, dict):
+                scope = {}
+            _current_speaker_id.set(str(scope.get("speaker_id") or ""))
+            _ambient_hint.set(str(scope.get("ambient_hint") or ""))
+            _direct_address.set(bool(scope.get("direct_address")))
+            speaker_context = scope.get("speaker_context")
+            if not (
+                isinstance(speaker_context, tuple)
+                and len(speaker_context) == 2
+            ):
+                speaker_context = ("", None)
+            _speaker_context.set(speaker_context)
+            _room_context.set(str(scope.get("room_context") or ""))
+            _travel_context.set(str(scope.get("travel_context") or ""))
+            _gif_profile_context.set(str(scope.get("gif_profile") or ""))
         extras: list[str] = []
         reply_style = _ambient_cfg("reply_style", {})
         reply_style_enabled = bool(
@@ -6378,6 +6670,7 @@ def register(ctx) -> None:
     """
     _install_compaction_focus()
     _install_direct_silence_filter()
+    _install_gateway_turn_scope()
 
     _bundled.register(ctx)
 
@@ -6389,9 +6682,13 @@ def register(ctx) -> None:
     except Exception as exc:
         logger.warning("ambient: could not register image gate: %s", exc)
 
-    # Ambient directive delivery. Registered unconditionally and process-wide;
-    # scoping is automatic because the callback no-ops unless _ambient_hint is
-    # set, which only happens inside an ambient dispatch on this adapter.
+    # Bind the wrapper's verified current source to Hermes' actual turn_id.
+    try:
+        ctx.register_hook("pre_llm_call", _on_pre_llm_call_turn_scope)
+        logger.info("ambient: queued turn-scope hook registered")
+    except Exception as exc:
+        logger.warning("ambient: could not register turn scope: %s", exc)
+
     try:
         ctx.register_middleware("llm_request", _on_llm_request_ambient_hint)
         logger.info("ambient: directive middleware registered (request-only injection)")

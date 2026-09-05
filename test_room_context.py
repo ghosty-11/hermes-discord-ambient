@@ -226,9 +226,10 @@ check("no staged room context means no extra row", out2 is None, out2)
 print("echo protection for the room block")
 adapter2._stage_room_context(Message(304, ALICE, GENERAL, "a third line"))
 lines = [ln for ln in ambient._room_context.get("").splitlines() if ln.startswith("@")]
+adapter2._bind_room_echo(str(GENERAL.id), {"room_context": ambient._room_context.get("")})
 check("two copied talk lines are a leak",
-      len(lines) >= 2 and adapter2._room_echo_leak("\n".join(lines[:2])))
-check("one quoted line is allowed", not adapter2._room_echo_leak(lines[0] if lines else "x"))
+      len(lines) >= 2 and adapter2._room_echo_leak("\n".join(lines[:2]), GENERAL.id))
+check("one quoted line is allowed", not adapter2._room_echo_leak(lines[0] if lines else "x", GENERAL.id))
 
 print("guild-scoped ping resolution")
 adapter3 = build_adapter(ROOM_CFG)
