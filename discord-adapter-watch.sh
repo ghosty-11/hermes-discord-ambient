@@ -22,7 +22,7 @@ mkdir -p "$(dirname "${STATE}")"
 [ -r "${B}" ] || { echo "discord-adapter-watch: gateway base not found at ${B} — the ambient plugin is probably broken."; exit 0; }
 
 # Admission gate body (mention/auth/dedup seam the ambient re-dispatch relies on).
-sig_admission="$(awk '/def _discord_message_admission/,/^    def _dispatch_discord_message/' "${A}" | sha256sum | cut -c1-16)"
+sig_admission="$(awk '/^    def _discord_message_admission/{f=1; print; next} f{ if (/^    (async )?def /) exit; print }' "${A}" | sha256sum | cut -c1-16)"
 # Whole send() method body: guards BOTH the signature (reply_to param) and the
 # one-SendResult-per-call chunking contract that bounce counting assumes.
 sig_send="$(awk '/^    async def send\(/{f=1; print; next} f{ if (/^    async def /) exit; print }' "${A}" | sha256sum | cut -c1-16)"
@@ -38,11 +38,12 @@ sig_dedup="$(grep -c "_dedup\.\(contains\|is_duplicate\)" "${A}")"
 # "not busy" if they vanish — but a silent vanish means standby silently stops
 # deferring, so the drift still deserves a ping).
 R="${HERMES_RUN:-${HERMES_HOME}/hermes-agent/gateway/run.py}"
+RA="$(dirname "${R}")/run_adapters.py"
 C="${HERMES_CRON:-${HERMES_HOME}/hermes-agent/cron/scheduler.py}"
 # NB: grep -c prints its count even when it exits 1 (zero matches) — never
 # chain `|| echo 0` onto it or a legitimate 0 captures as "0\n0" and corrupts
 # the state line.
-if [ -r "${R}" ]; then sig_runnerstamp="$(grep -c "adapter.gateway_runner = self" "${R}")"; else sig_runnerstamp=0; fi
+if [ -r "${RA}" ]; then sig_runnerstamp="$(grep -c "adapter.gateway_runner = self" "${RA}")"; else sig_runnerstamp=none; fi
 sig_runnerdecl="$(grep -c "gateway_runner" "${B}")"
 if [ -r "${R}" ]; then sig_turnts="$(grep -c "_running_agents_ts" "${R}")"; else sig_turnts=0; fi
 if [ -r "${C}" ]; then sig_cronids="$(grep -A6 "def get_running_job_ids" "${C}" | sha256sum | cut -c1-16)"; else sig_cronids=none; fi
