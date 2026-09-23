@@ -251,7 +251,7 @@ failure and delivered output separately. Required discriminating cases:
 | Two profiles interleaved, including voice/GIF paths | No identity, pending-media or delivery-state crossing |
 | Ambient off; private work profile outside selected rooms | Stock behavior and privileged boundaries unchanged |
 | Echoed internal envelope across stream chunks | Private payload is never sent; safe unrelated prose survives; no fallback sentence |
-| Long session with replay snapshots | Retention and epoch bounds hold across reload; original human messages remain |
+| Long session and replay after reload | No injected observation snapshot appears in historical `api_content` or native provider prefetch; original human messages remain |
 | Legacy unscoped fact and excessive note writes | No unreviewed disclosure, no quota bypass or false claim of a successful save |
 | Diagnostic payload and skill-exposure fixtures | No sensitive fragments or object-stringification bypass; exposure matches the rendered surface |
 | Configured media hop available without fallback credentials | Accurate readiness, no generation call and no authorization expansion |
