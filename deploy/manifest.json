@@ -3,6 +3,7 @@
   "module": "hermes-discord-ambient",
   "artifacts": [
     {"source": "__init__.py", "destination": "plugins/discord-ambient/__init__.py", "kind": "file"},
+    {"source": "companion_skill_read.py", "destination": "plugins/discord-ambient/companion_skill_read.py", "kind": "file"},
     {"source": "plugin.yaml", "destination": "plugins/discord-ambient/plugin.yaml", "kind": "file"},
     {"source": "discord-adapter-watch.sh", "destination": "scripts/discord-adapter-watch.sh", "kind": "file"}
   ]

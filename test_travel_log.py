@@ -76,12 +76,14 @@ class Author:
 
 
 class Chan:
+    instances = {}
     def __init__(self, cid, name, guild=None, topic=None, parent=None):
         self.id = cid
         self.name = name
         self.guild = guild
         self.topic = topic
         self.parent = parent
+        self.instances[str(cid)] = self
         self.visible_to_everyone = True
 
     def permissions_for(self, role):
@@ -139,7 +141,9 @@ def build_adapter(travel=TRAVEL_ON, room=None):
     adapter = ambient.AmbientDiscordAdapter(
         types.SimpleNamespace(extra={"ambient_presence": presence})
     )
-    adapter._client = types.SimpleNamespace(user=HER)
+    adapter._client = types.SimpleNamespace(
+        user=HER, get_channel=lambda cid: Chan.instances.get(str(cid))
+    )
     adapter._ambient_last = 0.0
     adapter._last_seen = {}
     adapter._seen_loaded = True
@@ -600,8 +604,76 @@ with case("budgets bound the projection"):
               (len("\n".join(rows)), len(rows)))
 
 
+with case("revoked public-room visibility evicts admitted travel before replay"):
+    with state_home() as home:
+        seed_travel_store(home, [mk_beat(
+            77, GENERAL, opened_m=30, closed_m=5, her=2,
+            snippets=["private after role change"],
+        )], {})
+        a = build_adapter()
+        a._travel_load_state()
+        query = Message(66, BOB, RANDOM, "where have you been?")
+        try:
+            GENERAL.visible_to_everyone = True
+            check("positive: admitted public beat projects",
+                  any("#general" in line for line in a._travel_rows(query)))
+            GENERAL.visible_to_everyone = False
+            rows = a._travel_rows(query)
+            check("revoked source cannot project into another room",
+                  not any("#general" in line or "private after role change" in line
+                          for line in rows), rows)
+            check("known revocation drops the old beat from memory",
+                  all(str(beat.get("channel_id")) != "501" for beat in a._travel_beats),
+                  a._travel_beats)
+            a._travel_sweep()
+            with open(state_file(home, "ambient-travel-log")) as fh:
+                stored = json.load(fh)
+            check("revoked beat cannot return after reload",
+                  all(str(beat.get("channel_id")) != "501"
+                      for beat in stored.get("beats", [])), stored.get("beats"))
+        finally:
+            GENERAL.visible_to_everyone = True
+
+with case("uncached source withholds without deleting admitted history"):
+    with state_home() as home:
+        seed_travel_store(home, [mk_beat(
+            78, GENERAL, opened_m=30, closed_m=5, her=2,
+            snippets=["cached public room"],
+        )], {})
+        a = build_adapter()
+        a._travel_load_state()
+        query = Message(67, BOB, RANDOM, "what happened elsewhere?")
+        getter = a._client.get_channel
+        a._client.get_channel = lambda cid: None
+        try:
+            check("uncached source is withheld",
+                  not any("#general" in line for line in a._travel_rows(query)))
+            check("cache miss alone is not a permission revocation",
+                  any(str(beat.get("channel_id")) == "501" for beat in a._travel_beats))
+        finally:
+            a._client.get_channel = getter
+        check("admitted beat returns after public cache recovers",
+              any("#general" in line for line in a._travel_rows(query)))
+
+with case("prepared turn removes travel quote already present in room talk"):
+    with state_home():
+        a = build_adapter()
+        a._room_context_rows = lambda _m: [
+            "[ambient room]", "@alice id:101: the deploy went fine",
+        ]
+        a._travel_rows = lambda _m: [
+            "[ambient travel log]", "· said: the deploy went fine",
+        ]
+        bundle = a._prepare_turn_context(
+            Message(68, ALICE, GENERAL, "what happened?")
+        )
+        check("room fact remains once but travel quote is removed",
+              "the deploy went fine" in bundle["room_context"]
+              and "the deploy went fine" not in bundle["travel_context"],
+              repr((bundle["room_context"], bundle["travel_context"])))
+
 print("request-only delivery through the middleware")
-with case("the travel block rides as one request-only row at the END"):
+with case("travel rides the ephemeral envelope; no provider rows are appended"):
     with state_home() as home:
         seed_travel_store(home, PROJ_BEATS, {})
         a = build_adapter()
@@ -613,24 +685,48 @@ with case("the travel block rides as one request-only row at the END"):
         block = ambient._travel_context.get("")
         check("the staged block is bracketed travel", block.startswith("[ambient travel log"), block[:40])
         request = {"model": "m", "messages": [{"role": "user", "content": "turn text"}]}
-        out = ambient._on_llm_request_ambient_hint(request=request, platform="discord")
-        check("middleware patched the request", out is not None and "request" in out, out)
-        msgs = out["request"]["messages"]
-        check("rows appended at the end only",
-              len(msgs) == 3 and msgs[0] == {"role": "user", "content": "turn text"}, msgs)
-        check("the travel row is the LAST row, one element, verbatim",
-              msgs[-1] == {"role": "user", "content": block}, msgs[-1:])
+        out = ambient._on_llm_request_bind_turn_scope(request=request, platform="discord")
+        check("the binding middleware appends nothing", out is None, out)
         check("the original request dict is unmutated",
               request == {"model": "m", "messages": [{"role": "user", "content": "turn text"}]},
               request)
-        check("the patched request is a copy, not the same object",
-              out["request"] is not request and out["request"]["messages"] is not request["messages"])
+        bundle = a._prepare_turn_context(m)
+        from gateway import session_context as _session_ctx
+        import contextvars as _cv
 
-with case("nothing staged means no patched request"):
+        _identity = getattr(_session_ctx, "_ambient_turn_identity", None)
+        if _identity is None:
+            _identity = _cv.ContextVar("ambient_turn_identity", default=None)
+            _session_ctx._ambient_turn_identity = _identity
+        _scope_token = ambient._verified_run_context.set(bundle)
+        _id_token = _identity.set(
+            (bundle.get("message_id"), bundle.get("speaker_id"))
+        )
+        try:
+            ambient._on_pre_llm_call_turn_scope(turn_id="travel-turn")
+        finally:
+            _identity.reset(_id_token)
+            ambient._verified_run_context.reset(_scope_token)
+        ambient._EPHEMERAL_OVERRIDE = True
+        try:
+            delivered = ambient._on_pre_llm_call_ambient_context(
+                turn_id="travel-turn", platform="discord"
+            )
+        finally:
+            ambient._EPHEMERAL_OVERRIDE = None
+        envelope = (delivered or {}).get("ephemeral_context") or ""
+        check("the travel facts ride inside the frozen envelope",
+              envelope.startswith("<ambient_context ")
+              and "ambient travel log" in envelope,
+              envelope[:400])
+        check("the envelope is ephemeral-only",
+              isinstance(delivered, dict) and "context" not in delivered, repr(delivered))
+
+with case("nothing staged means nothing delivered"):
     room_token = ambient._room_context.set("")
     travel_token = ambient._travel_context.set("")
     try:
-        out = ambient._on_llm_request_ambient_hint(
+        out = ambient._on_llm_request_bind_turn_scope(
             request={"messages": [{"role": "user", "content": "hi"}]}, platform="discord"
         )
     finally:
@@ -923,16 +1019,23 @@ with case("v1.32.1: a swallowed reply does not stamp her clocks"):
         a._travel_observe(Message(2303, ALICE, GENERAL, "are you there?"))
         key = next(iter(a._travel_lanes))
         before = dict(a._travel_lanes[key])
-        a._room_echo = ambient.OrderedDict({str(GENERAL.id): (time.time(), {bait1, bait2})})
+        a._room_echo = ambient.OrderedDict({
+            str(GENERAL.id): ambient.OrderedDict({
+                bait1: time.time(), bait2: time.time(),
+            }),
+        })
 
         async def swallowed():
             # Each bait on its OWN line -- that is what the guard matches.
             return await a.send("501", f"{bait1}\n{bait2}")
 
-        asyncio.run(swallowed())
+        result = asyncio.run(swallowed())
         after = a._travel_lanes.get(key, {})
         check("the reply was actually swallowed by the echo guard",
-              True, "control: reached send() without error")
+              getattr(result, "error", None) == "room_echo"
+              and getattr(result, "delivered_text", None) == ""
+              and getattr(result, "message_id", None) is None,
+              result)
         check("suppressed send left last_spoke_at untouched",
               after.get("last_spoke_at") == before.get("last_spoke_at"),
               (before.get("last_spoke_at"), after.get("last_spoke_at")))
@@ -960,6 +1063,86 @@ with case("v1.32.1: a delivered reply does stamp her clocks"):
                   (before_spoke, after.get("last_spoke_at")))
             check("delivered send counted her message",
                   int(after.get("her_msg_count") or 0) == 1, after.get("her_msg_count"))
+        finally:
+            del ambient.DiscordAdapter.send
+
+with case("a failed Discord send does not stamp her travel clocks"):
+    import asyncio
+    with state_home():
+        a = build_adapter()
+        attempts = []
+        async def failing_super_send(chat_id, content_, *args_, **kw_):
+            attempts.append((chat_id, content_))
+            return types.SimpleNamespace(success=False, message_id=None, error="transport unavailable")
+        ambient.DiscordAdapter.send = failing_super_send
+        try:
+            a._travel_observe(Message(2450, ALICE, GENERAL, "speak to me"))
+            key = next(iter(a._travel_lanes))
+            before = dict(a._travel_lanes[key])
+            result = asyncio.run(a.send("501", "not delivered"))
+            after = a._travel_lanes[key]
+            check("transport attempted and failed", len(attempts) == 1 and result.success is False)
+            check("failed transport projects no delivered text",
+                  getattr(result, "delivered_text", None) == "",
+                  getattr(result, "delivered_text", None))
+            check("failed send leaves last_spoke_at untouched",
+                  after.get("last_spoke_at") == before.get("last_spoke_at"))
+            check("failed send leaves her_msg_count untouched",
+                  after.get("her_msg_count") == before.get("her_msg_count"))
+        finally:
+            del ambient.DiscordAdapter.send
+
+with case("partial text/media delivery reports failure and counts only carried speech"):
+    import asyncio
+    for outcomes in ((True, False), (False, True)):
+        with state_home():
+            a = build_adapter()
+            attempts = []
+            async def split_super_send(chat_id, content_, *args_, **kw_):
+                success = outcomes[len(attempts)]
+                attempts.append((chat_id, content_))
+                return types.SimpleNamespace(
+                    success=success,
+                    message_id=f"m{len(attempts)}" if success else None,
+                    error=None if success else "transport unavailable",
+                )
+            ambient.DiscordAdapter.send = split_super_send
+            try:
+                a._travel_observe(Message(2460, ALICE, GENERAL, "speak to me"))
+                key = next(iter(a._travel_lanes))
+                result = asyncio.run(a.send(
+                    "501", "A word and https://example.com/cat.gif"
+                ))
+                check(f"both text/media lanes attempted {outcomes}",
+                      len(attempts) == 2, attempts)
+                check(f"partial delivery never reports full success {outcomes}",
+                      result.success is False, result)
+                check(f"failed lane projects no phantom text {outcomes}",
+                      getattr(result, "delivered_text", None) == "",
+                      getattr(result, "delivered_text", None))
+                check(f"one carried lane counts once {outcomes}",
+                      a._travel_lanes[key]["her_msg_count"] == 1,
+                      a._travel_lanes[key]["her_msg_count"])
+            finally:
+                del ambient.DiscordAdapter.send
+
+with case("isolated media URLs carry no prose projection"):
+    import asyncio
+    with state_home():
+        a = build_adapter()
+        urls = []
+        async def media_super_send(chat_id, content_, *args_, **kw_):
+            urls.append(content_)
+            return types.SimpleNamespace(success=True, message_id=f"m{len(urls)}")
+        ambient.DiscordAdapter.send = media_super_send
+        try:
+            result = asyncio.run(a.send(
+                "501", "https://example.com/one.gif https://example.com/two.gif"
+            ))
+            check("two media URL messages delivered", len(urls) == 2, urls)
+            check("media-only receipt has no delivered prose",
+                  getattr(result, "delivered_text", None) == "",
+                  getattr(result, "delivered_text", None))
         finally:
             del ambient.DiscordAdapter.send
 

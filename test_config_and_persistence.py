@@ -272,67 +272,159 @@ def check_speaker_is_request_only():
     print("\n-- speaker identity stays off the persisted user turn --")
     adapter = make_adapter()
     inbound = message_in("channel-1", author_id=42, content="hey")
-    adapter._apply_speaker_tag(inbound)
+    tag = adapter._speaker_tag(inbound)
     check(
         "the inbound Discord text is left unchanged",
         inbound.content == "hey",
         repr(inbound.content),
     )
-    token = ambient._speaker_context.set((" [speaker @alice id:42]", None))
+    check(
+        "the identity tag carries the stable numeric id",
+        isinstance(tag, str) and "id:42" in tag,
+        repr(tag),
+    )
+    bundle = adapter._prepare_turn_context(inbound)
+    envelope = bundle.get("envelope") or ""
+    check(
+        "the prepared turn freezes the identity into the envelope",
+        'speaker_id="42"' in envelope,
+        envelope[:300],
+    )
+    check(
+        "no adapter-produced private recall block exists",
+        "memory_observation" not in envelope and "[known " not in envelope,
+        envelope[:300],
+    )
+    check(
+        "the adapter owns no synchronous speaker-memory lookup any more",
+        not hasattr(adapter, "_speaker_memory"),
+    )
+    from gateway import session_context as _session_ctx
+    import contextvars as _cv
+
+    identity_ctx = getattr(_session_ctx, "_ambient_turn_identity", None)
+    if identity_ctx is None:
+        identity_ctx = _cv.ContextVar("ambient_turn_identity", default=None)
+        _session_ctx._ambient_turn_identity = identity_ctx
+    scope_token = ambient._verified_run_context.set(bundle)
+    id_token = identity_ctx.set(
+        (bundle.get("message_id"), bundle.get("speaker_id"))
+    )
     try:
-        request = {"messages": [{"role": "user", "content": "hey"}]}
-        patched = ambient._on_llm_request_ambient_hint(request=request)
-        messages = ((patched or {}).get("request") or {}).get("messages") or []
-        check(
-            "the model still receives the speaker tag",
-            any("[speaker @alice id:42]" in str(m.get("content", "")) for m in messages),
-            repr(messages),
-        )
-        check(
-            "the speaker tag is a request-only user row, not a trailing system row",
-            bool(messages)
-            and messages[-1].get("role") == "user"
-            and not any(m.get("role") == "system" for m in messages[1:]),
-            repr([m.get("role") for m in messages]),
+        ambient._on_pre_llm_call_turn_scope(turn_id="speaker-turn")
+    finally:
+        if id_token is not None:
+            identity_ctx.reset(id_token)
+        ambient._verified_run_context.reset(scope_token)
+    request = {"messages": [{"role": "user", "content": "hey"}]}
+    patched = ambient._on_llm_request_bind_turn_scope(
+        request=request, turn_id="speaker-turn", platform="discord"
+    )
+    check(
+        "the binding middleware never appends rows",
+        patched is None and len(request["messages"]) == 1,
+        (repr(patched), request),
+    )
+    ambient._EPHEMERAL_OVERRIDE = True
+    try:
+        delivered = ambient._on_pre_llm_call_ambient_context(
+            turn_id="speaker-turn", platform="discord"
         )
     finally:
-        ambient._speaker_context.reset(token)
+        ambient._EPHEMERAL_OVERRIDE = None
+    envelope = (delivered or {}).get("ephemeral_context") or ""
+    check(
+        "the speaker identity rides the ephemeral envelope, never persisted prose",
+        envelope.startswith("<ambient_context ") and 'speaker_id="42"' in envelope,
+        envelope[:300],
+    )
+    check(
+        "the envelope carries no persistent context key",
+        isinstance(delivered, dict) and "context" not in delivered,
+        repr(delivered),
+    )
 
 
 def check_quiet_resume_is_request_only():
-    print("\n-- quiet-resume is request-only, not a persisted user injection --")
+    print("\n-- quiet-resume follows the typed origin, never user text --")
     original_cfg = ambient._ambient_cfg
     ambient._ambient_cfg = lambda key, default=None: True if key == "quiet_resume" else default
     try:
-        hook = ambient._on_pre_llm_call_quiet_resume(
+        ambient._quiet_resume_pending.set(False)
+        typed = ambient._on_pre_llm_call_quiet_resume(
+            user_message="completely ordinary text",
+            conversation_history=[],
+            turn_origin={"kind": "resume", "response_policy": "required"},
+        )
+        check(
+            "a typed resume origin stages the directive",
+            typed is None and ambient._quiet_resume_pending.get(False) is True,
+            repr(ambient._quiet_resume_pending.get(False)),
+        )
+
+        ambient._quiet_resume_pending.set(False)
+        typed_other = ambient._on_pre_llm_call_quiet_resume(
+            user_message="completely ordinary text",
+            conversation_history=[],
+            turn_origin={"kind": "direct", "response_policy": "discretionary"},
+        )
+        check(
+            "a non-resume origin stages nothing",
+            typed_other is None and ambient._quiet_resume_pending.get(False) is False,
+            repr(ambient._quiet_resume_pending.get(False)),
+        )
+
+        ambient._quiet_resume_pending.set(False)
+        phrases = ambient._on_pre_llm_call_quiet_resume(
             user_message="The previous turn was interrupted. The gateway is now back online.",
             conversation_history=[],
         )
         check(
-            "pre_llm_call no longer injects quiet-resume into user context",
-            hook is None,
-            repr(hook),
+            "a user typing the old resume phrases does not stage quiet mode",
+            phrases is None and ambient._quiet_resume_pending.get(False) is False,
+            repr(ambient._quiet_resume_pending.get(False)),
+        )
+
+        ambient._quiet_resume_pending.set(False)
+        legacy_history = ambient._on_pre_llm_call_quiet_resume(
+            user_message="hello!",
+            conversation_history=[
+                {"role": "system", "content": "The gateway is now back online."}
+            ],
+        )
+        check(
+            "history rows carrying the old phrases do not stage quiet mode either",
+            legacy_history is None and ambient._quiet_resume_pending.get(False) is False,
+            repr(ambient._quiet_resume_pending.get(False)),
+        )
+
+        # Delivery is ephemeral-only: with the seam present the staged
+        # directive rides the envelope; the middleware never emits rows.
+        ambient._quiet_resume_pending.set(True)
+        ambient._EPHEMERAL_OVERRIDE = True
+        try:
+            delivered = ambient._on_pre_llm_call_ambient_context(
+                turn_id="resume-turn-unbound", platform="discord",
+                turn_origin={"kind": "resume", "response_policy": "required"},
+            )
+        finally:
+            ambient._EPHEMERAL_OVERRIDE = None
+            ambient._quiet_resume_pending.set(False)
+        envelope = (delivered or {}).get("ephemeral_context") or ""
+        check(
+            "a staged resume rides the ephemeral envelope",
+            envelope.startswith("<ambient_context ") and "gateway restarted" in envelope,
+            envelope[:200],
+        )
+        request = {"messages": [{"role": "user", "content": "hello"}]}
+        patched = ambient._on_llm_request_bind_turn_scope(request=request)
+        check(
+            "no provider row carries the resume directive on any path",
+            patched is None and len(request["messages"]) == 1,
+            (repr(patched), request),
         )
     finally:
         ambient._ambient_cfg = original_cfg
-
-    token = ambient._quiet_resume_pending.set(True)
-    try:
-        request = {"messages": [{"role": "user", "content": "hello"}]}
-        patched = ambient._on_llm_request_ambient_hint(request=request)
-        messages = ((patched or {}).get("request") or {}).get("messages") or []
-        check(
-            "the resume directive reaches the request payload",
-            any("gateway restarted" in str(m.get("content", "")).lower() for m in messages),
-            repr(messages),
-        )
-        check(
-            "the resume directive is a request-only user row",
-            bool(messages) and messages[-1].get("role") == "user",
-            repr(messages[-1] if messages else None),
-        )
-    finally:
-        ambient._quiet_resume_pending.reset(token)
 
 
 def check_local_fallback_window_covers_the_local_floor():

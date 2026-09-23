@@ -92,13 +92,16 @@ def make_adapter():
         extra={
             "ambient_presence": {
                 "enabled": True,
+                "channels": ["*"],
+                "probability": 0,
                 "silent_marker": "[SILENT]",
-                "direct_silence_fallback": "I'm here.",
                 "text_hygiene": {"resolve_plain_mentions": True},
                 "reply_style": {
                     "enabled": True,
                     "standalone_marker": "[STANDALONE]",
                 },
+                "speaker_identity": True,
+                "room_context": {"enabled": False},
             }
         }
     )
@@ -157,98 +160,130 @@ async def main():
         other_event.reply_to_text == "Alice wrote: earlier text",
         repr(other_event.reply_to_text),
     )
-
-    print("\n-- direct scope reaches request middleware and response filter --")
+    print("\n-- direct scope binds state; delivery is ephemeral-only --")
     seen = {}
 
     async def handler(scoped_event):
         request = {"messages": [{"role": "user", "content": scoped_event.text}]}
-        patched = ambient._on_llm_request_ambient_hint(request=request)
+        patched = ambient._on_llm_request_bind_turn_scope(request=request)
         seen["request"] = patched
         seen["suppressed"] = response_filters.is_intentional_silence_agent_result(
             {"failed": False}, "[SILENT]"
         )
         return None
 
-    ambient._install_direct_silence_filter()
     adapter.set_message_handler(handler)
     await adapter._message_handler(event)
-    messages = ((seen.get("request") or {}).get("request") or {}).get("messages", [])
     check(
-        "model receives a request-only direct-address directive",
-        bool(messages) and "direct" in messages[-1].get("content", "").lower(),
-        repr(messages),
+        "the binding middleware never appends provider rows",
+        seen.get("request") is None,
+        repr(seen.get("request")),
     )
     check(
-        "the directive is not a non-leading system row (Hetzner system-first 400)",
-        bool(messages) and messages[-1].get("role") == "user"
-        and not any(m.get("role") == "system" for m in messages[1:]),
-        repr([m.get("role") for m in messages]),
+        "no adapter patch retains direct silence markers any more",
+        not hasattr(ambient, "_install_direct_silence_filter"),
     )
     check(
-        "gateway does not swallow a direct silence token",
-        seen.get("suppressed") is False,
+        "gateway silence shaping stays stock: the marker is intentional silence",
+        seen.get("suppressed") is True,
         repr(seen.get("suppressed")),
     )
     check(
-        "ambient silence remains suppressible outside direct scope",
+        "ambient silence shaping is equally stock",
         response_filters.is_intentional_silence_agent_result(
             {"failed": False}, "[SILENT]"
         ) is True,
     )
 
-    print("\n-- reply placement guidance is request-only --")
-    original_cfg = ambient._ambient_cfg
-    ambient._ambient_cfg = lambda key, default=None: (
-        {
-            "enabled": True,
-            "standalone_marker": "[STANDALONE]",
-        }
-        if key == "reply_style"
-        else default
-    )
+    print("\n-- the direct-address directive rides the frozen envelope --")
+    direct_msg = RawMessage(Reference("199", replied), message_id="200")
+    bundle = adapter._prepare_turn_context(direct_msg)
+    from gateway import session_context as _session_ctx
+    import contextvars as _cv
+
+    _identity = getattr(_session_ctx, "_ambient_turn_identity", None)
+    if _identity is None:
+        _identity = _cv.ContextVar("ambient_turn_identity", default=None)
+        _session_ctx._ambient_turn_identity = _identity
+    scope_token = ambient._verified_run_context.set(bundle)
+    _id_token = _identity.set((bundle.get("message_id"), bundle.get("speaker_id")))
     try:
-        request = {"messages": [{"role": "user", "content": "hello"}]}
-        patched = ambient._on_llm_request_ambient_hint(request=request)
-        messages = ((patched or {}).get("request") or {}).get("messages", [])
-        check(
-            "the model receives standalone-placement guidance",
-            bool(messages)
-            and "[STANDALONE]" in messages[-1].get("content", "")
-            and "room-wide" in messages[-1].get("content", "").lower(),
-            repr(messages),
-        )
-        check(
-            "reply-placement guidance does not mutate the persisted request",
-            len(request["messages"]) == 1,
-            repr(request["messages"]),
-        )
-        cron_patched = ambient._on_llm_request_ambient_hint(
-            request={"messages": [{"role": "user", "content": "hello"}]},
-            platform="cron",
-        )
-        check(
-            "a cron turn is not told about Discord reply placement",
-            cron_patched is None,
-            repr(cron_patched),
-        )
-        discord_patched = ambient._on_llm_request_ambient_hint(
-            request={"messages": [{"role": "user", "content": "hello"}]},
-            platform="discord",
-        )
-        discord_messages = (
-            ((discord_patched or {}).get("request") or {}).get("messages", [])
-        )
-        check(
-            "a Discord turn still receives the placement guidance",
-            bool(discord_messages)
-            and "[STANDALONE]" in discord_messages[-1].get("content", ""),
-            repr(discord_messages),
+        ambient._on_pre_llm_call_turn_scope(turn_id="direct-turn")
+    finally:
+        _identity.reset(_id_token)
+        ambient._verified_run_context.reset(scope_token)
+    ambient._EPHEMERAL_OVERRIDE = True
+    try:
+        delivered = ambient._on_pre_llm_call_ambient_context(
+            turn_id="direct-turn", platform="discord"
         )
     finally:
-        ambient._ambient_cfg = original_cfg
+        ambient._EPHEMERAL_OVERRIDE = None
+    envelope = (delivered or {}).get("ephemeral_context") or ""
+    check(
+        "the model receives the direct-address directive inside the envelope",
+        envelope.startswith("<ambient_context ") and "direct" in envelope.lower(),
+        envelope[:200],
+    )
+    check(
+        "the envelope is ephemeral-only: never a persistent context key",
+        isinstance(delivered, dict) and "context" not in delivered,
+        repr(delivered),
+    )
+    # Seam-absent withhold: the paired framework advertises the seam, so the
+    # override must be forced False for THIS assertion only, then restored.
+    ambient._EPHEMERAL_OVERRIDE = False
+    try:
+        withheld_check = ambient._on_pre_llm_call_ambient_context(
+            turn_id="direct-turn", platform="discord"
+        )
+    finally:
+        ambient._EPHEMERAL_OVERRIDE = None
+    check(
+        "with the seam absent the envelope is withheld, not row-appended",
+        not (
+            isinstance(withheld_check, dict)
+            and withheld_check.get("ephemeral_context")
+        ),
+        repr(withheld_check),
+    )
 
-    print("\n-- outbound direct silence becomes an acknowledgment --")
+    placement_cfg = dict(adapter.config.extra["ambient_presence"])
+    placement_cfg["reply_style"] = {"enabled": True, "standalone_marker": "[STANDALONE]"}
+    adapter.config.extra = {"ambient_presence": placement_cfg}
+    placement_msg = RawMessage(Reference("199", replied), message_id="210")
+    placement_bundle = adapter._prepare_turn_context(placement_msg)
+    scope_token = ambient._verified_run_context.set(placement_bundle)
+    _id_token = _identity.set(
+        (placement_bundle.get("message_id"), placement_bundle.get("speaker_id"))
+    )
+    try:
+        ambient._on_pre_llm_call_turn_scope(turn_id="placement-turn")
+    finally:
+        _identity.reset(_id_token)
+        ambient._verified_run_context.reset(scope_token)
+    ambient._EPHEMERAL_OVERRIDE = True
+    try:
+        placement = ambient._on_pre_llm_call_ambient_context(
+            turn_id="placement-turn", platform="discord"
+        )
+    finally:
+        ambient._EPHEMERAL_OVERRIDE = None
+    placement_env = (placement or {}).get("ephemeral_context") or ""
+    check(
+        "the model receives standalone-placement guidance in the envelope",
+        "[STANDALONE]" in placement_env and "room-wide" in placement_env.lower(),
+        placement_env[:300],
+    )
+    check(
+        "a turn with no scope delivers nothing (cron/webhook turns get no envelope)",
+        ambient._on_pre_llm_call_ambient_context(
+            turn_id="", platform="cron"
+        )
+        in (None, {}),
+    )
+
+    print("\n-- a direct silence marker sends nothing: no fallback sentence --")
     sent = []
 
     async def fake_send(self, chat_id, content, *args, **kwargs):
@@ -258,18 +293,16 @@ async def main():
     discord_adapter.DiscordAdapter.send = fake_send
     adapter._direct_note_event(event)
     result = await adapter.send("channel-1", "[SILENT]", reply_to="200")
-    check("one Discord message is sent", len(sent) == 1, repr(sent))
+    check("no replacement message is sent", not sent, repr(sent))
     check(
-        "the control token is replaced by configured fallback",
-        bool(sent) and sent[0][1] == "I'm here.",
-        repr(sent),
+        "the silent outcome reports success with no delivered text",
+        getattr(result, "success", False) is True
+        and getattr(result, "delivered_text", "missing") == "",
+        repr(getattr(result, "delivered_text", "missing")),
     )
-    check("send reports success", getattr(result, "success", False) is True)
-    await adapter.send("channel-1", "[SILENT]", reply_to="200")
     check(
-        "the completed direct marker is consumed exactly once",
-        len(sent) == 1,
-        repr(sent),
+        "the adapter no longer fabricates presence text of any wording",
+        not hasattr(adapter, "_direct_silence_fallback"),
     )
 
     print("\n-- Discord replies are default; room-wide remarks may stand alone --")
@@ -283,10 +316,8 @@ async def main():
     accounted = []
     original_bounce_count = adapter._bounce_count_sent
     original_catchup_count = adapter._catchup_count_sent
-    original_direct_count = adapter._direct_count_sent
     adapter._bounce_count_sent = lambda anchor, result: accounted.append(("bounce", anchor))
     adapter._catchup_count_sent = lambda anchor, result: accounted.append(("catchup", anchor))
-    adapter._direct_count_sent = lambda anchor, result: accounted.append(("direct", anchor))
     try:
         await adapter.send(
             "channel-1",
@@ -296,7 +327,6 @@ async def main():
     finally:
         adapter._bounce_count_sent = original_bounce_count
         adapter._catchup_count_sent = original_catchup_count
-        adapter._direct_count_sent = original_direct_count
     check(
         "the standalone marker is stripped and the Discord reference is omitted",
         sent[-1]
@@ -309,7 +339,6 @@ async def main():
         == [
             ("bounce", "placement-2"),
             ("catchup", "placement-2"),
-            ("direct", "placement-2"),
         ],
         repr(accounted),
     )
@@ -335,14 +364,13 @@ async def main():
         repr(sent[-1]),
     )
 
-    adapter._direct_pending["placement-3"] = ambient.time.time()
+    before = len(sent)
     await adapter.send("channel-1", "[STANDALONE]", reply_to="placement-3")
     check(
-        "a marker-only direct turn falls back to an anchored acknowledgment",
-        sent[-1] == ("channel-1", "I'm here.", "placement-3"),
-        repr(sent[-1]),
+        "a marker-only direct turn also sends nothing",
+        len(sent) == before,
+        repr(sent[before:]),
     )
-    before = len(sent)
     await adapter.send("channel-1", "[STANDALONE]", reply_to="placement-4")
     check(
         "a marker-only ambient turn stays silent",

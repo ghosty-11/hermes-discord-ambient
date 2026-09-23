@@ -1,9 +1,115 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+import ast
 import os
 import sys
 from pathlib import Path
+
 module_root = Path(__file__).resolve().parents[1]
+
+def _paired_framework_issues(root: Path) -> list[str]:
+    """Check the source capabilities this plugin requires before activation."""
+    issues: list[str] = []
+
+    def tree(rel: str):
+        try:
+            return ast.parse((root / rel).read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            issues.append(f"{rel}: missing or unreadable")
+            return None
+
+    def functions(node):
+        return [n for n in getattr(node, "body", ())
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+    turn = tree("agent/turn_context.py")
+    if turn is not None:
+        marker = any(
+            isinstance(n, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "SUPPORTS_EPHEMERAL_CONTEXT"
+                    for target in n.targets)
+            and isinstance(n.value, ast.Constant) and n.value.value is True
+            for n in turn.body
+        )
+        builder = next((n for n in functions(turn)
+                        if n.name == "build_api_messages"), None)
+        wire_copy = (
+            builder is not None and any(
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name)
+                and n.func.id == "_append_ephemeral_to_wire_copy"
+                for n in ast.walk(builder)
+            )
+        )
+        if not (marker and wire_copy):
+            issues.append("agent/turn_context.py: ephemeral wire seam")
+        zero_retention = any(
+            isinstance(n, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "SUPPORTS_COMPANION_ZERO_RETENTION"
+                    for target in n.targets)
+            and isinstance(n.value, ast.Constant) and n.value.value is True
+            for n in turn.body
+        )
+        if not zero_retention:
+            issues.append("agent/turn_context.py: companion zero-retention seam")
+
+    origin = tree("gateway/turn_origin.py")
+    if origin is not None and not (
+        any(isinstance(n, ast.ClassDef) and n.name == "TurnOrigin"
+            for n in origin.body)
+        and any(n.name == "turn_origin_allows_silence" for n in functions(origin))
+    ):
+        issues.append("gateway/turn_origin.py: server-created response policy")
+
+    base = tree("gateway/platforms/base.py")
+    if base is not None:
+        adapter = next((n for n in base.body
+                        if isinstance(n, ast.ClassDef)
+                        and n.name == "BasePlatformAdapter"), None)
+        methods = functions(adapter)
+        process = [n for n in methods if n.name == "_process_message_background"]
+        records = (
+            len(process) == 1
+            and any(n.name == "_finalize_turn_delivery_record" for n in methods)
+            and any(n.name == "_turn_delivery_outcome" for n in methods)
+            and any(isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "_finalize_turn_delivery_record"
+                    for n in ast.walk(process[0]))
+        )
+        if not records:
+            issues.append("gateway/platforms/base.py: _process_message_background delivery path")
+
+    state = tree("hermes_state_messages.py")
+    if state is not None and not any(
+        n.name == "record_message_delivery"
+        for cls in state.body if isinstance(cls, ast.ClassDef)
+        for n in functions(cls)
+    ):
+        issues.append("hermes_state_messages.py: row-addressed delivery receipt")
+
+    search = tree("tools/session_search_tool.py")
+    if search is not None and not any(
+        n.name == "_companion_scope_decision" for n in functions(search)
+    ):
+        issues.append("tools/session_search_tool.py: scoped session search")
+    return issues
+
+
+if len(sys.argv) > 1 and sys.argv[1] in {"compat", "apply"}:
+    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    framework = Path(os.environ.get("HERMES_FRAMEWORK_PATH", str(home / "hermes-agent")))
+    issues = _paired_framework_issues(framework)
+    if issues:
+        print("discord-ambient: incompatible paired framework; refusing activation:", file=sys.stderr)
+        for issue in issues:
+            print(f"  {issue}", file=sys.stderr)
+        raise SystemExit(1)
+    if sys.argv[1] == "compat":
+        print("discord-ambient: paired framework capabilities present")
+        raise SystemExit(0)
 control = Path(os.environ.get("HARNESS_STACK_CONTROL", module_root.parents[1] / "control" / "harness-stack-control"))
 engine = control / "deploy" / "module_deploy.py"
 if not engine.is_file():

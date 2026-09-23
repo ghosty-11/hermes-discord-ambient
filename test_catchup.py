@@ -193,7 +193,9 @@ def stub_dispatch():
         seen["msg"] = message
         seen["hint"] = amb._ambient_hint.get("")
         seen["open"] = amb._ambient_open.get()
-        seen["speaker"] = amb._speaker_context.get(("", None))
+        prepared = self._prepared_turns.get(str(message.id)) or {}
+        seen["speaker_tag"] = prepared.get("speaker_tag")
+        seen["origin"] = prepared.get("turn_origin")
         seen["authorized_speaker"] = amb._current_speaker_id.get("")
         return True
 
@@ -228,14 +230,19 @@ async def main():
     check("target is the newest human message", getattr(d.get("msg"), "id", None) == 42423)
     check("silence is offered as the default", "[SILENT]" in hint)
     check(
-        "speaker identity reaches the catch-up request",
-        d.get("speaker", ("", None))[0].startswith("[speaker @bob id:2]"),
-        repr(d.get("speaker")),
+        "speaker identity reaches the catch-up turn bundle",
+        isinstance(d.get("speaker_tag"), str) and "id:2" in d["speaker_tag"],
+        repr(d.get("speaker_tag")),
     )
     check(
-        "catch-up speaker identity is cleared after dispatch",
-        amb._speaker_context.get(("", None)) == ("", None),
-        repr(amb._speaker_context.get(("", None))),
+        "the catch-up dispatch declares its typed origin",
+        d.get("origin", {}).get("kind") == "catch_up",
+        repr(d.get("origin")),
+    )
+    check(
+        "catch-up turn kind is cleared after dispatch",
+        amb._turn_kind.get("") == "",
+        repr(amb._turn_kind.get("")),
     )
     check(
         "catch-up authorization uses the current author",

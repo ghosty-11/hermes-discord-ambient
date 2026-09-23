@@ -306,12 +306,16 @@ async def check_embed_media():
     )
     with patch.dict(sys.modules, {"tools.transcription_tools": fake_transcription}):
         await adapter._transcribe_embedded_video_event(event)
+    staged = ambient._media_transcripts.get()
     check(
-        "local transcript is injected into the same user turn",
-        "transcript from embedded video" in event.text.lower()
-        and "escaped the sandbox" in event.text,
-        repr(event.text),
+        "local transcript is staged without rewriting the human turn",
+        event.text == "what happens in this clip?"
+        and len(staged) == 1
+        and staged[0]["text"] == "the speaker says the agent escaped the sandbox"
+        and staged[0]["source"] == "embedded_video",
+        repr((event.text, staged)),
     )
+    ambient._media_transcripts.set([])
 
 
 async def main():

@@ -1,4 +1,10 @@
-"""Regression checks for Discord voice-only reply correlation.
+"""Regression checks for Discord voice-only reply correlation (S02 scope).
+
+The TTS "speech happened" signal is bound to the verified turn that
+generated it — keyed by (bot id, inbound message id) — so an interleaved
+second seat can never have its text suppressed by another profile's
+speech (plan V10). The claim remains consume-once within the turn and
+expires with the window.
 
 Run with the framework venv:
 
@@ -38,11 +44,11 @@ def check(name, condition, detail=""):
     if condition:
         print(f"  PASS  {name}")
     else:
-        print(f"  FAIL  {name} {detail}")
+        print(f"  FAIL  {name}: {detail}")
         FAILURES.append(name)
 
 
-def make_adapter():
+def make_adapter(bot_id="999"):
     config = types.SimpleNamespace(
         extra={
             "ambient_presence": {
@@ -52,7 +58,11 @@ def make_adapter():
             }
         }
     )
-    return ambient.AmbientDiscordAdapter(config)
+    adapter = ambient.AmbientDiscordAdapter(config)
+    adapter._client = types.SimpleNamespace(
+        user=types.SimpleNamespace(id=bot_id, name=f"bot-{bot_id}")
+    )
+    return adapter
 
 
 async def main():
@@ -70,7 +80,14 @@ async def main():
     # MEDIA attachment is delivered. The internal notice must not consume the
     # one text-suppression claim intended for the model's transcript.
     ambient._profile_wants_voice_only = lambda: True
+    bundle = {
+        "message_id": "message-1",
+        "speaker_id": "101",
+        "gif_profile": "999",
+    }
+    scope_token = ambient._verified_run_context.set(bundle)
     ambient._note_tts_generated()
+    ambient._verified_run_context.reset(scope_token)
 
     fallback = (
         "🔄 Switched to fallback model: old/free via openrouter → "
@@ -92,6 +109,60 @@ async def main():
         repr(sent),
     )
 
+    print("\n-- the TTS signal is owned by the turn that generated it --")
+    ambient._tts_signals.clear()
+    bundle_a = {"message_id": "msg-a", "speaker_id": "1", "gif_profile": "111"}
+    scope_a = ambient._verified_run_context.set(bundle_a)
+    ambient._note_tts_generated()
+    ambient._verified_run_context.reset(scope_a)
+    check(
+        "the signal is keyed by seat and turn, not process-global",
+        ("111", "msg-a") in ambient._tts_signals, dict(ambient._tts_signals),
+    )
+
+    seat_b = make_adapter(bot_id="222")
+    suppressed_b = await seat_b.send("channel-9", "other seat text", reply_to="msg-a")
+    check(
+        "another seat's text is never suppressed by this seat's speech",
+        ("channel-9", "other seat text") in sent,
+        repr(sent),
+    )
+    check("the interleaved seat's own send succeeded",
+          getattr(suppressed_b, "success", False) is True)
+
+    seat_a = make_adapter(bot_id="111")
+    before = len(sent)
+    await seat_a.send("channel-8", "twin text", reply_to="msg-a")
+    check("the owning seat's text twin is suppressed",
+          len(sent) == before, repr(sent[before:]))
+
+    await seat_a.send("channel-8", "unrelated later text", reply_to="msg-b")
+    check(
+        "the claim is consume-once: later text in the window still goes out",
+        sent and sent[-1][1] == "unrelated later text", repr(sent[-2:]),
+    )
+
+    ambient._tts_signals.clear()
+    scope_token = ambient._verified_run_context.set(
+        {"message_id": "msg-late", "speaker_id": "1", "gif_profile": "111"}
+    )
+    ambient._note_tts_generated()
+    ambient._verified_run_context.reset(scope_token)
+    key = ("111", "msg-late")
+    ambient._tts_signals[key] = ambient.time.monotonic() - (
+        ambient._TTS_SIGNAL_WINDOW_S + 10
+    )
+    before = len(sent)
+    await seat_a.send("channel-8", "after the window", reply_to="msg-late")
+    check("an expired signal never suppresses", len(sent) == before + 1, repr(sent[before:]))
+
+    ambient._tts_signals.clear()
+    ambient._note_tts_generated()
+    check(
+        "a TTS call outside any verified turn arms nothing",
+        not ambient._tts_signals, dict(ambient._tts_signals),
+    )
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {FAILURES}")
@@ -99,5 +170,4 @@ async def main():
     print("ALL PASSED")
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())

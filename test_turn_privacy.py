@@ -196,11 +196,35 @@ def main():
             turn_id=f"runner-{source.message_id}",
             sender_id="101", platform="discord",
         )
+        # Simulate the framework's ephemeral seam (framework-owned): collect
+        # the ACTIVE profile's adapter-owned module hook and carry its
+        # wire-only envelope into the observed request, as build_api_messages
+        # would at the current-turn user index. Resolving the hook from the
+        # adapter's CLASS keeps profile-qualified plugin copies isolated:
+        # the second profile's turn must use the second module's scopes,
+        # not this file's `ambient` reference. On the base framework the
+        # hook withholds; the override stands in for the paired framework's
+        # SUPPORTS_EPHEMERAL_CONTEXT.
+        _active_adapter = runner._adapter_for_source(source)
+        _ephemeral_hook = getattr(
+            type(_active_adapter), "_ambient_ephemeral_context_hook", None
+        )
+        envelope = ""
+        if callable(_ephemeral_hook):
+            delivered = _ephemeral_hook(
+                turn_id=f"runner-{source.message_id}", platform="discord"
+            )
+            envelope = (delivered or {}).get("ephemeral_context") or ""
         request = apply_llm_request_middleware(
             {"messages": [{"role": "user", "content": message}]},
             turn_id=f"runner-{source.message_id}",
             platform="discord",
         ).payload
+        if envelope:
+            request = {
+                "messages": request["messages"]
+                + [{"role": "user", "content": envelope}]
+            }
         gate, _ = plugins_mod._dispatch_pre_tool_call_hooks(
             "image_generate", {"prompt": "x"}, turn_id=f"runner-{source.message_id}"
         )
@@ -224,6 +248,9 @@ def main():
             )
         return {"final_response": "ok"}
 
+    # Stand in for the paired framework's SUPPORTS_EPHEMERAL_CONTEXT seam
+    # for the whole scenario run; restored before the assertions return.
+    ambient._EPHEMERAL_OVERRIDE = True
     runner._run_agent_inner = fake_run_agent_inner
     runner._adapter_for_source = lambda source: adapter
 
@@ -462,46 +489,52 @@ def main():
     finally:
         ambient._image_gate_cfg = old_cfg
         plugins_mod._plugin_manager = old_manager
-
+        ambient._EPHEMERAL_OVERRIDE = None
     req_a = observed["1"]["request"]
     req_b = observed["2"]["request"]
     wire_a = "\n".join(str(row.get("content", "")) for row in req_a["messages"])
     wire_b = "\n".join(str(row.get("content", "")) for row in req_b["messages"])
     check(
         "GatewayRunner current source overrides cached sender",
-        "id:202" in wire_b and "id:101" not in wire_b,
+        'speaker_id="202"' in wire_b and 'speaker_id="101"' not in wire_b,
         wire_b,
     )
-    check("first queued-chain turn has Alice identity", "id:101" in wire_a and "id:202" not in wire_a, wire_a)
-    check("second queued-chain turn has Bob identity", "id:202" in wire_b and "id:101" not in wire_b, wire_b)
+    check("first queued-chain turn has Alice identity",
+          'speaker_id="101"' in wire_a and 'speaker_id="202"' not in wire_a, wire_a)
+    check("second queued-chain turn has Bob identity",
+          'speaker_id="202"' in wire_b and 'speaker_id="101"' not in wire_b, wire_b)
     check("Alice retains image authorization", observed["1"]["gate"] is None, repr(observed["1"]["gate"]))
     check("Bob cannot inherit Alice image authorization", isinstance(observed["2"]["gate"], str), repr(observed["2"]["gate"]))
 
     reset_wire = "\n".join(
         str(row.get("content", "")) for row in observed["4"]["request"]["messages"]
     )
-    check("private command bundle cannot leak into later public turn", "dm" not in reset_wire.lower() and "id:101" in reset_wire, reset_wire)
+    check("private command bundle cannot leak into later public turn",
+          "dm" not in reset_wire.lower() and 'speaker_id="101"' in reset_wire, reset_wire)
     reverse_a_wire = "\n".join(str(r.get("content", "")) for r in observed["5"]["request"]["messages"])
     reverse_b_wire = "\n".join(str(r.get("content", "")) for r in observed["6"]["request"]["messages"])
-    check("reversed same-session order keeps Alice exact", "id:101" in reverse_a_wire and "id:202" not in reverse_a_wire, reverse_a_wire)
-    check("reversed same-session order keeps Bob exact", "id:202" in reverse_b_wire and "id:101" not in reverse_b_wire, reverse_b_wire)
+    check("reversed same-session order keeps Alice exact",
+          'speaker_id="101"' in reverse_a_wire and 'speaker_id="202"' not in reverse_a_wire, reverse_a_wire)
+    check("reversed same-session order keeps Bob exact",
+          'speaker_id="202"' in reverse_b_wire and 'speaker_id="101"' not in reverse_b_wire, reverse_b_wire)
     catchup_wire = "\n".join(str(r.get("content", "")) for r in observed["7"]["request"]["messages"])
     check("catch-up context survives the real runner boundary", "CATCHUP_SENTINEL" in catchup_wire, catchup_wire)
     check("thread echo binds actual delivery thread", "8008" in adapter._room_echo, repr(adapter._room_echo))
     missing_wire = "\n".join(str(r.get("content", "")) for r in observed["99"]["request"]["messages"])
-    check("no-bundle turn withholds private context", "[speaker " not in missing_wire and isinstance(observed["99"]["gate"], str), missing_wire)
+    check("no-bundle turn withholds private context",
+          "<ambient_context" not in missing_wire and isinstance(observed["99"]["gate"], str), missing_wire)
     check("reply anchor cannot substitute for incoming identity",
           isinstance(observed[None]["gate"], str), repr(observed[None]["gate"]))
     second_wire = "\n".join(str(row.get("content", ""))
                             for row in observed["88"]["request"]["messages"])
     check("profile-qualified plugin import binds its own turn",
-          "id:202" in second_wire, second_wire)
+          'speaker_id="202"' in second_wire, second_wire)
     check("completed dispatch cannot authorize a later unbound turn",
           isinstance(observed["after-return"]["gate"], str))
     for message_id in ("77", "78"):
         wire = repr(observed[message_id]["request"])
         check(f"verified turn {message_id} authorizes with speaker tags disabled",
-              observed[message_id]["gate"] is None and "[speaker " not in wire, wire)
+              observed[message_id]["gate"] is None and "speaker_id=" not in wire, wire)
     check("long queued wait retains exact turn authorization", observed["80"]["gate"] is None)
     check("accepted event survives transport cancellation", observed["82"]["gate"] is None)
     check("unbound ambient context does not erase framework user identity",
@@ -515,7 +548,7 @@ def main():
           observed["90"]["gate"] is None, repr(observed["90"]["gate"]))
     anchor_wire = repr(observed[None]["request"])
     check("reply anchor turn receives no retained private context",
-          "[speaker " not in anchor_wire and "dm" not in anchor_wire.lower(),
+          "speaker_id=" not in anchor_wire and "dm" not in anchor_wire.lower(),
           anchor_wire[:200])
     check("binding failure is an availability refusal, not user denial",
           isinstance(observed["binding-error"]["gate"], str)
@@ -533,6 +566,11 @@ def main():
     ambient._image_gate_cfg = old_cfg
     plugins_mod._plugin_manager = old_manager
 
+    guild_b = Guild(2, "Guild B")
+    channel_b = Channel(20, "commons", guild_b)
+    adapter._client.get_channel = lambda cid: {
+        10: channel_a, 20: channel_b,
+    }.get(cid)
     public = {
         "id": 1, "guild_id": "2", "guild_name": "Guild B", "channel_id": "20",
         "channel_name": "commons", "chat_type": "channel", "admitted": True,
@@ -589,10 +627,12 @@ def main():
     adapter._discard_prepared_turn(excluded_bundle)
 
     adapter._room_echo = ambient.OrderedDict({
-        "10": (ambient.time.time(), {"same alpha", "same beta"}),
+        "10": ambient.OrderedDict({"same alpha": ambient.time.time(),
+                                   "same beta": ambient.time.time()}),
     })
     check("channel A echo is suppressed", adapter._room_echo_leak("same alpha\nsame beta", "10"))
-    check("channel A echo does not suppress channel B", not adapter._room_echo_leak("same alpha\nsame beta", "11"))
+    check("channel A echo does not suppress channel B",
+          not adapter._room_echo_leak("same alpha\nsame beta", "11"))
     for channel_number in range(200):
         adapter._bind_room_echo(
             str(1000 + channel_number),

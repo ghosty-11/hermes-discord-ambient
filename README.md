@@ -15,10 +15,10 @@ Hermes' chat gate is binary. A bot either answers **every** message in a channel
 (`require_mention: false` / free-response channels) or **only** when explicitly
 `@mentioned`. Neither models someone who hangs out in a server and chimes in sometimes.
 
-The obvious extension points don't help:
+The extension needs two framework boundaries:
 
-- **Gateway hooks** are fire-and-forget observers. Only `pre_tool_call` can veto, and only for tools.
-- **`[SILENT]` suppression** is global at the gateway boundary. It does not know whether a Discord turn was ambient or directly addressed.
+- **Admission and origin:** The server identifies whether the Discord turn was directly addressed or an ambient join. User text cannot declare its own response policy.
+- **Request-only context:** `pre_llm_call` places verified, tagged context on the current user row's wire copy. It never writes private context to `message.content` or `api_content`.
 
 ## What it adds
 
@@ -27,8 +27,8 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 | Behaviour | Cost | What it does |
 |---|---|---|
 | **Ambient joining** | 1 inference | Re-dispatch a mention-rejected message as free-response. Rate-limited by cooldown, daily cap and probability. Plain-text name triggers bypass the long cooldown (short anti-spam floor only). Budget is charged only when the join reaches the agent. |
-| **Silence** | — | The model may answer `[SILENT]`; the adapter swallows it. |
-| **Direct-reply guarantee** | zero | Restores replied-to author identity, marks DMs / mentions / name hits / replies-to-self as direct, and converts a direct silence token into `direct_silence_fallback` (default `I'm here.`). |
+| **Silence** | — | A discretionary turn may answer `[SILENT]`; the gateway and adapter send nothing. A required turn keeps the gateway's existing error/fallback policy. |
+| **Direct-turn ownership** | zero | Restores replied-to author identity and marks DMs, mentions, name hits and replies-to-self as direct. The server-created turn origin, not a canned presence sentence, decides the silence policy. |
 | **Reply-target attribution** | zero | Labels a quote of someone else's message with that author's name so the bot does not treat it as speech to itself. |
 | **Hybrid reply placement** | zero | Actual Discord replies remain the default. With `reply_style.enabled`, the model may mark an obvious room-wide remark with `[STANDALONE]`; the marker is stripped wherever it lands in the reply, and only that send drops its Discord reply reference. Surfaces without a reply anchor (cron, webhook) are never given the guidance. |
 | **Reactions** | zero | Emoji on messages it does not answer. Regex rules plus a fallback pool. |
@@ -40,8 +40,8 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 | **Fallback-notice routing** | zero | Parses both framework fallback formats for standby. Sends the notice to `system_notices.reroute_channel` when configured; otherwise `suppress_fallback_notice` drops it. |
 | **Group-address greetings** | 1 inference when it answers | "good morning agents" / "hello everyone" at its own probability and cooldown, exempt from the daily cap. |
 | **System-notice rerouting** | zero | Compression, provider, fallback, reset and cron diagnostics go to a private channel. Drain and stall notices can be rewritten in-character. Routine progress plumbing is dropped. |
-| **Speaker identity** | zero | Request-only `[speaker @handle id:123]` so memory can key on a stable id. Queued messages bind the verified framework `sender_id` to the actual `turn_id`; missing identity clears the scope instead of inheriting another speaker. Not written onto the persisted user turn. |
-| **Room context** | zero | Request-only `[ambient room: …]` — server, channel, topic, thread, optional operator notes per guild and per channel — plus a roster of recently-present people and the last few lines of room talk with reply refs (`→ @author`; the bot's own messages ride as `you`, so a populated buffer preserves its side of the conversation across sessions — with `persist_room_talk` on it survives restarts from disk; otherwise it repopulates via live traffic or eligible catch-up). Bound to the actual `turn_id`, never written onto the persisted user turn; echo suppression is scoped to the destination channel. |
+| **Speaker identity** | zero | A verified speaker id and display name enter the current turn's tagged request-only envelope. Queued messages bind the framework sender to the actual turn id; missing identity withholds the envelope instead of inheriting another speaker. |
+| **Room context** | zero | Tagged, bounded request-only context contains server, channel, topic, thread, permitted operator notes, a roster and recent room talk with reply references. It is bound to the actual turn id and screened from outbound echoes. With `persist_room_talk`, the underlying admitted buffer survives restarts; the injected projection never enters persisted user text. |
 | **Speaker boost** | zero | Per-user overrides of probability / cooldown / daily cap. Cooldown is the load-bearing half. |
 | **Conversation window** | zero | Messages in the bot's wake get a high response chance, bounded by both count and elapsed time. |
 | **Catch-up** | zero per scan; 1 inference on a check-in | Timer scanner. Hands **one** real message to the normal ambient path with a transcript. Same budget as reactive joins. |
@@ -67,17 +67,18 @@ the 512-entry least-recently-used bound limits storage without expiring a bundle
 while it waits behind a long turn. Exhausting that bound can withhold old context.
 On a quiet profile, unconsumed bundle content can remain in process memory until
 consumption, eviction or shutdown; the bound limits capacity, not retention time.
-Travel visibility is classified at admission, not continuously monitored.
-Later permission changes do not revoke existing records automatically; normal
-32-hour closed-beat retention still applies.
+Before each travel projection, the adapter checks current channel permissions
+or the Discord channel cache. An uncached source is withheld but kept until
+the cache recovers. A confirmed loss of public visibility removes the source's
+beats and lane; the next sweep removes them from persisted state.
 
 The process wrapper dispatches through each adapter's own callback so
 profile-qualified plugin imports keep their own context. It binds a task-local
 `gateway.session_context._ambient_turn_identity` attestation for the matching
 memory-recall plugin and restores it on return. Missing attestation withholds
 Discord recall; cached sender fields and environment variables cannot supply it.
-Deploy the matching ambient and memory-policy revisions together before the
-separately approved gateway restart. No framework source file is modified.
+Use matching ambient, memory-policy and framework revisions. An older
+framework withholds private context instead of persisting it.
 Failed binding installation leaves the image gate fail-closed with an explicit
 availability reason. Framework session identity remains distinct from private
 context authorization; the attestation, not blank identity fields, carries proof.
@@ -139,6 +140,7 @@ platforms:
   discord:
     extra:
       ambient_presence:
+        companion_skill_view: false  # requires the separate Discord toolset grant
         enabled: true
         channels: ["*"]            # "*" = any channel the bot can see, or list ids
         probability: 0.12          # code default; recipe below uses 0.10
@@ -147,19 +149,11 @@ platforms:
         name_triggers: ["bot-name"]
         name_cooldown_seconds: 60
         silent_marker: "[SILENT]"
-        direct_silence_fallback: "I'm here."
         no_threads: true
         reply_style:
           enabled: false
           standalone_marker: "[STANDALONE]"
         speaker_identity: true
-        speaker_memory:
-          enabled: false
-          binary: /path/to/recall-binary
-          memory_dir: /path/to/store
-          max_facts: 8
-          max_chars: 600
-          timeout_seconds: 4
         speaker_boost:
           "553...":
             probability: 0.75
@@ -296,6 +290,15 @@ platforms:
 
 `KLIPY_API_KEY` belongs in the **profile's** `.env`, never in `config.yaml`.
 
+To expose the two approved reference skills, set
+`platforms.discord.extra.ambient_presence.companion_skill_view: true` in the
+named companion profile and grant `companion_skills` in
+`platform_toolsets.discord`. Keep the built-in `skills` toolset disabled.
+The view reads only `optmem` and `philosophy-of-agency`; it cannot list,
+install or edit skills, and it is unavailable to command-line, cron and API
+surfaces.
+
+
 ## Recipe: a community chatbot
 
 An inference is the expensive thing. Most of this recipe is about spending them rarely.
@@ -329,14 +332,14 @@ are for uninvited interjections only — never let a cooldown suppress a direct 
 ### 3. Personality lives in `SOUL.md`
 
 Commit to a character with a point of view. State that silence is allowed, that
-`[SILENT]` is only for uninvited turns, and that a bracketed stage direction is not
-something to quote. Bound bot-to-bot exchanges in prose **and** with `bot_bounce`.
+`[SILENT]` belongs only on a turn whose server-origin policy permits silence.
+Bound bot-to-bot exchanges in prose **and** with `bot_bounce`.
 
 ### 4. Memory without a shell
 
 Pair with [hermes-optmem-tools](https://github.com/ghosty-11/hermes-optmem-tools). Key
-notes on `@handle id:<number>`, never a display name. `speaker_identity` supplies that
-id as a request-only prefix.
+notes on `@handle id:<number>`, never a display name alone. The verified
+speaker id rides in the request-only envelope.
 
 ### 5. Lock the public surface
 
@@ -370,11 +373,21 @@ bug, not a style choice.
 
 - **Opt-in.** No `enabled: true` → stock Discord, including on a multiplexed gateway that
   also serves operator profiles.
-- **Fail closed.** Exceptions degrade to stock behaviour, never to a mute or an auth bypass.
+- **Fail closed.** Missing identity or an unavailable context seam withholds
+  optional context; it never authorizes another speaker or persists private bytes.
 - **Auth is re-run.** Ambient re-dispatch cannot skip `_is_allowed_user`.
-- **Directives are request-only.** Ambient hints, speaker tags, speaker memory, room
-  context and quiet resume are appended to the outgoing request. They are not written
-  onto `message.content`.
+- **Private context is request-only.** Verified speaker, room, travel, media
+  transcript and automatic memory blocks enter a bounded tagged envelope on
+  the current user row's wire copy. They never enter `message.content`,
+  `api_content`, summaries or exports; without the paired framework seam,
+  they are withheld instead of persisted.
+- **Zero retained companion observations.** On a speaker-scoped Discord turn,
+  the paired framework discards replayable plugin `pre_llm_call.context` and
+  bare-string results before spill, and skips native memory prefetch.
+  Server-authored one-shot gateway notices remain a separate exception.
+  The human transcript, reviewed OptMem facts and separately bounded travel
+  state retain their own contracts; dynamic observations never enter
+  historical `api_content`.
 - **Room context is structurally safe.** Snippets are flattened to single lines and
   capped, so user text cannot forge a wrapper row or an identity line; a reply that
   repeats two lines of the surfaced talk is suppressed, exactly like a catch-up echo.
@@ -383,17 +396,19 @@ bug, not a style choice.
 - **Beats are observed facts.** A travel-log beat records traffic the adapter saw —
   counts, participants, snippets from the room-talk buffer. Nothing in it is model
   output, and no inference ever summarises a visit.
-- **The travel projection is request-only.** Like room context it is appended to the
-  outgoing request and never written onto `message.content`; the beats underneath are
-  persisted state, the projection itself never is.
+- **Travel observations are stored separately.** Admitted beats persist in
+  the travel log; their per-turn projection enters only the wire request,
+  never the conversation transcript or its `api_content` sidecar.
 - **Closure is traffic-based.** Beats close on observed idle clocks alone — sessions
   are never consulted, and gateway downtime simply counts as quiet.
 - **No disk I/O on the message path.** Lanes live in memory; the sweep tick is the
   only writer, and it writes atomically (temp file plus rename).
-- **Silence is scoped.** Unaddressed `[SILENT]` is swallowed. A directly addressed turn
-  that emits silence becomes `direct_silence_fallback`.
-- **Charge at send.** Bot-bounce and the shared catch-up budget count replies that went
-  out, not intentions. A swallowed `[SILENT]` does not spend them.
+- **Silence follows server origin.** A discretionary direct or ambient turn
+  may send nothing. Required work turns keep the gateway's error policy;
+  neither path fabricates an availability sentence.
+- **Charge after receipt.** Bot-bounce, catch-up and travel speech count
+  delivered replies, not dispatches or failed transports. A screened or
+  intentionally silent turn sends nothing.
 - **Catch-up cannot raise the ceiling.** With `respect_ambient_budget: true` (the default)
   a check-in spends the same cooldown and daily cap as a reactive join.
 - **One check-in per pass.** `channels: ["*"]` changes where a check-in may happen, never
@@ -424,12 +439,12 @@ gates already measure "is anyone here".
 is excluded automatically. State lives in
 `$HERMES_HOME/state/ambient-catchup-<bot-user-id>.json`.
 
-The catch-up directive is single-line bracketed wrappers around the transcript, each
-short enough for `_AMBIENT_ECHO_RE` to strip. Transcript lines themselves are matched
-verbatim: two copied lines suppress the reply; one quoted line is allowed.
+The catch-up directive is a typed block inside the reserved request-only
+envelope. Transcript lines remain untrusted observations; two copied lines
+suppress an echo, while one quoted line is allowed.
 
 ```bash
-cd /var/lib/hermes/.hermes/hermes-agent
+cd <framework-checkout>
 venv/bin/python /path/to/hermes-discord-ambient/test_catchup.py
 ```
 
@@ -479,24 +494,27 @@ the first dispatch, entries keeping their true timestamps. All writes happen on 
 sweep tick, atomically; the per-message path touches memory only.
 
 ```bash
-cd /var/lib/hermes/.hermes/hermes-agent
+cd <framework-checkout>
 venv/bin/python /path/to/hermes-discord-ambient/test_travel_log.py
 ```
 
-## Known limitations
-
-- Voice-only TTS suppression is a process-global, consume-once signal. Concurrent voice
-  turns from multiplexed profiles can consume one another's 45-second suppression claim,
-  so avoid enabling `voice_only_replies` on profiles that may speak concurrently.
-- The test commands assume the Hermes framework checkout and virtualenv live at
-  `/var/lib/hermes/.hermes/hermes-agent`. On another installation, substitute that
-  checkout's `venv/bin/python` path.
 
 ## Maintenance
 
 The plugin depends on private adapter methods. `discord-adapter-watch.sh` hashes those
 regions and stays silent unless they move — run it monthly as a `no_agent` cron job.
 If it fires, re-check the plugin against the bundled adapter before the next `hermes update`.
+
+Before you activate this module, check the paired framework source. The
+`deploy/deploy apply` wrapper runs the same check and refuses missing
+wire-context, zero-retention, turn-origin, delivery-receipt or scoped-search
+capabilities.
+The `compat` command reads source only; it does not deploy or restart anything:
+
+```bash
+HERMES_FRAMEWORK_PATH=<framework-checkout> \
+  python3 deploy/deploy compat
+```
 
 Coupling the watcher actually hashes:
 
@@ -524,8 +542,12 @@ append-only memory as tools, so a public bot can remember people without a shell
 
 ## Tests
 
+Set `<framework-checkout>` to a framework checkout with its virtual
+environment installed. Run the scenarios with the paired framework source;
+the private context seam is unavailable on older revisions.
+
 ```bash
-cd /var/lib/hermes/.hermes/hermes-agent
+cd <framework-checkout>
 venv/bin/python /path/to/hermes-discord-ambient/test_catchup.py
 venv/bin/python /path/to/hermes-discord-ambient/test_direct_reply.py
 venv/bin/python /path/to/hermes-discord-ambient/test_no_threads.py
@@ -535,6 +557,10 @@ venv/bin/python /path/to/hermes-discord-ambient/test_config_and_persistence.py
 venv/bin/python /path/to/hermes-discord-ambient/test_room_context.py
 venv/bin/python /path/to/hermes-discord-ambient/test_image_gate.py
 venv/bin/python /path/to/hermes-discord-ambient/test_turn_privacy.py
+venv/bin/python /path/to/hermes-discord-ambient/test_ephemeral_delivery.py
+venv/bin/python /path/to/hermes-discord-ambient/test_context_envelope.py
+venv/bin/python /path/to/hermes-discord-ambient/test_outbound_envelope_screen.py
+venv/bin/python /path/to/hermes-discord-ambient/test_companion_skill_read.py
 ```
 
 `test_turn_privacy.py` holds the gateway module's import lock in another thread

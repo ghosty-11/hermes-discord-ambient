@@ -207,21 +207,58 @@ check(
 check("staging never touches message.content",
       (adapter2._stage_room_context((m := Message(302, ALICE, GENERAL, "keep me"))), m.content == "keep me")[1])
 
-print("request-only delivery through the middleware")
+print("context delivery is ephemeral-only; binding never appends rows")
 adapter2._stage_room_context(Message(303, ALICE, GENERAL, "turn text"))
 room = ambient._room_context.get("")
 check("room context staged in the ContextVar", room.startswith("[ambient room:"), room[:40])
 request = {"messages": [{"role": "user", "content": "turn text"}]}
-out = ambient._on_llm_request_ambient_hint(request=request, platform="discord")
-check("middleware appended a request-only row", out is not None and len(out["request"]["messages"]) == 2)
-check("original request list is unmodified", len(request["messages"]) == 1)
-check("appended row carries the room context", room in out["request"]["messages"][-1]["content"])
-clear = ambient._room_context.set("")
-out2 = ambient._on_llm_request_ambient_hint(
-    request={"messages": [{"role": "user", "content": "hi"}]}, platform="discord"
-)
-ambient._room_context.reset(clear)
-check("no staged room context means no extra row", out2 is None, out2)
+out = ambient._on_llm_request_bind_turn_scope(request=request, platform="discord")
+check("the binding middleware delivers no provider rows", out is None, out)
+check("the request is left untouched", len(request["messages"]) == 1, request)
+from gateway import session_context as _session_ctx
+import contextvars as _cv
+
+_identity = getattr(_session_ctx, "_ambient_turn_identity", None)
+if _identity is None:
+    _identity = _cv.ContextVar("ambient_turn_identity", default=None)
+    _session_ctx._ambient_turn_identity = _identity
+turn_msg = Message(303, ALICE, GENERAL, "turn text")
+bundle = adapter2._prepare_turn_context(turn_msg)
+_scope_token = ambient._verified_run_context.set(bundle)
+_id_token = _identity.set((bundle.get("message_id"), bundle.get("speaker_id")))
+try:
+    ambient._on_pre_llm_call_turn_scope(turn_id="room-turn")
+finally:
+    _identity.reset(_id_token)
+    ambient._verified_run_context.reset(_scope_token)
+ambient._EPHEMERAL_OVERRIDE = True
+try:
+    delivered = ambient._on_pre_llm_call_ambient_context(
+        turn_id="room-turn", platform="discord"
+    )
+finally:
+    ambient._EPHEMERAL_OVERRIDE = None
+envelope = (delivered or {}).get("ephemeral_context") or ""
+check("the frozen envelope carries the room observation",
+      envelope.startswith("<ambient_context ") and "[ambient room:" in envelope
+      and "Community Server" in envelope, envelope[:200])
+check("the envelope never carries a persistent context key",
+      isinstance(delivered, dict) and "context" not in delivered, repr(delivered))
+# Same fixture rule as direct_reply: force the seam absent for THIS
+# assertion only (the paired framework advertises it), then restore.
+ambient._EPHEMERAL_OVERRIDE = False
+try:
+    withheld = ambient._on_pre_llm_call_ambient_context(
+        turn_id="room-turn", platform="discord"
+    )
+finally:
+    ambient._EPHEMERAL_OVERRIDE = None
+check("absent seam withholds the envelope entirely",
+      not (isinstance(withheld, dict) and withheld.get("ephemeral_context")),
+      repr(withheld))
+check("binding still exposes the staged room rows",
+      ambient._room_context.get("").startswith("[ambient room:"),
+      ambient._room_context.get("")[:40])
 
 print("echo protection for the room block")
 adapter2._stage_room_context(Message(304, ALICE, GENERAL, "a third line"))
@@ -230,6 +267,35 @@ adapter2._bind_room_echo(str(GENERAL.id), {"room_context": ambient._room_context
 check("two copied talk lines are a leak",
       len(lines) >= 2 and adapter2._room_echo_leak("\n".join(lines[:2]), GENERAL.id))
 check("one quoted line is allowed", not adapter2._room_echo_leak(lines[0] if lines else "x", GENERAL.id))
+
+print("echo acceptance is bounded per line, not refreshed per bind")
+fresh = time.time()
+adapter2._room_echo[str(GENERAL.id)] = ambient.OrderedDict({
+    "old line one": fresh - 901,
+    "old line two": fresh - 901,
+    "new line three": fresh,
+})
+check("an aged line expires individually while a fresh line still matches",
+      not adapter2._room_echo_leak("old line one\nold line two\nnew line three", GENERAL.id),
+      dict(adapter2._room_echo[str(GENERAL.id)]))
+check("the fresh line alone is still not a leak",
+      not adapter2._room_echo_leak("new line three", GENERAL.id))
+adapter2._room_echo[str(GENERAL.id)] = ambient.OrderedDict({
+    "kept line": fresh - 600,
+    "rebound line": fresh - 600,
+})
+adapter2._bind_room_echo(str(GENERAL.id), {"room_context": "rebound line"})
+aged = dict(adapter2._room_echo[str(GENERAL.id)])
+check("re-binding one line does not refresh another line's age",
+      aged.get("kept line") == fresh - 600 and aged.get("rebound line") != fresh - 600,
+      aged)
+for extra in range(300):
+    adapter2._bind_room_echo(
+        str(GENERAL.id), {"room_context": f"bulk echo line {extra}"}
+    )
+check("a channel's echo set stays count-bounded",
+      len(adapter2._room_echo[str(GENERAL.id)]) <= 96,
+      len(adapter2._room_echo[str(GENERAL.id)]))
 
 print("guild-scoped ping resolution")
 adapter3 = build_adapter(ROOM_CFG)
