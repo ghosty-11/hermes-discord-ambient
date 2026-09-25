@@ -155,6 +155,32 @@ def main():
         raise registration_errors[0]
     check("registration completes while gateway import is held by another thread",
           registered_without_gateway_import)
+    from model_tools import get_tool_definitions
+    skill_defs = get_tool_definitions(
+        enabled_toolsets=["skills_ro"], quiet_mode=True,
+    )
+    skill_names = {tool["function"]["name"] for tool in skill_defs}
+    check("companion skill view is readable without mutable management",
+          {"skills_list", "skill_view"} <= skill_names
+          and "skill_manage" not in skill_names,
+          repr(sorted(skill_names)))
+    from agent import turn_context as framework_turn_context
+    incompatible_hooks = []
+    incompatible_ctx = types.SimpleNamespace(
+        register_hook=lambda *args, **kwargs: incompatible_hooks.append(args),
+        register_middleware=lambda *args, **kwargs: incompatible_hooks.append(args),
+        register_tool=lambda *args, **kwargs: incompatible_hooks.append(args),
+    )
+    refused = False
+    with mock.patch.object(framework_turn_context, "SUPPORTS_EPHEMERAL_CONTEXT", False), \
+         mock.patch.object(ambient._bundled, "register") as stock:
+        try:
+            ambient.register(incompatible_ctx)
+        except RuntimeError as exc:
+            refused = "ephemeral_context" in str(exc)
+    check("missing wire-only framework seam refuses plugin activation",
+          refused and stock.call_count == 0 and not incompatible_hooks,
+          repr(incompatible_hooks))
     recall_plugin = os.environ.get("HERMES_RECALL_PLUGIN")
     recall_requests, persistable = {}, []
     if recall_plugin:
@@ -162,24 +188,33 @@ def main():
         recall = importlib.util.module_from_spec(recall_spec)
         recall_spec.loader.exec_module(recall)
         recall._available = lambda: True
-        recall._cfg = lambda: {"speaker_scoped": True}
+        memory_dir = os.path.join(os.environ["HERMES_HOME"], "memory")
+        os.makedirs(memory_dir, exist_ok=True)
+        recall._cfg = lambda: {"speaker_scoped": True, "memory_dir": memory_dir}
+        recall._profile_restricted = lambda: True
+        for user_id, fact in (
+            ("101", "ALICE_PRIVATE_RECALL"),
+            ("202", "BOB_PRIVATE_RECALL"),
+        ):
+            assert recall._record_review_row(
+                memory_dir, fact, f"id:{user_id}", f"id:{user_id}",
+                reviewed_by="synthetic-test",
+            )
         recall._run = lambda args, cap: {
             "id:101": "ALICE_PRIVATE_RECALL", "id:202": "BOB_PRIVATE_RECALL"
         }.get(args[-1], "")
-        stage, inject = recall.on_pre_llm_call, recall.on_llm_request
+        stage = recall.on_pre_llm_call
 
         def capture_stage(**kwargs):
             result = stage(**kwargs)
             persistable.append(result)
-            return result
-
-        def capture_request(**kwargs):
-            result = inject(**kwargs)
-            recall_requests[kwargs.get("turn_id")] = repr(result or kwargs.get("request"))
+            recall_requests[kwargs.get("turn_id")] = (
+                result.get("ephemeral_context", "")
+                if isinstance(result, dict) else ""
+            )
             return result
 
         recall.on_pre_llm_call = capture_stage
-        recall.on_llm_request = capture_request
         recall.register(ctx)
     old_manager = plugins_mod._plugin_manager
     plugins_mod._plugin_manager = manager
@@ -191,7 +226,7 @@ def main():
     adapter._pending_messages = {}
 
     async def fake_run_agent_inner(message, context_prompt, history, source, session_id, **kwargs):
-        plugins_mod.invoke_hook(
+        pre_results = plugins_mod.invoke_hook(
             "pre_llm_call",
             turn_id=f"runner-{source.message_id}",
             sender_id="101", platform="discord",
@@ -201,6 +236,19 @@ def main():
             turn_id=f"runner-{source.message_id}",
             platform="discord",
         ).payload
+        # The fake runner replaces the agent loop. Compose its hook results
+        # through the actual framework helper into a fresh current-user wire
+        # row, never the persisted input message or an llm_request tail row.
+        ephemeral = "\n".join(
+            result["ephemeral_context"] for result in pre_results
+            if isinstance(result, dict)
+            and isinstance(result.get("ephemeral_context"), str)
+        )
+        if ephemeral:
+            from agent.turn_context import _append_ephemeral_to_wire_copy
+            current = dict(request["messages"][0])
+            _append_ephemeral_to_wire_copy(current, ephemeral)
+            request = {**request, "messages": [current, *request["messages"][1:]]}
         gate, _ = plugins_mod._dispatch_pre_tool_call_hooks(
             "image_generate", {"prompt": "x"}, turn_id=f"runner-{source.message_id}"
         )
@@ -600,8 +648,14 @@ def main():
         )
     check("channel echo map stays bounded", len(adapter._room_echo) == 128, len(adapter._room_echo))
     if recall_plugin:
-        check("coupled recall returns no persistable hook context",
-              bool(persistable) and all(value is None for value in persistable))
+        check("coupled recall has no replayable hook context",
+              bool(persistable) and all(
+                  value is None or (
+                      isinstance(value, dict)
+                      and "context" not in value
+                      and set(value) == {"ephemeral_context"}
+                  ) for value in persistable
+              ))
         check("coupled first turn recalls only Alice",
               "ALICE_PRIVATE_RECALL" in recall_requests["runner-1"]
               and "BOB_PRIVATE_RECALL" not in recall_requests["runner-1"])

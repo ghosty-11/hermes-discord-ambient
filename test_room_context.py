@@ -14,12 +14,14 @@ Run from the framework checkout:
 
 import asyncio
 import importlib.util
+from html import escape
 import os
 import re
 import sys
 import tempfile
 import time
 import types
+from unittest.mock import patch
 
 sys.path.insert(0, os.environ.get("HERMES_FRAMEWORK_PATH", "/var/lib/hermes/.hermes/hermes-agent"))
 os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="room-context-test-")
@@ -207,21 +209,43 @@ check(
 check("staging never touches message.content",
       (adapter2._stage_room_context((m := Message(302, ALICE, GENERAL, "keep me"))), m.content == "keep me")[1])
 
-print("request-only delivery through the middleware")
+print("wire-only room context on the verified current turn")
 adapter2._stage_room_context(Message(303, ALICE, GENERAL, "turn text"))
 room = ambient._room_context.get("")
 check("room context staged in the ContextVar", room.startswith("[ambient room:"), room[:40])
+turn_id = "room-303"
+with ambient._turn_scopes_lock:
+    ambient._turn_scopes[turn_id] = {
+        "speaker_id": "42", "message_id": "303", "room_context": room,
+    }
+try:
+    out = ambient._on_pre_llm_call_ambient_context(
+        turn_id=turn_id, platform="discord",
+    )
+finally:
+    with ambient._turn_scopes_lock:
+        ambient._turn_scopes.pop(turn_id, None)
+block = (out or {}).get("ephemeral_context", "")
+check("verified room context reaches only the wire copy",
+      escape(room, quote=True) in block and block.startswith("<ambient_context>"), block[:80])
+from xml.etree import ElementTree
+
+try:
+    ElementTree.fromstring(ambient._render_ambient_envelope(
+        ["safe\x01 room\x00 text"], speaker_id="42", speaker_handle="al\x02ice",
+    ))
+    valid_envelope = True
+except ElementTree.ParseError:
+    valid_envelope = False
+check("rendered untrusted room and identity remain valid XML", valid_envelope)
 request = {"messages": [{"role": "user", "content": "turn text"}]}
-out = ambient._on_llm_request_ambient_hint(request=request, platform="discord")
-check("middleware appended a request-only row", out is not None and len(out["request"]["messages"]) == 2)
+public = ambient._on_llm_request_ambient_hint(request=request, platform="discord")
+check("room context never enters a replayable synthetic row",
+      room not in str(public), str(public)[:120])
 check("original request list is unmodified", len(request["messages"]) == 1)
-check("appended row carries the room context", room in out["request"]["messages"][-1]["content"])
-clear = ambient._room_context.set("")
-out2 = ambient._on_llm_request_ambient_hint(
-    request={"messages": [{"role": "user", "content": "hi"}]}, platform="discord"
-)
-ambient._room_context.reset(clear)
-check("no staged room context means no extra row", out2 is None, out2)
+check("missing room scope contributes no private block",
+      ambient._on_pre_llm_call_ambient_context(turn_id="room-missing",
+                                                platform="discord") is None)
 
 print("echo protection for the room block")
 adapter2._stage_room_context(Message(304, ALICE, GENERAL, "a third line"))
@@ -230,6 +254,33 @@ adapter2._bind_room_echo(str(GENERAL.id), {"room_context": ambient._room_context
 check("two copied talk lines are a leak",
       len(lines) >= 2 and adapter2._room_echo_leak("\n".join(lines[:2]), GENERAL.id))
 check("one quoted line is allowed", not adapter2._room_echo_leak(lines[0] if lines else "x", GENERAL.id))
+private_log_canary = "PRIVATE_CONTEXT_LOG_CANARY"
+adapter2._catchup_echo = (time.time(), {"leak alpha", "leak beta"})
+with patch.object(ambient.logger, "warning") as warnings:
+    asyncio.run(adapter2.send(
+        str(GENERAL.id), f"leak alpha\nleak beta\n<ambient_context>{private_log_canary}</ambient_context>",
+    ))
+check("catch-up echo warning omits private context",
+      warnings.called and private_log_canary not in repr(warnings.call_args_list),
+      repr(warnings.call_args_list))
+adapter2._catchup_echo = (0, set())
+with patch.object(ambient.logger, "warning") as warnings:
+    asyncio.run(adapter2.send(
+        str(GENERAL.id), "\n".join(lines[:2]) + f"\n<ambient_context>{private_log_canary}</ambient_context>",
+    ))
+check("room echo warning omits private context",
+      warnings.called and private_log_canary not in repr(warnings.call_args_list),
+      repr(warnings.call_args_list))
+
+speech_adapter = build_adapter({"text_hygiene": {"suppress_stt_echo": True}})
+with patch.object(ambient.logger, "info") as messages:
+    asyncio.run(speech_adapter.send(
+        str(GENERAL.id),
+        f'🎙️ "brief <ambient_context>{private_log_canary}</ambient_context>"',
+    ))
+check("early speech suppression log omits private context",
+      messages.called and private_log_canary not in repr(messages.call_args_list),
+      repr(messages.call_args_list))
 
 print("guild-scoped ping resolution")
 adapter3 = build_adapter(ROOM_CFG)

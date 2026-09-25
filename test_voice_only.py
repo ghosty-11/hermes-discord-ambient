@@ -70,7 +70,7 @@ async def main():
     # MEDIA attachment is delivered. The internal notice must not consume the
     # one text-suppression claim intended for the model's transcript.
     ambient._profile_wants_voice_only = lambda: True
-    ambient._note_tts_generated()
+    adapter._note_tts_generated()
 
     fallback = (
         "🔄 Switched to fallback model: old/free via openrouter → "
@@ -89,6 +89,15 @@ async def main():
     check(
         "voice transcript is suppressed after the notice",
         getattr(placeholder_result, "success", False) is True and not sent,
+        repr(sent),
+    )
+
+    other = make_adapter()
+    other_result = await other.send("channel-2", "Independent profile reply")
+    check(
+        "one adapter's TTS cannot suppress another profile's text",
+        getattr(other_result, "success", False) is True
+        and sent == [("channel-2", "Independent profile reply")],
         repr(sent),
     )
 

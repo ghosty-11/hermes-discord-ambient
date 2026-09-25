@@ -511,6 +511,43 @@ with case("a 40h-old beat leaves the store on save and never projects"):
               {str(b.get("channel_id")) for b in stored.get("beats", [])} == {"501"},
               stored.get("beats"))
 
+print("retained travel snapshots keep recent facts within their byte bound")
+with case("a triggered beat snapshot drops old visits, not new ones"):
+    with state_home() as home:
+        a = build_adapter()
+        a._travel_beats = [
+            mk_beat(i, GENERAL, opened_m=120, closed_m=30 - i,
+                    snippets=[f"public-{i}-" + "x" * 900])
+            for i in range(1, 21)
+        ]
+        a._travel_save_state()
+        path = state_file(home, "ambient-travel-log")
+        with open(path) as fh:
+            retained = json.load(fh)
+        kept = {beat["id"] for beat in retained["beats"]}
+        check("newest visit survives snapshot trim", 20 in kept and 1 not in kept, sorted(kept))
+        check("triggered beat snapshot retains at most 8 KiB",
+              os.path.getsize(path) <= 8 * 1024, os.path.getsize(path))
+
+with case("many active lanes cannot bypass the retained byte bound"):
+    with state_home() as home:
+        a = build_adapter()
+        for i in range(120):
+            lane = mk_lane(GENERAL, opened_m=121 - i, obs_m=120 - i, spoke_m=None)
+            lane["channel_id"] = 1000 + i
+            lane["channel_name"] = f"room-{i}"
+            a._travel_lanes[str(1000 + i)] = lane
+        a._travel_save_state()
+        path = state_file(home, "ambient-travel-log")
+        with open(path) as fh:
+            retained = json.load(fh)
+        check("triggered lane snapshot retains at most 8 KiB",
+              os.path.getsize(path) <= 8 * 1024, os.path.getsize(path))
+        check("newest active lane survives persisted trim",
+              "1119" in retained["lanes"] and "1000" not in retained["lanes"],
+              list(retained["lanes"]))
+
+
 
 print("projection")
 PROJ_BEATS = [
@@ -600,8 +637,8 @@ with case("budgets bound the projection"):
               (len("\n".join(rows)), len(rows)))
 
 
-print("request-only delivery through the middleware")
-with case("the travel block rides as one request-only row at the END"):
+print("wire-only travel context on the verified current turn")
+with case("the travel block rides only the ephemeral current-user wire copy"):
     with state_home() as home:
         seed_travel_store(home, PROJ_BEATS, {})
         a = build_adapter()
@@ -612,19 +649,30 @@ with case("the travel block rides as one request-only row at the END"):
         check("staging never touches message.content", m.content == "turn text", m.content)
         block = ambient._travel_context.get("")
         check("the staged block is bracketed travel", block.startswith("[ambient travel log"), block[:40])
+        turn_id = "travel-70"
+        with ambient._turn_scopes_lock:
+            ambient._turn_scopes[turn_id] = {
+                "speaker_id": "42", "message_id": "70",
+                "room_context": ambient._room_context.get(""),
+                "travel_context": block,
+            }
+        try:
+            ephemeral = ambient._on_pre_llm_call_ambient_context(
+                turn_id=turn_id, platform="discord",
+            )
+        finally:
+            with ambient._turn_scopes_lock:
+                ambient._turn_scopes.pop(turn_id, None)
+        wire = (ephemeral or {}).get("ephemeral_context", "")
+        check("the verified travel block reaches the wire-only envelope",
+              block in wire and wire.startswith("<ambient_context>"), wire[:100])
         request = {"model": "m", "messages": [{"role": "user", "content": "turn text"}]}
-        out = ambient._on_llm_request_ambient_hint(request=request, platform="discord")
-        check("middleware patched the request", out is not None and "request" in out, out)
-        msgs = out["request"]["messages"]
-        check("rows appended at the end only",
-              len(msgs) == 3 and msgs[0] == {"role": "user", "content": "turn text"}, msgs)
-        check("the travel row is the LAST row, one element, verbatim",
-              msgs[-1] == {"role": "user", "content": block}, msgs[-1:])
+        public = ambient._on_llm_request_ambient_hint(request=request, platform="discord")
+        check("the travel block never enters a synthetic request row",
+              block not in str(public), str(public)[:100])
         check("the original request dict is unmutated",
               request == {"model": "m", "messages": [{"role": "user", "content": "turn text"}]},
               request)
-        check("the patched request is a copy, not the same object",
-              out["request"] is not request and out["request"]["messages"] is not request["messages"])
 
 with case("nothing staged means no patched request"):
     room_token = ambient._room_context.set("")

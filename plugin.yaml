@@ -1,15 +1,15 @@
 name: discord-ambient
 label: Discord (ambient presence)
 kind: platform
-version: 1.35.1
+version: 1.36.0
 description: >
-  Subclasses the bundled Discord adapter to add opt-in ambient presence.
-  A profile may occasionally join conversations it was not mentioned in,
-  decline to speak with a [SILENT] sentinel, react, catch up on missed
-  rooms, and keep operator plumbing out of public channels. Profiles
-  without platforms.discord.extra.ambient_presence.enabled behave like
-  stock Discord. Config is YAML under that block, not process-wide env
-  vars — under a multiplexed gateway every profile shares one process.
+  Subclasses the bundled Discord adapter for opt-in, server-admitted
+  conversational presence, intentional social silence, verified speaker
+  context, bounded catch-up and operator-notice hygiene. The companion
+  path requires Hermes framework TurnOrigin, pre_llm_call.ephemeral_context
+  and row-addressed delivery receipts (reviewed at 2de7e376); test the
+  installed seams before applying this module. Profiles without
+  platforms.discord.extra.ambient_presence.enabled keep stock behavior.
 author: ghosty
 optional_env:
   - name: KLIPY_API_KEY

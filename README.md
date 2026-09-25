@@ -9,6 +9,20 @@ conversation it was not addressed in, and decide not to speak.
 Built so one profile — a community chatbot — can behave like a person in a room rather
 than a mute or a reply-to-everything bot.
 
+## Companion-system source candidate
+
+This source uses server-vouched turn origins, wire-only private context and
+actual send projections. Installed behavior does not change until a reviewed
+deployment and gateway restart. Source checks do not authorize a public
+Discord canary.
+
+Deployment prerequisite: the installed Hermes framework must carry the
+reviewed `2de7e376` companion seams (server-created `TurnOrigin`,
+`pre_llm_call.ephemeral_context`, and row-addressed delivery receipts), or
+a separately reviewed equivalent. Refuse the module apply and gateway
+restart if the actual installed tree lacks any of them; a plugin file and
+version string alone do not establish compatibility.
+
 ## The problem
 
 Hermes' chat gate is binary. A bot either answers **every** message in a channel
@@ -27,8 +41,8 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 | Behaviour | Cost | What it does |
 |---|---|---|
 | **Ambient joining** | 1 inference | Re-dispatch a mention-rejected message as free-response. Rate-limited by cooldown, daily cap and probability. Plain-text name triggers bypass the long cooldown (short anti-spam floor only). Budget is charged only when the join reaches the agent. |
-| **Silence** | — | The model may answer `[SILENT]`; the adapter swallows it. |
-| **Direct-reply guarantee** | zero | Restores replied-to author identity, marks DMs / mentions / name hits / replies-to-self as direct, and converts a direct silence token into `direct_silence_fallback` (default `I'm here.`). |
+| **Silence** | — | A server-vouched discretionary social turn may answer `[SILENT]` and send nothing; required work turns keep the gateway's ordinary fallback. Suppressed sends report no delivered text. |
+| **Direct-reply origin** | zero | Restores replied-to author identity, marks DMs / mentions / name hits / replies-to-self as direct, and vouches for the event origin without a canned direct-silence response. |
 | **Reply-target attribution** | zero | Labels a quote of someone else's message with that author's name so the bot does not treat it as speech to itself. |
 | **Hybrid reply placement** | zero | Actual Discord replies remain the default. With `reply_style.enabled`, the model may mark an obvious room-wide remark with `[STANDALONE]`; the marker is stripped wherever it lands in the reply, and only that send drops its Discord reply reference. Surfaces without a reply anchor (cron, webhook) are never given the guidance. |
 | **Reactions** | zero | Emoji on messages it does not answer. Regex rules plus a fallback pool. |
@@ -40,7 +54,7 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 | **Fallback-notice routing** | zero | Parses both framework fallback formats for standby. Sends the notice to `system_notices.reroute_channel` when configured; otherwise `suppress_fallback_notice` drops it. |
 | **Group-address greetings** | 1 inference when it answers | "good morning agents" / "hello everyone" at its own probability and cooldown, exempt from the daily cap. |
 | **System-notice rerouting** | zero | Compression, provider, fallback, reset and cron diagnostics go to a private channel. Drain and stall notices can be rewritten in-character. Routine progress plumbing is dropped. |
-| **Speaker identity** | zero | Request-only `[speaker @handle id:123]` so memory can key on a stable id. Queued messages bind the verified framework `sender_id` to the actual `turn_id`; missing identity clears the scope instead of inheriting another speaker. Not written onto the persisted user turn. |
+| **Speaker identity** | zero | A verified request-only `<turn_identity speaker="…" speaker_id="…" />` and the existing `[speaker @handle id:123]` annotation ride inside one bounded `<ambient_context>` on the current user wire copy. Queued messages bind framework identity to the exact `turn_id`; missing attestation withholds the private block. Neither tag changes the persisted user turn. |
 | **Room context** | zero | Request-only `[ambient room: …]` — server, channel, topic, thread, optional operator notes per guild and per channel — plus a roster of recently-present people and the last few lines of room talk with reply refs (`→ @author`; the bot's own messages ride as `you`, so a populated buffer preserves its side of the conversation across sessions — with `persist_room_talk` on it survives restarts from disk; otherwise it repopulates via live traffic or eligible catch-up). Bound to the actual `turn_id`, never written onto the persisted user turn; echo suppression is scoped to the destination channel. |
 | **Speaker boost** | zero | Per-user overrides of probability / cooldown / daily cap. Cooldown is the load-bearing half. |
 | **Conversation window** | zero | Messages in the bot's wake get a high response chance, bounded by both count and elapsed time. |
@@ -140,6 +154,7 @@ platforms:
     extra:
       ambient_presence:
         enabled: true
+        discretionary_replies: false  # Opt in only on an authorized social profile.
         channels: ["*"]            # "*" = any channel the bot can see, or list ids
         probability: 0.12          # code default; recipe below uses 0.10
         cooldown_seconds: 1800
@@ -147,7 +162,6 @@ platforms:
         name_triggers: ["bot-name"]
         name_cooldown_seconds: 60
         silent_marker: "[SILENT]"
-        direct_silence_fallback: "I'm here."
         no_threads: true
         reply_style:
           enabled: false
@@ -248,7 +262,7 @@ platforms:
           mention_history_limit: 50
           mention_rescan_seconds: 21600   # re-observe channel history after this long
           no_em_dash: false
-          isolate_media_urls: true
+          isolate_media_urls: false  # One ledgered final; standalone preview presentation may differ.
           suppress_stt_echo: false
         slash_commands:
           allowed_channels: ["<operator-channel-id>"]
@@ -372,9 +386,11 @@ bug, not a style choice.
   also serves operator profiles.
 - **Fail closed.** Exceptions degrade to stock behaviour, never to a mute or an auth bypass.
 - **Auth is re-run.** Ambient re-dispatch cannot skip `_is_allowed_user`.
-- **Directives are request-only.** Ambient hints, speaker tags, speaker memory, room
-  context and quiet resume are appended to the outgoing request. They are not written
-  onto `message.content`.
+- **Private context is wire-only.** Verified speaker, room and travel observations
+  enter one escaped, 4 KiB-bounded `<ambient_context>` on the current human request
+  copy; missing identity or framework support withholds them. They never enter
+  `message.content`, `api_content`, history or a replayable synthetic user row.
+  Public-safe reply-placement and quiet-resume hints remain request-only.
 - **Room context is structurally safe.** Snippets are flattened to single lines and
   capped, so user text cannot forge a wrapper row or an identity line; a reply that
   repeats two lines of the surfaced talk is suppressed, exactly like a catch-up echo.
@@ -383,15 +399,16 @@ bug, not a style choice.
 - **Beats are observed facts.** A travel-log beat records traffic the adapter saw —
   counts, participants, snippets from the room-talk buffer. Nothing in it is model
   output, and no inference ever summarises a visit.
-- **The travel projection is request-only.** Like room context it is appended to the
-  outgoing request and never written onto `message.content`; the beats underneath are
-  persisted state, the projection itself never is.
+- **Travel projection is transient.** The bounded observation enters only the
+  current verified wire request; the admitted public beats underneath may be
+  persisted as separate state, but the projection never joins conversation history.
 - **Closure is traffic-based.** Beats close on observed idle clocks alone — sessions
   are never consulted, and gateway downtime simply counts as quiet.
 - **No disk I/O on the message path.** Lanes live in memory; the sweep tick is the
   only writer, and it writes atomically (temp file plus rename).
-- **Silence is scoped.** Unaddressed `[SILENT]` is swallowed. A directly addressed turn
-  that emits silence becomes `direct_silence_fallback`.
+- **Silence follows origin.** Direct and ambient companion social turns may close
+  silently when the server admits a discretionary origin; work turns still
+  require the gateway's normal answer. No direct fallback phrase is substituted.
 - **Charge at send.** Bot-bounce and the shared catch-up budget count replies that went
   out, not intentions. A swallowed `[SILENT]` does not spend them.
 - **Catch-up cannot raise the ceiling.** With `respect_ambient_budget: true` (the default)

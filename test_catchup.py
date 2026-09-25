@@ -251,7 +251,7 @@ async def main():
     print("\n-- the echo rule must catch every bracketed line of that hint --")
     for i, line in enumerate(hint.splitlines()):
         if line.startswith("[ambient"):
-            stripped, n = amb._screen_ambient_reply(line, "[SILENT]")
+            stripped, n, _ = amb._screen_ambient_reply(line, "[SILENT]")
             check(f"wrapper line {i} is strippable", n >= 1 and stripped is None,
                   repr(line[:60]))
 

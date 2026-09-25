@@ -109,6 +109,20 @@ check(
     f"got {screen('[ambient: nobody addressed you — say something short] Mrrrow. Fine. ✨')!r}",
 )
 
+print("private-context echoes never reach the room")
+secret = "PRIVATE_CONTEXT_CANARY"
+for label, text in (
+    ("attribute-bearing wrapper", f"<ambient_context version='1'>{secret}</ambient_context> Hello."),
+    ("nested wrapper", f"<ambient_context><ambient_context>{secret}</ambient_context></ambient_context> Hello."),
+    ("unclosed head", f"Hello. <ambient_context>{secret}"),
+    ("unclosed attributed head", f"Hello. <ambient_context version='1'>{secret}"),
+    ("orphan close", f"{secret}</ambient_context> Hello."),
+):
+    delivered = screen(text)
+    check(label, delivered == "Hello.", repr(delivered))
+check("unrelated XML remains ordinary speech",
+      screen("Hello <notice>friend</notice>.") == "Hello <notice>friend</notice>.")
+
 print()
 if FAILURES:
     print(f"FAILED {len(FAILURES)}: {', '.join(FAILURES)}")

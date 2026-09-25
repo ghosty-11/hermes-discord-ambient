@@ -12,8 +12,10 @@ to that 10k-line file keep flowing — and adds profile-scoped behaviours:
 
 1. AMBIENT JOINING — a message the stock gate rejects for lacking a mention may
    be re-dispatched as if the channel were free-response. Hard rate-limited.
-2. SILENCE — the model may answer with a sentinel ([SILENT]) which the adapter
-   swallows, so it can see a message and decide not to speak.
+2. SILENCE — the model may answer with a sentinel ([SILENT]); on a
+   server-admitted discretionary origin (direct/ambient/catch-up, plan S02)
+   that marker is delivered as real silence with an empty receipt, and any
+   other surface keeps the stock required-response behaviour.
 3. REACTIONS — messages it does NOT answer may still get an emoji reaction.
    This is the important one on this hardware: a reaction costs ZERO inference
    and posts instantly, so the bot reads as continuously present in the room
@@ -77,20 +79,21 @@ to that 10k-line file keep flowing — and adds profile-scoped behaviours:
    user-editable and freely reused, so durable notes keyed on one merge two
    people or lose someone the day they rename — and an agent told to "record
    the user id" cannot comply, because the id never reaches the model. Setting
-   `speaker_identity: true` appends a compact `[speaker @handle id:123]`
-   request-only row, giving the agent the stable account handle and numeric id
-   without modifying the persisted user turn.
+   `speaker_identity: true` adds a compact `[speaker @handle id:123]` private
+   row on the wire-only ephemeral seam, giving the agent the stable account
+   handle and numeric id without ever persisting them to the turn.
 11. SLASH-COMMAND POLICY — chat admission and slash auth share one gate
    upstream, so an answer-everyone community profile also hands /model,
    /reset, ... to everyone (and the per-profile allow-all env flag is not
    reliably visible on the interaction path under multiplex — the operator
    can end up rejected while strangers chat freely). `slash_commands`
    restricts slash invocations to explicit channels/users, chat untouched.
-12. DIRECT-REPLY GUARANTEE — the stock Discord adapter admits reply-pings but
-   omits the replied-to author's identity from MessageEvent. Restore it so the
-   model sees "your previous message", add a request-only direct-address hint,
-   and deterministically replace any direct [SILENT]/NO_REPLY with a configured
-   acknowledgment. Unaddressed ambient silence remains unchanged.
+12. DIRECT-REPLY ORIGIN — the stock Discord adapter admits reply-pings but
+   omits the replied-to author's identity from MessageEvent. Restore it,
+   vouch for the server-admitted turn origin and deliver the direct-address
+   hint only through the wire-only context seam. A discretionary direct
+   social turn may close with real silence; no canned acknowledgment replaces
+   it. Other work surfaces keep their required-response behavior.
 
 HOW (and why this exact seam)
 -----------------------------
@@ -175,6 +178,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from functools import wraps
+from html import escape as _xml_escape
 from pathlib import Path as _Path
 from types import SimpleNamespace
 from typing import Any
@@ -250,65 +254,59 @@ _TTS_PATCHED = False
 # TTS file is written ~14s before that. So a mark set when audio is delivered
 # is always too late — but the TTS call itself is early enough to act on.
 #
-# SCOPE, and its limit, stated plainly: the tool has no reliable profile context
-# (the same process-global resolution that misfiles audio into another profile's
-# cache dir is the only signal available at TTS time), so this flag is
-# process-wide. Three things keep it safe:
-#   1. only profiles with voice_only_replies consult it;
-#   2. it is consume-once, so at most one text send is ever affected;
-#   3. a short window, and every suppression is logged.
-# Residual risk: another profile generates speech and a voice-only profile sends
-# unrelated text inside the window — one message dropped, logged, never silence.
-# Measured over five real turns (2026-08-07): the gap between the TTS call and
-# the text send is 2.7s / 5.6s / 12.8s / 15.4s / 35.4s — dominated by how long
-# the model takes to FINISH generating after calling the tool, which on a
-# free-tier model is wildly variable. A 30s window caught only 4 of 5; the
-# instinct to shrink it would have brought the duplicate text straight back.
+# OWNERSHIP (plan S02/V09): the signal belongs to the ADAPTER INSTANCE whose
+# turn generated the speech, never to the process. The old module globals let
+# one profile's TTS call suppress another profile's unrelated text send inside
+# the window; under multiplex that is a cross-seat content drop. The tool-path
+# wrapper below resolves the owning adapter from the verified turn scope
+# (`_tts_owner`, bound per GatewayRunner turn in `_install_gateway_turn_scope`)
+# and arms THAT instance; `send_voice` and `send` are instance methods and read
+# instance state directly. An unbound TTS call arms nothing — failing toward
+# "do not suppress" is the safe direction.
+#
+# Still bounded the same way: consume-once, so at most one text send is ever
+# affected, and a short window with every suppression logged. Measured over
+# five real turns (2026-08-07): the gap between the TTS call and the text send
+# is 2.7s / 5.6s / 12.8s / 15.4s / 35.4s — dominated by how long the model
+# takes to FINISH generating after calling the tool, which on a free-tier
+# model is wildly variable. A 30s window caught only 4 of 5; the instinct to
+# shrink it would have brought the duplicate text straight back.
 _TTS_SIGNAL_WINDOW_S = 45.0
-_last_tts_at: float = 0.0
-_last_tts_claimed: bool = True
+
+# The adapter instance owning the gateway turn currently running, or None.
+# Bound inside the verified turn scope so the TTS tool wrapper can arm the
+# right seat's signal even when the turn was queued past its dispatch task.
+_tts_owner: contextvars.ContextVar = contextvars.ContextVar(
+    "ambient_tts_owner", default=None
+)
 
 
-def _profile_wants_voice_only() -> bool:
-    """Does the profile that is generating this speech want voice-only replies?
+_EPHEMERAL_SEAM_WARNED = False
 
-    This is what keeps a process-wide signal from crossing profiles. Config
-    resolution is profile-correct inside the TTS tool, so a profile without
-    voice_only_replies never arms the signal and cannot cause another profile's
-    message to be dropped.
+
+def _ephemeral_seam_ok() -> bool:
+    """Whether the installed framework carries the wire-only context seam.
+
+    ``agent.turn_context.SUPPORTS_EPHEMERAL_CONTEXT`` is the framework's own
+    feature-detection constant. When it is absent the plugin FAILS CLOSED:
+    private ambient blocks are withheld entirely (never re-routed to the
+    replayable ``context`` channel or to synthetic request rows), with one
+    compatibility warning per process.
     """
+    global _EPHEMERAL_SEAM_WARNED
     try:
-        from hermes_cli.config import load_config  # type: ignore
-
-        extra = (
-            load_config()
-            .get("platforms", {})
-            .get("discord", {})
-            .get("extra", {})
-            .get("ambient_presence", {})
-        ) or {}
-        return bool(extra.get("voice_only_replies", False))
+        from agent.turn_context import (  # type: ignore
+            SUPPORTS_EPHEMERAL_CONTEXT,
+        )
+        return bool(SUPPORTS_EPHEMERAL_CONTEXT)
     except Exception:
-        return False          # fail toward "do not suppress"
-
-
-def _note_tts_generated() -> None:
-    global _last_tts_at, _last_tts_claimed
-    if not _profile_wants_voice_only():
-        return
-    _last_tts_at = time.monotonic()
-    _last_tts_claimed = False
-
-
-def _claim_recent_tts() -> bool:
-    """True at most once per TTS call, and only inside the window."""
-    global _last_tts_claimed
-    if _last_tts_claimed:
+        if not _EPHEMERAL_SEAM_WARNED:
+            _EPHEMERAL_SEAM_WARNED = True
+            logger.warning(
+                "ambient: ephemeral_context seam absent on this framework — "
+                "private ambient context is withheld, not downgraded"
+            )
         return False
-    if (time.monotonic() - _last_tts_at) > _TTS_SIGNAL_WINDOW_S:
-        return False
-    _last_tts_claimed = True
-    return True
 
 
 
@@ -384,8 +382,14 @@ def _install_tts_kaomoji_filter() -> None:
             result = _orig_tool(*a, **kw)
             try:
                 if isinstance(result, str) and '"success": false' not in result:
-                    if _profile_wants_voice_only():
-                        _note_tts_generated()
+                    # Turn-owned arming (plan S02/V09): resolve the adapter
+                    # whose verified gateway turn is running and arm THAT
+                    # instance. A TTS call outside any ambient turn (another
+                    # seat, a cron script) arms nothing, so one profile's
+                    # speech can never suppress another profile's text.
+                    owner = _tts_owner.get(None)
+                    if owner is not None and owner._voice_only_enabled():
+                        owner._note_tts_generated()
                         # Tell the model, AT THE POINT IT IS DECIDING, that the
                         # audio is the whole reply. Suppressing prose in send()
                         # is cosmetic — the tokens are already spent by then.
@@ -448,9 +452,9 @@ _ambient_open: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "hermes_ambient_open", default=False
 )
 
-# The ambient directive for the turn currently being dispatched, delivered to the
-# model through `llm_request` middleware instead of being concatenated onto the
-# user's message.
+# The ambient directive for the turn currently being dispatched, delivered to
+# the model through the wire-only ephemeral seam instead of being concatenated
+# onto the user's message.
 #
 # WHY THIS EXISTS (2026-08-08): the hint used to be prepended to
 # `message.content`. That text is the USER TURN, so Hermes persisted it — 59 rows
@@ -461,10 +465,10 @@ _ambient_open: contextvars.ContextVar[bool] = contextvars.ContextVar(
 # self-portrait, she echoed a stale "nobody addressed you ... reply [SILENT]" out
 # of her own history and declined.
 #
-# Injected via middleware, the hint reaches the provider for exactly one request
-# and is never written to history: `apply_llm_request_middleware` rewrites the
-# outgoing payload only. Appended at the END of the message list so the cached
-# prefix is untouched (the AGENTS.md prompt-cache invariant).
+# On the ephemeral seam (plan S03), the hint rides the WIRE COPY of the
+# current user row for exactly one turn and is never written to history,
+# exports or summaries — and never to the cached prefix, which synthetic
+# trailing rows would also have disturbed.
 #
 # A ContextVar rather than a dict keyed by session: the middleware is handed
 # session_id/platform but never a chat id, and this plugin already relies on
@@ -566,7 +570,10 @@ _RETURN_HINT = (
 
 _DIRECT_REPLY_HINT = (
     "[direct address: this person is speaking to you personally. Answer them "
-    "normally. Do not use [SILENT], SILENT, NO_REPLY, or NO REPLY on this turn.]"
+    "normally. Staying silent on a direct turn is allowed but is a real choice "
+    "with a real cost — make it only when answering would genuinely be worse "
+    "than saying nothing, never as a default. To close silently, reply with "
+    "exactly [SILENT]; it is delivered as silence, never as text.]"
 )
 
 # The catch-up directive is deliberately assembled from SINGLE-LINE bracketed
@@ -787,6 +794,62 @@ _SPEAKER_ECHO_RE = re.compile(r"\[speaker\b[^\]\n]{0,120}\]", re.IGNORECASE)
 # to a suppressed reply, never to a leaked prompt — that is the safe direction.
 _AMBIENT_ECHO_RE = re.compile(r"\[ambient\b[^\n]{0,400}\]", re.IGNORECASE)
 
+# PRIVATE-CONTEXT BLOCK ECHO (plan S03/V09). Every private ambient hint —
+# direct/ambient directives, speaker identity and recall, room context, the
+# travel log — rides the wire-only ``ephemeral_context`` seam wrapped in ONE
+# ``<ambient_context>…</ambient_context>`` block. The block is MULTILINE by
+# design (the room and travel rows it carries are many lines), which is
+# precisely why the single-line rule above cannot police it: a model that
+# regurgitates its input would post the whole block, other people's lines
+# included, back into the room they were copied from.
+#
+# Three shapes must close, in this order:
+#   1. a COMPLETE block (opener … closer, any newlines between);
+#   2. an UNCLOSED opener — strip from the opener to the end of the text. A
+#      stream that is still mid-echo, or a block split across two sends, leaks
+#      its head here; over-stripping degrades to a suppressed reply, never to
+#      a leaked prompt;
+#   3. an ORPHAN closer with no opener — strip from the start through the
+#      closer: that is the tail half of a split echo.
+# Every strip is recorded so send receipts can carry ``screened_context_echo``.
+_CONTEXT_OPEN_TAG = r"<ambient_context(?:\s+[^<>]*)?\s*>"
+_CONTEXT_OPEN_RE = re.compile(_CONTEXT_OPEN_TAG, re.IGNORECASE)
+_CONTEXT_BLOCK_RE = re.compile(
+    _CONTEXT_OPEN_TAG + r".*?</ambient_context\s*>", re.IGNORECASE | re.DOTALL
+)
+_CONTEXT_TAIL_RE = re.compile(
+    _CONTEXT_OPEN_TAG + r".*\Z", re.IGNORECASE | re.DOTALL
+)
+_CONTEXT_HEAD_RE = re.compile(
+    r"^.*?</ambient_context\s*>", re.IGNORECASE | re.DOTALL
+)
+
+
+def _strip_context_echo(text: str) -> tuple[str, int]:
+    """Remove echoed ``<ambient_context>`` blocks, including split halves.
+
+    Returns ``(cleaned, n_context_stripped)``. Complete blocks first, then an
+    unclosed opener (strip to end), then an orphan closer (strip from start).
+    Whitespace left behind is collapsed but paragraph structure is kept, so a
+    reply that merely quoted one line still reads naturally after the strip.
+    """
+    cleaned = text or ""
+    n = 0
+    cleaned, n_blocks = _CONTEXT_BLOCK_RE.subn(" ", cleaned)
+    n += n_blocks
+    if _CONTEXT_OPEN_RE.search(cleaned):
+        cleaned = _CONTEXT_TAIL_RE.sub(" ", cleaned)
+        n += 1
+    if _CONTEXT_HEAD_RE.match(cleaned) and not _CONTEXT_OPEN_RE.search(cleaned):
+        # An orphan closer only counts when no opener precedes it: with an
+        # opener present the TAIL rule already consumed the whole block.
+        cleaned = _CONTEXT_HEAD_RE.sub(" ", cleaned)
+        n += 1
+    if n:
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, n
+
 # Letters only, for sentinel comparison. The marker is `[SILENT]`, but a small
 # model reaches for `(SILENT)`, `**[SILENT]**` or a bare `SILENT` just as readily,
 # and the original exact-match test posted every one of those to the channel.
@@ -888,32 +951,38 @@ def _leaks_deliberation(text: str, marker: str) -> bool:
 
 
 def _screen_ambient_reply(content: str, marker: str) -> tuple:
-    """Strip any echoed ambient directive, then decide if anything is left to say.
+    """Strip echoed directives and private-context blocks, then judge the reply.
 
-    Returns `(text_or_None, n_stripped)`. None means "send nothing": the reply was
-    the silence marker, or nothing but the echoed directive, or the model's own
-    deliberation (see `_leaks_deliberation`).
+    Returns `(text_or_None, n_stripped, n_context_echo)`. None means "send
+    nothing": the reply was the silence marker, or nothing but the echoed
+    directive/context block, or the model's own deliberation (see
+    `_leaks_deliberation`). ``n_context_echo`` counts only
+    ``<ambient_context>`` block strips (whole or split), which send() records
+    on the delivery receipt as ``screened_context_echo``.
 
-    Ordering matters and is the whole point. The directive is removed FIRST, so a
-    reply of `<hint>\\n\\n(SILENT)` — the exact 2026-08-08 leak — reduces to
-    `(SILENT)` and is then recognised as silence. Checking the sentinel first (what
-    the code did before) saw only a 201-char string that matched nothing.
+    Ordering matters and is the whole point. The directive and context block
+    are removed FIRST, so a reply of `<hint>\\n\\n(SILENT)` — the exact
+    2026-08-08 leak — reduces to `(SILENT)` and is then recognised as silence.
+    Checking the sentinel first (what the code did before) saw only a
+    201-char string that matched nothing.
 
-    The emptiness test is gated on `n_stripped` so behaviour is untouched for
-    replies we did not modify: an emoji-only reply has no word characters and must
-    still go out.
+    The emptiness test is gated on the strip counts so behaviour is untouched
+    for replies we did not modify: an emoji-only reply has no word characters
+    and must still go out.
     """
     text, n = _AMBIENT_ECHO_RE.subn(" ", content or "")
     if n:
         text = re.sub(r"[ \t]{2,}", " ", text)
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    text, n_ctx = _strip_context_echo(text if n else content)
+    n += n_ctx
     if _looks_like_sentinel(text if n else content, marker):
-        return None, n
+        return None, n, n_ctx
     if _leaks_deliberation(text if n else content, marker):
-        return None, n
+        return None, n, n_ctx
     if n and not _HAS_WORD_RE.search(text):
-        return None, n
-    return (text if n else content), n
+        return None, n, n_ctx
+    return (text if n else content), n, n_ctx
 
 
 # Recall backends bracket their output with chatter rather than facts: a trailing
@@ -1089,11 +1158,11 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # in flight at a time, so a single slot is enough.
         self._catchup_echo: tuple[float, set] = (0.0, set())
         # inbound message id -> timestamp for directly addressed turns whose
-        # outbound reply has not completed yet.  The id returns as send's
+        # outbound reply has not completed yet. The id returns as send's
         # reply_to anchor, giving deterministic correlation even when a turn
-        # was queued behind another one.  This is also the final safety net for
-        # a model that ignores the request-only direct-address directive and
-        # still emits a silence control token.
+        # was queued behind another one. Silence on a direct turn is now a
+        # real outcome (plan S02): this bookkeeping closes the pending entry
+        # once the turn's send settles, whether it carried words or not.
         self._direct_pending: dict[str, float] = {}
         # When a fallback-switch notice last named a local model (0 = never).
         # In-memory only: a restart forgets an open window, and the next
@@ -1159,6 +1228,23 @@ class AmbientDiscordAdapter(DiscordAdapter):
         self._travel_lanes: dict[str, dict] = {}
         self._travel_seq: int = 1
 
+        # Server-admitted turn origins (plan S02). Exact inbound message id ->
+        # (origin kind, noted_at). `turn_origin_for_event` reads this when the
+        # gateway asks the adapter to vouch for WHY a turn was admitted: an
+        # ambient join or a catch-up check-in is discretionary, everything
+        # unverifiable falls back to the gateway's `required` default. Entries
+        # expire (30 minutes) and evict oldest-first; a queued turn resolving
+        # late still finds its kind, and a stale one can never grant silence.
+        self._origin_kinds: OrderedDict[str, tuple[str, float]] = OrderedDict()
+
+        # Voice-only text-twin suppression, OWNED BY THIS ADAPTER (plan
+        # S02/V09). The TTS tool wrapper arms the instance bound to the
+        # current verified turn via `_tts_owner`; `send()`/`send_voice()`
+        # consume it here. No module globals: one profile's speech must never
+        # suppress another profile's text under multiplex.
+        self._tts_signal_at: float = 0.0
+        self._tts_signal_claimed: bool = True
+
     # ---- config ---------------------------------------------------------
     def _ambient_cfg(self) -> dict:
         try:
@@ -1173,11 +1259,19 @@ class AmbientDiscordAdapter(DiscordAdapter):
     def _ambient_marker(self) -> str:
         return str(self._ambient_cfg().get("silent_marker") or "[SILENT]").strip()
 
-    def _direct_silence_fallback(self) -> str:
-        fallback = str(
-            self._ambient_cfg().get("direct_silence_fallback") or "I'm here."
-        ).strip()
-        return fallback or "I'm here."
+    def _note_tts_generated(self) -> None:
+        """Arm THIS adapter's one-shot speech signal (see `_tts_owner`)."""
+        self._tts_signal_at = time.monotonic()
+        self._tts_signal_claimed = False
+
+    def _claim_recent_tts(self) -> bool:
+        """True at most once per TTS call, and only inside the window."""
+        if self._tts_signal_claimed:
+            return False
+        if (time.monotonic() - self._tts_signal_at) > _TTS_SIGNAL_WINDOW_S:
+            return False
+        self._tts_signal_claimed = True
+        return True
 
     def _reply_style_cfg(self) -> dict:
         return self._sub("reply_style")
@@ -1334,9 +1428,75 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 self._direct_pending[message_id] = time.time()
         return direct
 
-    def _direct_is_pending(self, reply_to: Any) -> bool:
-        self._direct_prune_pending()
-        return bool(reply_to) and str(reply_to) in self._direct_pending
+    # ---- server-admitted turn origins (plan S02) --------------------------
+    _ORIGIN_KIND_TTL_S = 1800.0  # a queued turn resolving late still qualifies; stale never does
+
+    def _note_origin_kind(self, message_id: Any, kind: str) -> None:
+        """Record WHY this inbound id was re-dispatched: ambient join or catch-up."""
+        key = str(message_id or "")
+        if not key or kind not in ("ambient", "catch_up"):
+            return
+        self._origin_kinds[key] = (kind, time.time())
+        self._origin_kinds.move_to_end(key)
+        while len(self._origin_kinds) > _TURN_SCOPE_LIMIT:
+            self._origin_kinds.popitem(last=False)
+
+    def _peek_origin_kind(self, message_id: Any) -> str:
+        """The still-fresh origin kind for this inbound id, or ""."""
+        key = str(message_id or "")
+        entry = self._origin_kinds.get(key)
+        if not entry:
+            return ""
+        kind, noted_at = entry
+        if time.time() - noted_at > self._ORIGIN_KIND_TTL_S:
+            self._origin_kinds.pop(key, None)
+            return ""
+        self._origin_kinds.move_to_end(key)
+        return kind
+
+    def turn_origin_for_event(self, event: Any):
+        """Vouch for this event's server-admitted turn origin, or None (S02).
+
+        The gateway calls this when preparing the turn and normalises the
+        return before trusting it. Only VERIFIED state is consulted — the
+        event's own reply/mention metadata for a direct turn, the adapter's
+        own re-dispatch record for an ambient join or catch-up check-in —
+        never model-supplied policy text. Only a server-owned profile adapter
+        with an explicit ``ambient_presence.discretionary_replies: true`` opt-in
+        may vouch for discretionary social turns. An unprofiled work adapter
+        stays required even if ambient presence is enabled. A missing opt-in,
+        missing event id or unknown adapter keeps the gateway's required default.
+        """
+        profile = getattr(self, "_owner_profile", None)
+        if (not self._ambient_enabled()
+                or self._ambient_cfg().get("discretionary_replies") is not True
+                or not isinstance(profile, str) or not profile):
+            return None
+        try:
+            self._annotate_reply_context(event)
+            event_id = str(getattr(event, "message_id", "") or "")
+            if not event_id:
+                return None
+            from gateway.turn_origin import TurnOrigin  # type: ignore
+
+            if self._event_is_direct(event):
+                return TurnOrigin(
+                    event_id=event_id,
+                    kind="direct",
+                    response_policy="discretionary",
+                    surface="discord-ambient",
+                )
+            kind = self._peek_origin_kind(event_id)
+            if kind:
+                return TurnOrigin(
+                    event_id=event_id,
+                    kind=kind,
+                    response_policy="discretionary",
+                    surface="discord-ambient",
+                )
+        except Exception:
+            logger.debug("ambient: turn origin resolution failed", exc_info=True)
+        return None
 
     def _direct_count_sent(self, reply_to: Any, result: Any) -> None:
         if not reply_to:
@@ -2675,6 +2835,10 @@ class AmbientDiscordAdapter(DiscordAdapter):
         bundle = {
             "message_id": message_id,
             "speaker_id": speaker_id,
+            "speaker_handle": (
+                str(getattr(author, "name", "") or getattr(author, "display_name", "") or "").strip()
+                if tag else ""
+            ),
             "ambient_hint": _ambient_hint.get(""),
             "direct_address": self._raw_message_is_direct(message),
             "speaker_context": (tag, known),
@@ -2855,6 +3019,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
             # persists it. See the _ambient_hint comment — this is the fix for the
             # 2026-08-08 self-portrait refusal.
             _ambient_hint.set(hint)
+            # This re-dispatch IS the admission: record why, so the gateway's
+            # turn-origin resolution can vouch for a discretionary ambient turn.
+            self._note_origin_kind(getattr(message, "id", ""), "ambient")
 
             token = _ambient_open.set(True)
             try:
@@ -3102,9 +3269,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
     # tell which community it is speaking in, and a turn arrives as one
     # message with no idea what conversation it interrupts or who replied to
     # whom. Everything below is assembled at dispatch and delivered
-    # REQUEST-ONLY through the llm_request middleware, exactly like the
-    # ambient hint and speaker tag: never written onto message.content, which
-    # Hermes persists verbatim (the 2026-08-08 directive-echo lesson).
+    # REQUEST-ONLY on the wire-only ephemeral seam (plan S03), exactly like
+    # the ambient hint and speaker tag: never written onto message.content,
+    # which Hermes persists verbatim (the 2026-08-08 directive-echo lesson).
     #
     # Display names and message text are attacker-controlled. Snippets are
     # flattened to single lines and capped so they cannot forge a wrapper row
@@ -3943,6 +4110,14 @@ class AmbientDiscordAdapter(DiscordAdapter):
         except Exception:
             logger.debug("ambient: travel log sweep stopped", exc_info=True)
 
+    # Retained-snapshot byte bounds (plan S03/V06): the persisted travel
+    # state triggers a trim past 16 KiB and retains at most 8 KiB; the
+    # room-talk snapshot below triggers at 8 KiB and retains 4 KiB. Counts
+    # and per-entry caps stay as they were — these bound the FILE, which is
+    # the copy that survives restarts.
+    _TRAVEL_SNAPSHOT_TRIGGER_B = 16 * 1024
+    _TRAVEL_SNAPSHOT_RETAIN_B = 8 * 1024
+
     def _travel_save_state(self) -> None:
         path = self._travel_state_path()
         if not path:
@@ -3963,8 +4138,28 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 if lane.get("admitted") is True
                 and str(lane.get("visibility") or "") == "public"
             }
-            os.makedirs(os.path.dirname(path), exist_ok=True)
             payload = {"beats": admitted_beats, "lanes": admitted_lanes}
+            # Bound the durable copy, not the live lanes. Keep the newest
+            # closed visits; if active lanes dominate, evict their oldest
+            # observations from this snapshot too.
+            size = len(json.dumps(payload))
+            if size > self._TRAVEL_SNAPSHOT_TRIGGER_B:
+                while size > self._TRAVEL_SNAPSHOT_RETAIN_B and payload["beats"]:
+                    payload["beats"] = payload["beats"][1:]
+                    size = len(json.dumps(payload))
+                if size > self._TRAVEL_SNAPSHOT_RETAIN_B:
+                    oldest_first = sorted(
+                        payload["lanes"],
+                        key=lambda key: float(
+                            payload["lanes"][key].get("last_observed_at") or 0.0
+                        ),
+                    )
+                    for key in oldest_first:
+                        if size <= self._TRAVEL_SNAPSHOT_RETAIN_B:
+                            break
+                        del payload["lanes"][key]
+                        size = len(json.dumps(payload))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             tmp = f"{path}.tmp"
             # 0640: drop group-write. Every seat runs as hermes, so a
             # group-writable store is writable by anything on the host, and
@@ -3976,13 +4171,26 @@ class AmbientDiscordAdapter(DiscordAdapter):
         except Exception:
             logger.debug("ambient.travel_log: could not persist state", exc_info=True)
 
-    def _travel_flush_room_talk(self) -> None:
-        """Snapshot the room-talk buffer, bounded exactly like the live one.
+    # Room-talk snapshot bounds (plan S03/V06): trigger a trim past 8 KiB,
+    # retain at most 4 KiB, and RETAIN NOTHING older than 30 minutes. The
+    # room-talk file is a private copy of other people's conversation; rows
+    # older than half an hour have no recall value the live buffer doesn't
+    # already serve, so they are revoked from retention rather than expired
+    # lazily. The in-memory buffer keeps its own (count-based) bounds — this
+    # governs only the durable snapshot.
+    _ROOM_SNAPSHOT_TRIGGER_B = 8 * 1024
+    _ROOM_SNAPSHOT_RETAIN_B = 4 * 1024
+    _ROOM_SNAPSHOT_TTL_S = 1800.0
 
-        Same caps as _remember_room_talk — max(recent_messages*4, 24)
+    def _travel_flush_room_talk(self) -> None:
+        """Snapshot the room-talk buffer, bounded and expiring like a copy.
+
+        Same entry caps as _remember_room_talk — max(recent_messages*4, 24)
         entries per channel, 128 channels by eviction time — so the file can
-        never outgrow the buffer it mirrors and memory cannot grow because
-        of persistence.
+        never outgrow the buffer it mirrors, PLUS the retained-snapshot
+        bounds above: rows older than 30 minutes are not retained, and the
+        serialized file is trimmed (oldest-touched channels first) to the
+        retain bound once it crosses the trigger.
         """
         if not self._room_cfg().get("persist_room_talk", True):
             return
@@ -3991,22 +4199,36 @@ class AmbientDiscordAdapter(DiscordAdapter):
             return
         try:
             keep = max(int(self._room_cfg().get("recent_messages", 6)) * 4, 24)
+            expiry = time.time() - self._ROOM_SNAPSHOT_TTL_S
             room = {}
             touched = {}
             for key, rows in self._room_talk.items():
                 # index 4 is the flattened line; redact it exactly like the
-                # close-time snippet path above.
-                room[key] = [
+                # close-time snippet path above. index 6 is the entry
+                # timestamp: rows older than the TTL are revoked outright.
+                retained = [
                     [(redact_sensitive_text(v) if i == 4 else v) for i, v in enumerate(r)]
                     for r in rows[-keep:]
+                    if len(r) > 6 and float(r[6] or 0.0) >= expiry
                 ]
-                touched[key] = float(self._room_talk_touched.get(key, 0.0))
+                if retained:
+                    room[key] = retained
+                    touched[key] = float(self._room_talk_touched.get(key, 0.0))
             while len(room) > 128:
                 oldest = min(touched, key=touched.get)
                 room.pop(oldest, None)
                 touched.pop(oldest, None)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
             payload = {"room_talk": room, "touched": touched}
+            if len(json.dumps(payload)) > self._ROOM_SNAPSHOT_TRIGGER_B:
+                while (
+                    len(json.dumps(payload)) > self._ROOM_SNAPSHOT_RETAIN_B
+                    and room
+                ):
+                    oldest = min(touched, key=touched.get)
+                    room.pop(oldest, None)
+                    touched.pop(oldest, None)
+                    payload = {"room_talk": room, "touched": touched}
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             tmp = f"{path}.tmp"
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
             with os.fdopen(fd, "w") as fh:
@@ -4889,6 +5111,9 @@ class AmbientDiscordAdapter(DiscordAdapter):
         self._stage_room_context(target)
 
         hint_token = _ambient_hint.set(hint)
+        # The check-in's own admission: discretionary catch-up, vouchable by
+        # the turn-origin resolution (plan S02).
+        self._note_origin_kind(getattr(target, "id", ""), "catch_up")
         thread_token = self._ambient_no_thread_token(target)
         open_token = _ambient_open.set(True)
         gif_token = _gif_profile_context.set(self._bot_user_id())
@@ -5240,14 +5465,53 @@ class AmbientDiscordAdapter(DiscordAdapter):
             return False
         return (time.monotonic() - ts) <= self._VOICE_TWIN_WINDOW_S
 
-    def _suppressed_result(self):
-        """The 'sent nothing, report success' result the base adapter expects."""
+    def _suppressed_result(self, reason: str = "intentional silence"):
+        """The nonphantom "carried nothing" receipt the delivery ledger expects.
+
+        ``success=True`` because the turn is complete and nothing is owed; the
+        projection is EXPLICITLY empty (``delivered_text=""``) and the reason
+        rides on ``error`` so the gateway's outcome classification reads it as
+        "no carriage", never as a phantom delivery of text nobody received
+        (framework `_turn_delivery_outcome`).
+        """
         try:
             from gateway.platforms.base import SendResult  # type: ignore
 
-            return SendResult(success=True, message_id=None)
+            return SendResult(
+                success=True,
+                message_id=None,
+                delivered_text="",
+                error=f"suppressed: {reason}",
+            )
         except Exception:
             return None
+
+    @staticmethod
+    def _mark_delivered_text(result: Any, text: Any, *, screened_context_echo: int = 0):
+        """Stamp the ACTUAL post-screening projection onto a send result.
+
+        The base adapter fills ``delivered_text`` only when the gateway's own
+        final send runs; sends this adapter screens or rewrites must project
+        what really went out, or the receipt reports a draft nobody received.
+        Failures keep their error-only shape — a failed lane carried nothing,
+        so partial/failure semantics downstream stay honest.
+        ``screened_context_echo`` records how many private-context blocks the
+        outbound screen stripped from this text (plan S03/V10).
+        """
+        if result is None:
+            return result
+        try:
+            if (
+                getattr(result, "success", False)
+                and getattr(result, "delivered_text", None) is None
+                and text is not None
+            ):
+                result.delivered_text = str(text)
+            if screened_context_echo:
+                result.screened_context_echo = int(screened_context_echo)
+        except Exception:
+            pass
+        return result
 
     async def send_voice(self, *args: Any, **kwargs: Any):
         """Mark that speech went out, so send() can drop the text twin."""
@@ -5437,9 +5701,23 @@ class AmbientDiscordAdapter(DiscordAdapter):
 
         reply_to = kwargs.get("reply_to", args[0] if args else None)
         standalone = False
+        pre_screened_context = 0
         if self._ambient_enabled() and isinstance(content, str):
             content, standalone = self._extract_standalone_reply(content)
-
+            # Do this before voice, notice, fallback and echo branches: all
+            # can log or reroute the reply before the final delivery screen.
+            content, pre_screened_context = _strip_context_echo(content)
+            if pre_screened_context:
+                logger.warning(
+                    "ambient: stripped %d private-context block(s) before reply routing",
+                    pre_screened_context,
+                )
+                if not _HAS_WORD_RE.search(content):
+                    self._bounce_discard_pending(reply_to)
+                    self._catchup_discard_pending(reply_to)
+                    suppressed = self._suppressed_result("screened_context_echo")
+                    self._direct_count_sent(reply_to, suppressed)
+                    return suppressed
         # Inbound-speech echo: the gateway posts 🎙️ "<transcript>" so a user can
         # verify STT quality. Useful on an operator surface, noise on a public
         # one — and NOT configurable per profile upstream, because
@@ -5449,7 +5727,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
         if self._hygiene_cfg().get("suppress_stt_echo", False) and isinstance(content, str):
             if _STT_ECHO_RE.match(content):
                 logger.info("ambient: suppressed STT transcript echo: %s", content.strip()[:80])
-                return self._suppressed_result()
+                return self._suppressed_result("stt transcript echo")
 
         # Voice-only, tool-call path: the model called the tts tool itself, so
         # send_voice() was never involved — the audio rode out as a MEDIA
@@ -5488,7 +5766,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             self._voice_only_enabled()
             and reply_to is not None
             and isinstance(content, str)
-            and _claim_recent_tts()
+            and self._claim_recent_tts()
         ):
             logger.info(
                 "ambient: voice-only — dropped text emitted alongside speech: %s",
@@ -5496,7 +5774,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             )
             self._bounce_discard_pending(reply_to)
             self._catchup_discard_pending(reply_to)
-            return self._suppressed_result()
+            return self._suppressed_result("voice-only text twin of tool speech")
 
         if self._voice_only_enabled() and self._voice_just_sent(chat_id):
             logger.info(
@@ -5555,8 +5833,11 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 "ambient: system notice rerouted to %s: %s",
                 target, str(content).strip()[:120],
             )
-            return await super().send(
-                target, content, metadata=kwargs.get("metadata"),
+            return self._mark_delivered_text(
+                await super().send(
+                    target, content, metadata=kwargs.get("metadata"),
+                ),
+                content,
             )
         if fallback_notice and self._ambient_enabled() and self._ambient_cfg().get(
             "suppress_fallback_notice"
@@ -5573,7 +5854,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
         if self._ambient_enabled() and isinstance(content, str) and self._catchup_echo_leak(content):
             logger.warning(
                 "ambient.catch_up: suppressed a reply that repeated the "
-                "transcript back into the room: %r", content[:200],
+                "transcript back into the room",
             )
             self._bounce_discard_pending(reply_to)
             self._catchup_discard_pending(reply_to)
@@ -5584,68 +5865,51 @@ class AmbientDiscordAdapter(DiscordAdapter):
         if self._ambient_enabled() and isinstance(content, str) and self._room_echo_leak(content, chat_id):
             logger.warning(
                 "ambient.room: suppressed a reply that repeated the recent-talk "
-                "block back into the room: %r", content[:200],
+                "block back into the room",
             )
             self._bounce_discard_pending(reply_to)
             self._catchup_discard_pending(reply_to)
             return self._suppressed_result()
 
+        context_echo_stripped = pre_screened_context
         if self._ambient_enabled() and isinstance(content, str):
             marker = self._ambient_marker()
-            direct_pending = self._direct_is_pending(reply_to)
-            direct_silence = False
-            if direct_pending:
-                try:
-                    from gateway.response_filters import (
-                        is_intentional_silence_response,
-                    )
-
-                    direct_silence = is_intentional_silence_response(content)
-                except Exception:
-                    direct_silence = _looks_like_sentinel(content, marker)
-            if direct_silence:
-                fallback = self._direct_silence_fallback()
-                logger.warning(
-                    "ambient.direct: replaced direct silence marker with fallback: %r",
-                    fallback,
-                )
-                content = fallback
-                standalone = False
+            # Silence is a first-class outcome (plan S02): the gateway already
+            # admitted the marker for a discretionary origin, and a REQUIRED
+            # turn never reaches here with one (the gateway rejected it and
+            # posted its own fallback). There is deliberately NO direct-turn
+            # fallback any more — conversational closure may actually send
+            # nothing, and a receipt claiming otherwise would be a phantom.
             if standalone and not content.strip():
-                screened, n_echo = None, 0
+                screened, n_echo, n_ctx = None, 0, 0
             else:
-                screened, n_echo = _screen_ambient_reply(content, marker)
-            if n_echo:
-                # WARNING, not info: the model just tried to publish an instruction
-                # we gave it. The rule caught it, but the frequency of this line is
-                # how we find out a model or a prompt has started misbehaving.
+                screened, n_echo, n_ctx = _screen_ambient_reply(content, marker)
+            if n_echo or n_ctx:
+                # WARNING, not info: the model just tried to publish an
+                # instruction or private context we gave it. The rule caught
+                # it, but the frequency of this line is how we find out a
+                # model or a prompt has started misbehaving.
                 logger.warning(
-                    "ambient: stripped %d echoed ambient directive(s) from a reply: %r",
-                    n_echo, content[:200],
+                    "ambient: stripped %d echoed directive(s) and %d "
+                    "private-context block(s) from a reply",
+                    n_echo - n_ctx, n_ctx,
                 )
+            context_echo_stripped += n_ctx
             if screened is None:
-                if direct_pending:
-                    screened = self._direct_silence_fallback()
-                    logger.warning(
-                        "ambient.direct: replaced an empty direct reply with fallback: %r",
-                        screened,
-                    )
-                    standalone = False
-                else:
-                    logger.info(
-                        "ambient: response suppressed (%s sentinel or bare directive echo)",
-                        marker,
-                    )
-                    # A swallowed reply was never sent: it must not count against
-                    # the pair, nor sit around to be charged to a later send.
-                    self._bounce_discard_pending(reply_to)
-                    self._catchup_discard_pending(reply_to)
-                    try:
-                        from gateway.platforms.base import SendResult  # type: ignore
-
-                        return SendResult(success=True, message_id=None)
-                    except Exception:
-                        return None
+                logger.info(
+                    "ambient: response suppressed (%s sentinel or bare directive echo)",
+                    marker,
+                )
+                # A swallowed reply was never sent: it must not count against
+                # the pair, nor sit around to be charged to a later send.
+                self._bounce_discard_pending(reply_to)
+                self._catchup_discard_pending(reply_to)
+                suppressed = self._suppressed_result(
+                    "screened_context_echo" if context_echo_stripped
+                    else f"{marker} sentinel or bare directive echo"
+                )
+                self._direct_count_sent(reply_to, suppressed)
+                return suppressed
             content = screened
         # General scrub last, so the fallback-notice comparison above still matches
         # on the model's verbatim text. The ONE thing that now runs earlier is the
@@ -5662,12 +5926,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             if scrubbed is None:
                 self._bounce_discard_pending(reply_to)
                 self._catchup_discard_pending(reply_to)
-                try:
-                    from gateway.platforms.base import SendResult  # type: ignore
-
-                    return SendResult(success=True, message_id=None)
-                except Exception:
-                    return None
+                return self._suppressed_result("outbound scrub left nothing to send")
             content = scrubbed
             if standalone:
                 send_kwargs = dict(kwargs)
@@ -5695,11 +5954,17 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     self._travel_spoke(chat_id)
                     first = None
                     if rest:
-                        first = await super().send(
-                            chat_id, rest, *send_args, **send_kwargs
+                        first = self._mark_delivered_text(
+                            await super().send(
+                                chat_id, rest, *send_args, **send_kwargs
+                            ),
+                            rest,
+                            screened_context_echo=context_echo_stripped,
                         )
                     for url in media:
-                        sent = await super().send(chat_id, url)
+                        sent = self._mark_delivered_text(
+                            await super().send(chat_id, url), url
+                        )
                         if first is None:
                             first = sent
                     logger.info(
@@ -5711,13 +5976,98 @@ class AmbientDiscordAdapter(DiscordAdapter):
                     self._catchup_count_sent(reply_to, first)
                     self._direct_count_sent(reply_to, first)
                     return first
-
-        self._travel_spoke(chat_id)
-        result = await super().send(chat_id, content, *send_args, **send_kwargs)
+            else:
+                # The companion's ledgered final is one send. Preserve a
+                # pending GIF in that same message instead of silently losing
+                # it when standalone media-URL sends are disabled.
+                pending = self._attach_pending_gif(content, [])
+                if pending:
+                    content = content + "\n" + "\n".join(pending)
+        result = self._mark_delivered_text(
+            await super().send(chat_id, content, *send_args, **send_kwargs),
+            content,
+            screened_context_echo=context_echo_stripped,
+        )
+        if (
+            getattr(result, "success", False)
+            and (getattr(result, "message_id", None)
+                 or getattr(result, "delivered_text", None))
+        ):
+            self._travel_spoke(chat_id)
         self._bounce_count_sent(reply_to, result)
         self._catchup_count_sent(reply_to, result)
         self._direct_count_sent(reply_to, result)
         return result
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+        metadata: Any = None,
+    ) -> Any:
+        """Screen STREAMED edits for echoed private context before they land.
+
+        The stream consumer edits one Discord message in place with the whole
+        accumulated segment text on every tick, so this is the only place a
+        model regurgitating its `<ambient_context>` block would otherwise
+        reach the room mid-stream. The same three shapes as the whole-text
+        screen apply, which is also what closes SPLIT echoes: an interim
+        frame carrying only the block's head strips from the opener to the
+        end (the room sees the pre-block text), and the closing half arriving
+        in a later frame is stripped from the start.
+
+        An interim frame that strips to nothing does not edit (Discord
+        refuses empty content; the previous frame stays visible) and reports
+        success with an empty projection — this edit carried nothing. The
+        FINAL frame stripping to nothing deletes the streamed message
+        best-effort so no orphan placeholder is left holding private text.
+        """
+        n_ctx = 0
+        if self._ambient_enabled() and isinstance(content, str):
+            cleaned = _AMBIENT_ECHO_RE.sub(" ", content)
+            cleaned, n_ctx = _strip_context_echo(cleaned)
+            if n_ctx:
+                logger.warning(
+                    "ambient: stripped %d echoed private-context block(s) "
+                    "from a streamed frame",
+                    n_ctx,
+                )
+            if not cleaned.strip():
+                if finalize:
+                    await self._delete_streamed_message(chat_id, message_id)
+                    return self._suppressed_result("screened_context_echo")
+                try:
+                    from gateway.platforms.base import SendResult  # type: ignore
+
+                    return SendResult(
+                        success=True, message_id=message_id, delivered_text=""
+                    )
+                except Exception:
+                    return None
+            content = cleaned
+        result = await super().edit_message(
+            chat_id, message_id, content, finalize=finalize, metadata=metadata
+        )
+        return self._mark_delivered_text(
+            result, content, screened_context_echo=n_ctx
+        )
+
+    async def _delete_streamed_message(self, chat_id: Any, message_id: Any) -> bool:
+        """Best-effort delete of a streamed message that carried no real text."""
+        try:
+            channel = await self._resolve_channel(str(chat_id))
+            message = channel.get_partial_message(int(message_id))
+            await message.delete()
+            return True
+        except Exception:
+            logger.debug(
+                "ambient: could not delete an all-context streamed frame",
+                exc_info=True,
+            )
+            return False
 
 
 # ---- GIF search (Klipy) ---------------------------------------------------
@@ -6351,9 +6701,14 @@ def _install_gateway_turn_scope() -> None:
             scope_token = _verified_run_context.set(bundle)
             identity_token = identity_context.set(
                 (message_id, source_user_id) if bundle is not None else None)
+            # Turn-owned TTS signal (plan S02/V09): the adapter whose turn
+            # this is owns any speech it generates. An unbound turn owns
+            # nothing, so its TTS calls arm no suppression at all.
+            tts_token = _tts_owner.set(adapter if bundle is not None else None)
             try:
                 return await original(runner, *args, **kwargs)
             finally:
+                _tts_owner.reset(tts_token)
                 identity_context.reset(identity_token)
                 _verified_run_context.reset(scope_token)
                 for token in reversed(session_tokens):
@@ -6431,10 +6786,17 @@ def _on_pre_llm_call_turn_scope(**kwargs: Any):
 
 
 def _on_llm_request_ambient_hint(**kwargs: Any):
-    """Deliver this turn's directives as request-only user rows.
+    """Rebind this turn's verified scope, then add the PUBLIC placement note.
 
-    Ambient/direct hints, speaker identity, speaker memory, and quiet-resume
-    all append here. Nothing is written onto the persisted user turn.
+    The per-pass rebinding below stays even when no note is added: later tool
+    calls (the image gate, gif_search's profile key) read these ContextVars
+    from the agent loop, and a queued turn runs on a task that never saw the
+    dispatch's own context. PRIVATE ambient/direct hints, speaker identity,
+    room context and travel observations move through the wire-only ephemeral
+    seam (`_on_pre_llm_call_ambient_context`, plan S03): only the copy of the
+    current user row carries them; history and `api_content` do not.
+    This middleware may append only public-safe reply-placement guidance or
+    the one-shot post-restart instruction. Neither contains speaker or room data.
     """
     try:
         turn_id = str(kwargs.get("turn_id") or "").strip()
@@ -6456,50 +6818,33 @@ def _on_llm_request_ambient_hint(**kwargs: Any):
             _room_context.set(str(scope.get("room_context") or ""))
             _travel_context.set(str(scope.get("travel_context") or ""))
             _gif_profile_context.set(str(scope.get("gif_profile") or ""))
-        extras: list[str] = []
         reply_style = _ambient_cfg("reply_style", {})
         reply_style_enabled = bool(
             isinstance(reply_style, dict) and reply_style.get("enabled")
         )
-        # The marker only means something where delivery carries a reply
-        # anchor. A cron or webhook turn has none, so the guidance there is an
-        # instruction the model can follow and delivery cannot honour — which
-        # is how a scheduled spark shipped a literal "[STANDALONE]" into the
-        # public room. An unknown surface keeps the guidance: the Discord path
-        # is the one that must never lose it.
         platform = str(kwargs.get("platform") or "").strip().lower()
+        public_rows = []
         if reply_style_enabled and (
             not platform or platform in _REPLY_ANCHORED_PLATFORMS
         ):
             marker = str(
                 reply_style.get("standalone_marker") or "[STANDALONE]"
             ).strip() or "[STANDALONE]"
-            extras.append(
-                "[ambient reply placement: Responses normally use Discord's reply "
-                f"feature. Begin a room-wide/general remark with exactly {marker} "
-                "only when its audience and addressee are already obvious. Do not "
-                "use it for a direct question, an older message, or ambiguous "
-                "attribution. The marker is removed before delivery.]"
-            )
-        if _direct_address.get(False):
-            extras.append(_DIRECT_REPLY_HINT)
-        else:
-            ambient_hint = _ambient_hint.get("")
-            if ambient_hint:
-                extras.append(ambient_hint)
-        tag, known = _speaker_context.get(("", None))
-        if tag:
-            extras.append(f"{tag}\n{known}" if known else tag)
-        room = _room_context.get("")
-        if room:
-            extras.append(room)
-        travel = _travel_context.get("")
-        if travel:
-            extras.append(travel)
-        if _quiet_resume_pending.get(False):
-            extras.append(_QUIET_RESUME_DIRECTIVE)
-            _quiet_resume_pending.set(False)
-        if not extras:
+            public_rows.append({
+                "role": "user",
+                "content": (
+                    "[ambient reply placement: Responses normally use Discord's reply "
+                    f"feature. Begin a room-wide/general remark with exactly {marker} "
+                    "only when its audience and addressee are already obvious. Do not "
+                    "use it for a direct question, an older message, or ambiguous "
+                    "attribution. The marker is removed before delivery.]"
+                ),
+            })
+        if _quiet_resume_pending.get(False) and (
+            not platform or platform in _REPLY_ANCHORED_PLATFORMS
+        ):
+            public_rows.append({"role": "user", "content": _QUIET_RESUME_DIRECTIVE})
+        if not public_rows:
             return None
         request = kwargs.get("request")
         if not isinstance(request, dict):
@@ -6508,27 +6853,9 @@ def _on_llm_request_ambient_hint(**kwargs: Any):
         if not isinstance(messages, list) or not messages:
             return None
         patched = dict(request)
-        patched["messages"] = list(messages) + [
-            {"role": "user", "content": block} for block in extras
-        ]
-        if _direct_address.get(False):
-            kind = "direct-address"
-        elif _ambient_hint.get(""):
-            kind = "ambient"
-        elif any("gateway restarted" in block.lower() for block in extras):
-            kind = "quiet-resume"
-        elif reply_style_enabled:
-            kind = "reply-placement"
-        else:
-            kind = "speaker"
-        if _room_context.get(""):
-            kind += "+room"
-        if _travel_context.get(""):
-            kind += "+travel"
-        logger.info(
-            "ambient: %s directive delivered via llm_request middleware (request-only)",
-            kind,
-        )
+        patched["messages"] = list(messages) + public_rows
+        if any(row["content"] == _QUIET_RESUME_DIRECTIVE for row in public_rows):
+            _quiet_resume_pending.set(False)
         return {"request": patched}
     except Exception:  # noqa: BLE001 — never break a turn over a nudge
         logger.debug("ambient: hint middleware failed; turn proceeds", exc_info=True)
@@ -6549,6 +6876,143 @@ def _on_pre_llm_call_quiet_resume(**kwargs: Any):
         return None
     except Exception:  # noqa: BLE001 — a cosmetic hook must never break a turn
         logger.debug("ambient.quiet_resume: hook failed; turn proceeds", exc_info=True)
+        return None
+
+
+def _ambient_private_parts(scope: dict) -> list:
+    """The PRIVATE hint rows for this turn's scope, in delivery order.
+
+    Direct/ambient directives, speaker identity, room context and the travel
+    log ride the wire-only ephemeral seam. They must not appear in a synthetic
+    request row, a persisted turn, an export or a summary. Post-restart
+    guidance is public-safe and handled separately by the request middleware.
+    """
+    parts: list[str] = []
+    if bool(scope.get("direct_address")):
+        parts.append(_DIRECT_REPLY_HINT)
+    else:
+        hint = str(scope.get("ambient_hint") or "")
+        if hint:
+            parts.append(hint)
+    speaker_context = scope.get("speaker_context")
+    if not (
+        isinstance(speaker_context, tuple)
+        and len(speaker_context) == 2
+    ):
+        speaker_context = ("", None)
+    tag, known = speaker_context
+    if tag:
+        parts.append(f"{tag}\n{known}" if known else tag)
+    room = str(scope.get("room_context") or "")
+    if room:
+        parts.append(room)
+    travel = str(scope.get("travel_context") or "")
+    if travel:
+        parts.append(travel)
+    return parts
+
+
+def _xml_safe_char(char: str) -> bool:
+    code = ord(char)
+    return (code in (9, 10, 13)
+            or 0x20 <= code <= 0xD7FF
+            or 0xE000 <= code <= 0xFFFD
+            or 0x10000 <= code <= 0x10FFFF)
+
+
+def _render_ambient_envelope(
+    parts: list[str], *, speaker_id: str = "", speaker_handle: str = "",
+) -> str:
+    """Escape untrusted observations within one 4 KiB wire-only envelope."""
+    identity = ""
+    if speaker_handle and speaker_id.isdecimal():
+        handle = re.sub(r"[\r\n\t]", " ", "".join(
+            char for char in speaker_handle[:64] if _xml_safe_char(char)
+        ))
+        identity = (
+            f'<turn_identity speaker="{_xml_escape(handle, quote=True)}" '
+            f'speaker_id="{speaker_id[:32]}" />\n'
+        )
+    opening = "<ambient_context>\n" + identity
+    closing = "\n</ambient_context>"
+    marker = "\n[truncated]"
+    budget = 4096 - len((opening + closing + marker).encode("utf-8"))
+    body: list[str] = []
+    used = 0
+    truncated = False
+    for index, part in enumerate(parts):
+        if index:
+            if used + 1 > budget:
+                truncated = True
+                break
+            body.append("\n")
+            used += 1
+        for char in part:
+            if not _xml_safe_char(char):
+                continue
+            escaped = _xml_escape(char, quote=True)
+            width = len(escaped.encode("utf-8"))
+            if used + width > budget:
+                truncated = True
+                break
+            body.append(escaped)
+            used += width
+        if truncated:
+            break
+    if truncated:
+        body.append(marker)
+    return opening + "".join(body) + closing
+
+
+def _on_pre_llm_call_ambient_context(**kwargs: Any):
+    """Deliver this turn's private ambient context WIRE-ONLY (plan S03).
+
+    Returns ``{"ephemeral_context": "<ambient_context>…</ambient_context>"}``,
+    which the framework collects once per turn into
+    ``TurnContext.ephemeral_user_context`` and appends ONLY to the wire copy
+    of the current user row on every API pass — never to ``api_content``,
+    history, exports, summaries or disk. The block wrapper is what the
+    outbound screens strip when a model echoes it (``_strip_context_echo``).
+
+    Fail-closed on both boundaries: an unverified turn with no server-bound
+    turn id and speaker identity yields NO private rows — never a fallback to
+    replayable ``context`` or synthetic request rows — and a framework
+    without the seam withholds the block entirely (``_ephemeral_seam_ok``).
+    """
+    try:
+        turn_id = str(kwargs.get("turn_id") or "").strip()
+        if not turn_id:
+            return None
+        with _turn_scopes_lock:
+            scope = _turn_scopes.get(turn_id)
+        if not (
+            isinstance(scope, dict)
+            and scope.get("speaker_id")
+            and scope.get("message_id")
+        ):
+            # A copied ContextVar or an old turn's staged observation is not
+            # current-turn speaker attestation. Never inject it by fallback.
+            return None
+        parts = _ambient_private_parts(scope)
+        if not parts:
+            return None
+        if not _ephemeral_seam_ok():
+            # Withheld, not downgraded: this turn delivers no private context
+            # on a framework lacking the wire-only seam.
+            return None
+        kind = "direct" if bool(scope.get("direct_address")) else "ambient"
+        logger.info(
+            "ambient: %s private context delivered wire-only (ephemeral seam)",
+            kind,
+        )
+        return {"ephemeral_context": _render_ambient_envelope(
+            parts,
+            speaker_id=str(scope["speaker_id"]),
+            speaker_handle=str(scope.get("speaker_handle") or ""),
+        )}
+    except Exception:  # noqa: BLE001 — never break a turn over context delivery
+        logger.debug("ambient: ephemeral context hook failed; turn proceeds",
+                     exc_info=True)
         return None
 
 
@@ -6638,61 +7102,30 @@ def _install_compaction_focus() -> None:
     logger.info("ambient: compaction focus installed (per-profile, resolved per call)")
 
 
-def _install_direct_silence_filter() -> None:
-    """Keep direct silence controls in the delivery path for adapter recovery.
-
-    Hermes normally turns a successful whole-response ``[SILENT]``/``NO_REPLY``
-    into an empty gateway response before the platform adapter sees it.  That is
-    correct for ambient turns.  A directly addressed turn is different: leave
-    its marker intact so ``AmbientDiscordAdapter.send`` can replace it with the
-    configured acknowledgment.  Both patches are process-wide but context-
-    gated, so other profiles and unaddressed turns retain stock behavior.
-    """
+def _require_companion_framework() -> None:
+    """Refuse activation without the pinned origin, privacy and receipt seams."""
     try:
-        from gateway import response_filters as filters
-
-        current = filters.is_intentional_silence_agent_result
-        original = getattr(current, "_ambient_direct_original", current)
-
-        def _direct_aware_agent_result(agent_result, response):
-            silent = original(agent_result, response)
-            if silent and _direct_address.get(False):
-                logger.warning(
-                    "ambient.direct: retained a direct silence marker for fallback delivery"
-                )
-                return False
-            return silent
-
-        _direct_aware_agent_result._ambient_direct_original = original
-        filters.is_intentional_silence_agent_result = _direct_aware_agent_result
-
-        # The stream consumer imports its response predicate by value, so patch
-        # that alias as well.  Partial-marker buffering remains unchanged; only
-        # the completed direct marker is allowed through to adapter.send().
-        try:
-            from gateway import stream_consumer
-
-            stream_current = stream_consumer._is_intentional_silence_response
-            stream_original = getattr(
-                stream_current, "_ambient_direct_original", stream_current
-            )
-
-            def _direct_aware_stream_response(response):
-                silent = stream_original(response)
-                return False if silent and _direct_address.get(False) else silent
-
-            _direct_aware_stream_response._ambient_direct_original = stream_original
-            stream_consumer._is_intentional_silence_response = (
-                _direct_aware_stream_response
-            )
-        except Exception:
-            logger.debug(
-                "ambient.direct: streaming silence filter unavailable",
-                exc_info=True,
-            )
-        logger.info("ambient: direct-address silence recovery installed")
-    except Exception:
-        logger.exception("ambient: could not install direct-address silence recovery")
+        from agent import turn_context
+        from gateway import turn_origin
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+        from hermes_state import SessionDB
+    except Exception as exc:
+        raise RuntimeError(
+            "discord-ambient requires Hermes companion framework 2de7e376 "
+            f"(missing import: {type(exc).__name__})"
+        ) from exc
+    if not getattr(turn_context, "SUPPORTS_EPHEMERAL_CONTEXT", False):
+        raise RuntimeError("discord-ambient requires pre_llm_call.ephemeral_context")
+    if not getattr(turn_context, "SUPPORTS_COMPANION_ZERO_RETENTION", False):
+        raise RuntimeError("discord-ambient requires companion zero-retention context")
+    if not (
+        callable(getattr(turn_origin, "normalize_turn_origin", None))
+        and callable(getattr(BasePlatformAdapter, "send_final_ledgered", None))
+        and callable(getattr(BasePlatformAdapter, "_turn_delivery_outcome", None))
+        and "delivered_text" in getattr(SendResult, "__dataclass_fields__", {})
+        and callable(getattr(SessionDB, "record_message_delivery", None))
+    ):
+        raise RuntimeError("discord-ambient requires TurnOrigin and row-addressed delivery receipts")
 
 
 def register(ctx) -> None:
@@ -6705,8 +7138,20 @@ def register(ctx) -> None:
     deferred bundled loader, preventing the adapter module being imported twice
     under two names.
     """
+    _require_companion_framework()
     _install_compaction_focus()
-    _install_direct_silence_filter()
+    # Hermes' built-in "skills" group also exposes skill_manage. Keep the
+    # companion's optional reading surface separate from that mutable group;
+    # only a profile's Discord config may opt into skills_ro.
+    try:
+        from toolsets import create_custom_toolset  # type: ignore
+        create_custom_toolset(
+            "skills_ro", "Read installed skills without editing them",
+            ["skills_list", "skill_view"],
+        )
+    except Exception as exc:
+        logger.warning("ambient: read-only skill surface unavailable: %s",
+                       type(exc).__name__)
 
     _bundled.register(ctx)
 
@@ -6727,7 +7172,10 @@ def register(ctx) -> None:
 
     try:
         ctx.register_middleware("llm_request", _on_llm_request_ambient_hint)
-        logger.info("ambient: directive middleware registered (request-only injection)")
+        logger.info(
+            "ambient: placement-guidance middleware registered "
+            "(request-only, public-safe)"
+        )
     except Exception as exc:
         logger.warning("ambient: could not register directive middleware: %s", exc)
 
@@ -6738,6 +7186,15 @@ def register(ctx) -> None:
         logger.info("ambient: quiet-resume hook registered")
     except Exception as exc:
         logger.warning("ambient: could not register quiet-resume: %s", exc)
+
+    # Private ambient context, wire-only (plan S03). The turn-scope hook must
+    # run first so this hook can require a verified current speaker. Public-safe
+    # quiet-resume guidance stays in the request middleware.
+    try:
+        ctx.register_hook("pre_llm_call", _on_pre_llm_call_ambient_context)
+        logger.info("ambient: wire-only private-context hook registered")
+    except Exception as exc:
+        logger.warning("ambient: could not register private-context hook: %s", exc)
 
     # Speech hygiene is process-wide by nature (see _install_tts_kaomoji_filter),
     # so install it once at registration rather than per adapter instance.
