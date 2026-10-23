@@ -6730,7 +6730,7 @@ def _install_gateway_turn_scope() -> None:
                 source = args[3]
             platform = getattr(getattr(source, "platform", None), "value", "")
             try:
-                adapter = runner._adapter_for_source(source)
+                adapter = runner._intake_adapter_for(source)
             except Exception:
                 adapter = None
             callback = getattr(adapter, "_ambient_scoped_gateway_turn", None)

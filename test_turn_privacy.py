@@ -219,6 +219,7 @@ def main():
     old_manager = plugins_mod._plugin_manager
     plugins_mod._plugin_manager = manager
     old_cfg = ambient._image_gate_cfg
+    check("gateway exposes inbound adapter resolver", callable(getattr(GatewayRunner, "_intake_adapter_for", None)))
     runner = object.__new__(GatewayRunner)
     runner.config = types.SimpleNamespace(multiplex_profiles=False)
     runner.adapters = {Platform.DISCORD: adapter}
@@ -273,7 +274,7 @@ def main():
         return {"final_response": "ok"}
 
     runner._run_agent_inner = fake_run_agent_inner
-    runner._adapter_for_source = lambda source: adapter
+    runner._intake_adapter_for = lambda source: adapter
 
     async def run_at_real_boundary(message, source):
         return await runner._run_agent(
@@ -495,7 +496,7 @@ def main():
             user_id="202", scope_id="1", message_id="88",
         )
         plugins_mod._plugin_manager = second_manager
-        runner._adapter_for_source = lambda source: second_adapter
+        runner._intake_adapter_for = lambda source: second_adapter
         try:
             async def connect_second_profile(_self, *, is_reconnect=False):
                 await run_at_real_boundary(second_message, second_source)
@@ -506,7 +507,7 @@ def main():
                 asyncio.run(second_adapter.connect())
         finally:
             plugins_mod._plugin_manager = manager
-            runner._adapter_for_source = lambda source: adapter
+            runner._intake_adapter_for = lambda source: adapter
     finally:
         ambient._image_gate_cfg = old_cfg
         plugins_mod._plugin_manager = old_manager
