@@ -18,6 +18,7 @@ import tempfile
 import time
 import types
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 sys.path.insert(0, os.environ.get("HERMES_FRAMEWORK_PATH", "/var/lib/hermes/.hermes/hermes-agent"))
 
@@ -31,6 +32,10 @@ import plugins.platforms.discord.adapter as _ad  # noqa: E402
 # Neutralise the stock __init__ (it wants a live token/session); everything
 # below still runs the REAL ambient __init__ on top of it.
 _ad.DiscordAdapter.__init__ = lambda self, config: setattr(self, "config", config)
+# Catch-up tests admit synthetic senders unless a case overrides this seam.
+_ad.DiscordAdapter._discord_message_admission = (
+    lambda self, message, *, claim: (True, False)
+)
 
 PLUGIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "__init__.py")
 spec = importlib.util.spec_from_file_location("ambient_under_test", PLUGIN)
@@ -194,6 +199,7 @@ def stub_dispatch():
         seen["hint"] = amb._ambient_hint.get("")
         seen["open"] = amb._ambient_open.get()
         seen["speaker"] = amb._speaker_context.get(("", None))
+        seen["request_speaker"] = self._prepared_turns[str(message.id)]["speaker_context"]
         seen["authorized_speaker"] = amb._current_speaker_id.get("")
         return True
 
@@ -216,7 +222,9 @@ async def main():
     ch = live_room()
     a = make_adapter(BASE, channels=[ch])
     d = stub_dispatch()
-    fired = await a._catchup_scan_channel(ch)
+    with patch.object(_ad.DiscordAdapter, "_discord_message_admission",
+                      lambda self, message, *, claim: (message.author.id == BOB.id, False)):
+        fired = await a._catchup_scan_channel(ch)
     check("dispatches on a conversation she missed", fired)
     hint = d.get("hint", "")
     check("transcript carries the actual messages",
@@ -229,8 +237,8 @@ async def main():
     check("silence is offered as the default", "[SILENT]" in hint)
     check(
         "speaker identity reaches the catch-up request",
-        d.get("speaker", ("", None))[0].startswith("[speaker @bob id:2]"),
-        repr(d.get("speaker")),
+        d.get("request_speaker", ("", None))[0].startswith("[speaker @bob id:2]"),
+        repr(d.get("request_speaker")),
     )
     check(
         "catch-up speaker identity is cleared after dispatch",
@@ -246,6 +254,19 @@ async def main():
         "catch-up authorization identity is cleared after dispatch",
         amb._current_speaker_id.get("") == "",
         repr(amb._current_speaker_id.get("")),
+    )
+    refused_room = live_room()
+    refused_room._msgs[0].author = ALICE
+    refused_adapter = make_adapter(BASE, channels=[refused_room])
+    refused_dispatch = stub_dispatch()
+    with patch.object(_ad.DiscordAdapter, "_discord_message_admission",
+                      lambda self, message, *, claim: (message.author.id == BOB.id, False)):
+        await refused_adapter._catchup_scan_channel(refused_room)
+    check(
+        "refused catch-up sender contributes no speaker identity",
+        refused_dispatch.get("speaker", ("", None)) == ("", None)
+        and refused_dispatch.get("request_speaker") == (None, None),
+        repr((refused_dispatch.get("speaker"), refused_dispatch.get("request_speaker"))),
     )
 
     print("\n-- the echo rule must catch every bracketed line of that hint --")

@@ -25,6 +25,7 @@ import tempfile
 import time
 import types
 from contextlib import contextmanager
+from unittest import mock
 
 sys.path.insert(0, os.environ.get("HERMES_FRAMEWORK_PATH", "/var/lib/hermes/.hermes/hermes-agent"))
 os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="travel-log-test-")
@@ -739,6 +740,25 @@ with case("persist_room_talk false never writes the snapshot"):
 def room_entry(mid, ts):
     return [str(mid), "101", "alice", False, f"crafted line {mid}", None, ts]
 
+with case("reload drops expired rows and disabled snapshots"):
+    with state_home() as home:
+        now = time.time()
+        path = state_file(home, "ambient-room-talk")
+        seed_room_talk_store(home, {
+            "501": [room_entry(901, now - 1900), room_entry(902, now - 20)],
+        }, {"501": now})
+        active = build_adapter(room={"persist_room_talk": True})
+        active._travel_load_room_talk()
+        rows = active._room_context_rows(Message(903, ALICE, GENERAL, "now"))
+        check("expired persisted talk is never projected",
+              "crafted line 901" not in "\n".join(rows)
+              and "crafted line 902" in "\n".join(rows), rows)
+        disabled = build_adapter(room={"persist_room_talk": False})
+        disabled._travel_load_room_talk()
+        check("disabled persistence loads nothing and removes snapshot",
+              not disabled._room_talk and not os.path.exists(path),
+              repr(disabled._room_talk))
+
 with case("a reload keeps the per-channel cap and the 128-channel bound"):
     with state_home() as home:
         base_ts = time.time() - 200  # fixed once: asserts must not re-derive "now"
@@ -782,11 +802,13 @@ with case("one dispatch touches no state file"):
             seen["room"] = ambient._room_context.get("")
             return True
         original = discord_adapter.DiscordAdapter._dispatch_discord_message
-        discord_adapter.DiscordAdapter._dispatch_discord_message = fake_dispatch
-        try:
-            asyncio.run(a._dispatch_discord_message(Message(91, BOB, GENERAL, "the measured message")))
-        finally:
-            discord_adapter.DiscordAdapter._dispatch_discord_message = original
+        with mock.patch.object(discord_adapter.DiscordAdapter, "_discord_message_admission",
+                               lambda self, message, *, claim: (True, False)):
+            discord_adapter.DiscordAdapter._dispatch_discord_message = fake_dispatch
+            try:
+                asyncio.run(a._dispatch_discord_message(Message(91, BOB, GENERAL, "the measured message")))
+            finally:
+                discord_adapter.DiscordAdapter._dispatch_discord_message = original
         post = {p: os.stat(p).st_mtime_ns for p in (travel_path, talk_path)}
         check("no state file was rewritten", pre == post, (pre, post))
         check("no temp files were left behind",

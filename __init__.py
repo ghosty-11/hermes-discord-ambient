@@ -507,6 +507,9 @@ _no_thread_keys: contextvars.ContextVar[set] = contextvars.ContextVar(
 _speaker_context: contextvars.ContextVar[tuple] = contextvars.ContextVar(
     "hermes_ambient_speaker_context", default=("", None)
 )
+_dispatch_recall: contextvars.ContextVar[tuple | None] = contextvars.ContextVar(
+    "hermes_ambient_dispatch_recall", default=None
+)
 _quiet_resume_pending: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "hermes_ambient_quiet_resume", default=False
 )
@@ -731,12 +734,13 @@ _STALL_NOTICE_RE = re.compile(r"^⏱️\s*Agent inactive for\b")
 # punctuation reads as the bot glitching. Those are suppressed instead.
 # Harmony is an envelope, not loose tokens, so it is parsed as one:
 #   <|start|>ROLE<|channel|>CHANNEL<|constrain|>FMT<|message|>PAYLOAD<|end|>
+#   <|im_start|>ROLE<|meta_sep|>CHANNEL<|im_sep|>PAYLOAD<|im_end|>
 # Stripping token-by-token is not enough — it leaves the channel name and the
 # tool-argument JSON behind as visible text. Only the payload of a `final`
 # channel is real output; `commentary`/`analysis` payloads are a tool call or
 # private reasoning and must never reach the room.
 _HARMONY_TOKEN_RE = re.compile(r"<\|[a-z_]{1,24}\|>", re.IGNORECASE)
-_HARMONY_MSG_RE = re.compile(r"^(?P<head>.*)<\|message\|>(?P<body>.*)$", re.S | re.I)
+_HARMONY_MSG_RE = re.compile(r"^(?P<head>.*)<\|(?:message|im_sep)\|>(?P<body>.*)$", re.S | re.I)
 _REASONING_CHANNEL_RE = re.compile(r"\b(?:commentary|analysis)\b", re.IGNORECASE)
 # A recipient marker is decisive on its own: `to=functions.x` is how harmony
 # addresses a tool, and no genuine chat reply contains it. This catches the
@@ -1502,10 +1506,36 @@ class AmbientDiscordAdapter(DiscordAdapter):
         if not reply_to:
             return
         try:
-            if result is not None and getattr(result, "success", False):
+            if result is not None and (
+                getattr(result, "success", False) or self._is_partial_delivery(result)
+            ):
                 self._direct_pending.pop(str(reply_to), None)
         except Exception:
             pass
+
+    def _turn_delivery_outcome(self, results, *, hint, streamed_text):
+        """Expand isolated carriages; shared accounting handles acknowledged chunks."""
+        expanded = []
+        isolated = False
+        for result in results or []:
+            raw = getattr(result, "raw_response", None)
+            carriages = raw.get("ambient_carriages") if isinstance(raw, dict) else None
+            if isinstance(carriages, tuple):
+                expanded.extend(carriages)
+                isolated = True
+            else:
+                expanded.append(result)
+        outcome = super()._turn_delivery_outcome(
+            expanded, hint=hint, streamed_text=streamed_text
+        )
+        if isolated and outcome.get("disposition") == "text":
+            outcome["text"] = "\n".join(
+                result.delivered_text for result in expanded
+                if (getattr(result, "success", False) or self._is_partial_delivery(result))
+                and isinstance(getattr(result, "delivered_text", None), str)
+                and result.delivered_text
+            )
+        return outcome
 
     def set_message_handler(self, handler) -> None:
         """Scope directness around the real gateway turn, including queued turns."""
@@ -2524,7 +2554,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             pending = self._bounce_pending.get(key)
             if pending is None:
                 return
-            if result is not None and not getattr(result, "success", True):
+            if result is not None and not getattr(result, "success", True) and not self._is_partial_delivery(result):
                 # The reply never landed. LEAVE the marker: _send_with_retry
                 # retries the same reply with the same reply_to, and a retry
                 # that succeeds must still be charged.
@@ -2819,13 +2849,28 @@ class AmbientDiscordAdapter(DiscordAdapter):
         self._annotate_reply_context(event)
         return self._ambient_enabled() and self._event_is_direct(event)
 
-    def _prepare_turn_context(self, message: Any) -> dict:
+    async def _prepare_turn_context(self, message: Any) -> dict:
         """Prepare context keyed only by the exact inbound Discord message id."""
         author = getattr(message, "author", None)
         speaker_id = str(getattr(author, "id", "") or "")
         message_id = str(getattr(message, "id", "") or "")
         tag = self._speaker_tag(message)
-        known = self._speaker_memory(speaker_id) if tag else None
+        admitted = (
+            super()._discord_message_admission(message, claim=False)[0]
+            if tag else False
+        )
+        cached = _dispatch_recall.get()
+        key = (message_id, speaker_id, tag)
+        if admitted and cached is not None and cached[:3] == key:
+            known = cached[3]
+        else:
+            known = (
+                await asyncio.to_thread(self._speaker_memory, speaker_id)
+                if admitted and self._speaker_memory_cfg().get("enabled") else None
+            )
+            if admitted and cached is not None:
+                _dispatch_recall.set((*key, known))
+        _speaker_context.set((tag, known) if admitted else ("", None))
         room_context = "\n".join(self._room_context_rows(message))
         channel = getattr(message, "channel", None)
         channel_id = str(getattr(channel, "id", "") or "")
@@ -2837,11 +2882,11 @@ class AmbientDiscordAdapter(DiscordAdapter):
             "speaker_id": speaker_id,
             "speaker_handle": (
                 str(getattr(author, "name", "") or getattr(author, "display_name", "") or "").strip()
-                if tag else ""
+                if admitted else ""
             ),
             "ambient_hint": _ambient_hint.get(""),
             "direct_address": self._raw_message_is_direct(message),
-            "speaker_context": (tag, known),
+            "speaker_context": (tag if admitted else None, known),
             "room_context": room_context,
             "travel_context": travel_context,
             "gif_profile": self._bot_user_id(),
@@ -2875,7 +2920,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             return self._prepared_turns.pop(message_id, None)
 
     async def _dispatch_stock_with_turn_context(self, message: Any) -> bool:
-        bundle = self._prepare_turn_context(message)
+        bundle = await self._prepare_turn_context(message)
         handled = await super()._dispatch_discord_message(message)
         if not handled:
             self._discard_prepared_turn(bundle)
@@ -2884,7 +2929,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
         return handled
 
     async def _dispatch_recovered_with_turn_context(self, message: Any) -> bool:
-        bundle = self._prepare_turn_context(message)
+        bundle = await self._prepare_turn_context(message)
         handled = await super()._dispatch_recovered_message(message)
         if not handled:
             self._discard_prepared_turn(bundle)
@@ -2924,6 +2969,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
         token = self._ambient_no_thread_token(message)
         authorization_token = _current_speaker_id.set("")
         gif_token = _gif_profile_context.set(self._bot_user_id())
+        speaker_token = _speaker_context.set(("", None))
         try:
             verdict = self._bounce_pre_dispatch(message)
             if verdict == "suppress":
@@ -2936,22 +2982,28 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 self._bounce_note_dispatch(message)
             return handled
         finally:
+            _speaker_context.reset(speaker_token)
             _gif_profile_context.reset(gif_token)
             _current_speaker_id.reset(authorization_token)
             if token is not None:
                 _no_thread_keys.reset(token)
 
     async def _dispatch_inner(self, message: Any) -> bool:
-        # Stable speaker identity before anything reads the content, so both
-        # the stock pass and any ambient re-dispatch carry it.
+        token = _dispatch_recall.set(())
+        try:
+            return await self._dispatch_inner_admitted(message)
+        finally:
+            _dispatch_recall.reset(token)
+
+    async def _dispatch_inner_admitted(self, message: Any) -> bool:
+        # Only stock-admitted senders contribute speaker recall or room talk.
+        admitted, _ = super()._discord_message_admission(message, claim=False)
         self._remember_discord_identities(message)
-        self._apply_speaker_tag(message)
         self._note_inbound_for_window(message)
-        # Room context BEFORE the current message enters the buffer, so the
-        # recent-talk block is strictly the conversation before this turn;
-        # the current message is already the user turn.
-        self._stage_room_context(message)
-        self._remember_room_talk(message)
+        # Stage the preceding talk before recording this admitted message.
+        if admitted:
+            self._stage_room_context(message)
+            self._remember_room_talk(message)
 
         # Project only continuity already admitted by an earlier handled public
         # source. The current arrival is recorded later by `_travel_admit`.
@@ -3193,21 +3245,6 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.debug("ambient: speaker memory lookup failed", exc_info=True)
             return None
 
-    def _apply_speaker_tag(self, message: Any) -> None:
-        """Stage speaker identity for request-only delivery. Never raises.
-
-        The outgoing LLM request receives the tag and recall block without
-        modifying the user turn that Hermes persists.
-        """
-        tag = self._speaker_tag(message)
-        if not tag:
-            return
-        try:
-            author = getattr(message, "author", None)
-            known = self._speaker_memory(str(getattr(author, "id", "") or ""))
-            _speaker_context.set((tag, known))
-        except Exception:
-            pass
 
 
     def _remember_discord_identities(self, message: Any) -> None:
@@ -3304,14 +3341,12 @@ class AmbientDiscordAdapter(DiscordAdapter):
     def _remember_room_talk(self, message: Any) -> None:
         """Append one inbound message to the channel's bounded recent-talk buffer.
 
-        Opt-in via `room_context.enabled`. Includes the profile's own
-        messages — rendered as ``you`` — so a populated buffer preserves
-        the bot's side of the conversation across sessions; after a
-        restart it repopulates via live traffic or eligible catch-up.
-        The duplication with live session history is capped by the talk
-        budget. Messages with nothing readable are skipped. Reply refs
-        prefer Discord's own resolved reference, then fall back to the
-        buffer, then to nothing — never a guessed name.
+        Opt-in via `room_context.enabled`. Live capture routes call this only
+        for stock-admitted senders. The bounded buffer survives restarts when
+        configured; the duplication with live session history is capped by
+        the talk budget. Messages with nothing readable are skipped. Reply
+        refs prefer Discord's own resolved reference, then the buffer, then
+        nothing — never a guessed name.
         """
         cfg = self._room_cfg()
         if not (self._ambient_enabled() and cfg.get("enabled")):
@@ -3694,6 +3729,14 @@ class AmbientDiscordAdapter(DiscordAdapter):
         path = self._room_talk_state_path()
         if not path:
             return
+        if not self._room_cfg().get("persist_room_talk", True):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.debug("ambient.travel_log: could not remove disabled room talk", exc_info=True)
+            return
         try:
             with open(path) as fh:
                 data = json.load(fh)
@@ -3702,11 +3745,13 @@ class AmbientDiscordAdapter(DiscordAdapter):
             if not isinstance(room, dict) or not isinstance(touched, dict):
                 return
             keep = max(int(self._room_cfg().get("recent_messages", 6)) * 4, 24)
+            expiry = time.time() - self._ROOM_SNAPSHOT_TTL_S
             for key, rows in room.items():
                 entries = [
                     tuple(r)
                     for r in rows or []
                     if isinstance(r, (list, tuple)) and len(r) == 7
+                    and float(r[6] or 0.0) >= expiry
                 ]
                 if not entries:
                     continue
@@ -4536,9 +4581,11 @@ class AmbientDiscordAdapter(DiscordAdapter):
             limit = max(1, min(configured, 100))
             observed = 0
             async for message in channel.history(limit=limit):
-                self._remember_discord_identities(message)
-                self._remember_room_talk(message)
-                observed += 1
+                admitted, _ = super()._discord_message_admission(message, claim=False)
+                if admitted:
+                    self._remember_discord_identities(message)
+                    self._remember_room_talk(message)
+                    observed += 1
             logger.info(
                 "ambient: observed %d recent channel message(s) for mention resolution",
                 observed,
@@ -5103,7 +5150,6 @@ class AmbientDiscordAdapter(DiscordAdapter):
             str(getattr(getattr(target, "author", None), "id", "") or "")
         )
         speaker_token = _speaker_context.set(("", None))
-        self._apply_speaker_tag(target)
         room_token = _room_context.set("")
         # The check-in turn gets no travel block (it renders the room's NOW,
         # not her memory) but must not inherit one either.
@@ -5284,7 +5330,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             key = str(reply_to or "")
             if key not in self._catchup_pending:
                 return
-            if result is not None and getattr(result, "success", True) is False:
+            if result is not None and getattr(result, "success", True) is False and not self._is_partial_delivery(result):
                 return
             self._catchup_pending.pop(key, None)
             now = time.time()
@@ -5318,8 +5364,10 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.debug("ambient: presence loop stopped", exc_info=True)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        # Discovery may run while another thread imports gateway.run. Bind only
-        # after that import completes, before the connector can admit a message.
+        # A gated profile cannot connect without the enforcement hook.
+        if not _image_gate_hook_registered and self._sub("image_gen_gate").get("enabled"):
+            logger.error("ambient: image gate hook missing; refusing gated Discord connection")
+            return False
         _install_gateway_turn_scope()
         ok = await super().connect(is_reconnect=is_reconnect)
         if ok:
@@ -5465,7 +5513,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
             return False
         return (time.monotonic() - ts) <= self._VOICE_TWIN_WINDOW_S
 
-    def _suppressed_result(self, reason: str = "intentional silence"):
+    def _suppressed_result(self, reason: str = "intentional silence", *, deleted_message_id: Any = None):
         """The nonphantom "carried nothing" receipt the delivery ledger expects.
 
         ``success=True`` because the turn is complete and nothing is owed; the
@@ -5482,6 +5530,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
                 message_id=None,
                 delivered_text="",
                 error=f"suppressed: {reason}",
+                raw_response=({"deleted_message_ids": (str(deleted_message_id),)}
+                              if deleted_message_id is not None else None),
             )
         except Exception:
             return None
@@ -5493,8 +5543,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
         The base adapter fills ``delivered_text`` only when the gateway's own
         final send runs; sends this adapter screens or rewrites must project
         what really went out, or the receipt reports a draft nobody received.
-        Failures keep their error-only shape — a failed lane carried nothing,
-        so partial/failure semantics downstream stay honest.
+        Never replace the stock sender's acknowledged partial chunk projection.
         ``screened_context_echo`` records how many private-context blocks the
         outbound screen stripped from this text (plan S03/V10).
         """
@@ -5531,13 +5580,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
             logger.info("ambient.voice: marked chat=%s for text-twin suppression", chat_id)
         return result
 
-    def _scrub_outbound(self, content: str, chat_id: Any = None) -> str | None:
-        """Clean a reply before it goes out.
-
-        Returns the cleaned text, or None when the message was nothing but
-        leaked control tokens and should be suppressed entirely rather than
-        posted as punctuation soup.
-        """
+    def _scrub_final_screens(self, content: str) -> str | None:
+        """Apply the control-token and speaker-echo screens to a final frame."""
         cfg = self._hygiene_cfg()
         text = content
 
@@ -5589,6 +5633,15 @@ class AmbientDiscordAdapter(DiscordAdapter):
             )
             text = cleaned
 
+        return text
+
+    def _scrub_outbound(self, content: str, chat_id: Any = None) -> str | None:
+        """Clean a reply before it goes out."""
+        text = self._scrub_final_screens(content)
+        if text is None:
+            return None
+        cfg = self._hygiene_cfg()
+
         text = self._resolve_plain_mentions(text, chat_id)
 
         # A leaked media narration is always a bug: it is the model describing a
@@ -5637,27 +5690,25 @@ class AmbientDiscordAdapter(DiscordAdapter):
         rest = re.sub(r"\n{3,}", "\n\n", rest).strip()
         return rest, media
 
-    def _attach_pending_gif(self, content: str, media: list) -> list:
-        """Append a fetched-but-unposted GIF URL to the outgoing media list.
-
-        Cleared unconditionally once inspected, so a URL can only ever be
-        attached to the single reply that follows its lookup. The time window
-        is a second guard for the case where a turn dies before sending at all
-        and the next unrelated message would otherwise inherit the GIF.
-        """
+    def _attach_pending_gif(self, content: str, media: list, reply_to: Any) -> list:
+        """Attach a fresh GIF only to its requesting turn's reply."""
         state = _gif_bucket(self._bot_user_id() or None)
         pending = state.get("pending")
         if not pending:
             return media
-        url, ts = pending
+        url, ts, anchor = pending
+        if time.time() - float(ts) > float(_gif_config().get("attach_window_seconds", 180)):
+            state["pending"] = None
+            logger.info("gif_search: pending GIF expired unposted (%s)", url[:60])
+            return media
+        if not anchor or str(reply_to or "") != anchor:
+            return media
         state["pending"] = None
 
         cfg = _gif_config()
         if not cfg.get("attach_if_omitted", True):
             return media
-        if time.time() - float(ts) > float(cfg.get("attach_window_seconds", 180)):
-            logger.info("gif_search: pending GIF expired unposted (%s)", url[:60])
-            return media
+        # A matching reply consumes the pending URL once.
         if url in content or url in media:
             # Belt and braces. The tool no longer hands the model a URL, so
             # this should not happen — if it does, the model dug one out of
@@ -5920,6 +5971,7 @@ class AmbientDiscordAdapter(DiscordAdapter):
         # charged to the bot-bounce pair.
         send_args = args
         send_kwargs = kwargs
+        attached_pending = False
         if isinstance(content, str):
             await self._refresh_plain_mention_history(content, chat_id)
             scrubbed = self._scrub_outbound(content, chat_id)
@@ -5946,50 +5998,111 @@ class AmbientDiscordAdapter(DiscordAdapter):
             # reaches it. The prose keeps the reply anchor and any metadata;
             # each media URL follows as its own bare message, which is the only
             # form Discord renders as pure media. Bounce accounting is charged
-            # ONCE, on the first send — the pair had one reply, not two.
+            # ONCE if any carriage lands — the pair had one reply, not two.
             if self._hygiene_cfg().get("isolate_media_urls", True):
                 rest, media = self._split_media_urls(content)
-                media = self._attach_pending_gif(content, media)
+                media = self._attach_pending_gif(content, media, reply_to)
                 if media:
-                    self._travel_spoke(chat_id)
-                    first = None
+                    from gateway.platforms.base import SendResult
+
+                    carriages = []
                     if rest:
-                        first = self._mark_delivered_text(
-                            await super().send(
-                                chat_id, rest, *send_args, **send_kwargs
-                            ),
-                            rest,
-                            screened_context_echo=context_echo_stripped,
-                        )
+                        carriages.append(self._mark_delivered_text(
+                            await super().send(chat_id, rest, *send_args, **send_kwargs),
+                            rest, screened_context_echo=context_echo_stripped,
+                        ))
                     for url in media:
-                        sent = self._mark_delivered_text(
-                            await super().send(chat_id, url), url
-                        )
-                        if first is None:
-                            first = sent
+                        carriages.append(self._mark_delivered_text(
+                            await super().send(chat_id, url), url,
+                        ))
+                    landed = [
+                        r for r in carriages
+                        if (getattr(r, "success", False) or self._is_partial_delivery(r))
+                        and (getattr(r, "message_id", None)
+                             or getattr(r, "delivered_text", None))
+                    ]
+                    failures = [r for r in carriages if not getattr(r, "success", False)]
+                    failed = len(failures)
+                    first_failure = failures[0] if failures else None
+                    pieces = ([rest] if rest else []) + media
+                    owed = []
+                    model_owed = []
+                    attachment_owed = []
+                    ambiguous = False
+                    for index, (piece, receipt) in enumerate(zip(pieces, carriages)):
+                        if getattr(receipt, "success", False):
+                            continue
+                        raw = getattr(receipt, "raw_response", None)
+                        raw = raw if isinstance(raw, dict) else {}
+                        remainder = raw.get("remaining_content")
+                        remainder = remainder if isinstance(remainder, str) and remainder else piece
+                        owed.append(remainder)
+                        ambiguous = ambiguous or bool(raw.get("delivery_ambiguous"))
+                        (model_owed if rest and index == 0 else attachment_owed).append(remainder)
+                    result = SendResult(
+                        success=failed == 0,
+                        message_id=next((r.message_id for r in landed if getattr(r, "message_id", None)), None),
+                        delivered_text="\n".join(
+                            str(r.delivered_text) for r in landed if getattr(r, "delivered_text", None)
+                        ),
+                        error=f"{failed} carriage(s) failed" if failed else None,
+                        retryable=bool(getattr(first_failure, "retryable", False)),
+                        retry_after=getattr(first_failure, "retry_after", None),
+                        error_kind=getattr(first_failure, "error_kind", None),
+                        raw_response={
+                            "ambient_carriages": tuple(carriages),
+                            "partial_overflow": bool(landed and failed),
+                            "delivery_error": getattr(first_failure, "error", None),
+                            "delivery_ambiguous": ambiguous,
+                            "model_remaining_content": "\n".join(model_owed),
+                            "attachment_remaining_content": "\n".join(attachment_owed),
+                            "remaining_content": "\n".join(owed) if failed else None,
+                        },
+                    )
+                    if landed:
+                        self._travel_spoke(chat_id)
                     logger.info(
                         "ambient: isolated %d media url(s) into their own "
                         "message(s) so Discord renders them without the link",
                         len(media),
                     )
-                    self._bounce_count_sent(reply_to, first)
-                    self._catchup_count_sent(reply_to, first)
-                    self._direct_count_sent(reply_to, first)
-                    return first
+                    self._bounce_count_sent(reply_to, result)
+                    self._catchup_count_sent(reply_to, result)
+                    self._direct_count_sent(reply_to, result)
+                    return result
             else:
-                # The companion's ledgered final is one send. Preserve a
-                # pending GIF in that same message instead of silently losing
-                # it when standalone media-URL sends are disabled.
-                pending = self._attach_pending_gif(content, [])
+                # A tool-attached GIF is not in the model's original content.
+                # Carry it in the failure receipt even when nothing lands.
+                pending = self._attach_pending_gif(content, [], reply_to)
                 if pending:
+                    attached_pending = True
                     content = content + "\n" + "\n".join(pending)
         result = self._mark_delivered_text(
             await super().send(chat_id, content, *send_args, **send_kwargs),
             content,
             screened_context_echo=context_echo_stripped,
         )
+        if attached_pending and not getattr(result, "success", False):
+            raw = getattr(result, "raw_response", None)
+            raw = dict(raw) if isinstance(raw, dict) else {}
+            if not raw.get("remaining_content") and not self._is_partial_delivery(result):
+                raw["remaining_content"] = content
+            model_owed = raw.get("model_remaining_content")
+            if not isinstance(model_owed, str):
+                model_owed = raw["remaining_content"]
+            pending_tail = "\n".join(pending)
+            attachment_owed = ""
+            if model_owed.endswith(pending_tail):
+                model_owed = model_owed[:-len(pending_tail)]
+                if model_owed.endswith("\n"):
+                    model_owed = model_owed[:-1]
+                attachment_owed = ("\n" if model_owed else "") + pending_tail
+            raw["model_remaining_content"] = model_owed
+            raw["attachment_remaining_content"] = attachment_owed
+            raw["partial_overflow"] = self._is_partial_delivery(result)
+            result.raw_response = raw
         if (
-            getattr(result, "success", False)
+            (getattr(result, "success", False) or self._is_partial_delivery(result))
             and (getattr(result, "message_id", None)
                  or getattr(result, "delivered_text", None))
         ):
@@ -6008,45 +6121,33 @@ class AmbientDiscordAdapter(DiscordAdapter):
         finalize: bool = False,
         metadata: Any = None,
     ) -> Any:
-        """Screen STREAMED edits for echoed private context before they land.
+        """Screen streamed frames before each Discord edit.
 
-        The stream consumer edits one Discord message in place with the whole
-        accumulated segment text on every tick, so this is the only place a
-        model regurgitating its `<ambient_context>` block would otherwise
-        reach the room mid-stream. The same three shapes as the whole-text
-        screen apply, which is also what closes SPLIT echoes: an interim
-        frame carrying only the block's head strips from the opener to the
-        end (the room sees the pre-block text), and the closing half arriving
-        in a later frame is stripped from the start.
-
-        An interim frame that strips to nothing does not edit (Discord
-        refuses empty content; the previous frame stays visible) and reports
-        success with an empty projection — this edit carried nothing. The
-        FINAL frame stripping to nothing deletes the streamed message
-        best-effort so no orphan placeholder is left holding private text.
+        Interim frames screened to nothing leave the previous frame visible;
+        final frames screened to nothing require deletion to succeed.
         """
         n_ctx = 0
-        if self._ambient_enabled() and isinstance(content, str):
-            cleaned = _AMBIENT_ECHO_RE.sub(" ", content)
-            cleaned, n_ctx = _strip_context_echo(cleaned)
-            if n_ctx:
-                logger.warning(
-                    "ambient: stripped %d echoed private-context block(s) "
-                    "from a streamed frame",
-                    n_ctx,
-                )
-            if not cleaned.strip():
-                if finalize:
-                    await self._delete_streamed_message(chat_id, message_id)
-                    return self._suppressed_result("screened_context_echo")
-                try:
-                    from gateway.platforms.base import SendResult  # type: ignore
-
-                    return SendResult(
-                        success=True, message_id=message_id, delivered_text=""
+        if isinstance(content, str):
+            cleaned = content
+            if self._ambient_enabled():
+                cleaned = _AMBIENT_ECHO_RE.sub(" ", cleaned)
+                cleaned, n_ctx = _strip_context_echo(cleaned)
+                if n_ctx:
+                    logger.warning(
+                        "ambient: stripped %d echoed private-context block(s) "
+                        "from a streamed frame",
+                        n_ctx,
                     )
-                except Exception:
-                    return None
+            cleaned = self._scrub_final_screens(cleaned) if cleaned.strip() else None
+            if cleaned is None or not cleaned.strip():
+                if finalize:
+                    if not await self._delete_streamed_message(chat_id, message_id):
+                        from gateway.platforms.base import SendResult
+                        return SendResult(success=False, error="failed to delete streamed message")
+                    return self._suppressed_result("screened_context_echo", deleted_message_id=message_id)
+                from gateway.platforms.base import SendResult
+                return SendResult(success=True, message_id=message_id,
+                                  raw_response={"skipped": True}, delivered_text="")
             content = cleaned
         result = await super().edit_message(
             chat_id, message_id, content, finalize=finalize, metadata=metadata
@@ -6081,8 +6182,8 @@ class AmbientDiscordAdapter(DiscordAdapter):
 #   platforms.discord.extra.ambient_presence.gif_search
 # and the credential is KLIPY_API_KEY in the PROFILE's .env (never config.yaml —
 # config.yaml is world-readable-ish and goes nowhere near a git remote).
-# "pending" holds (url, fetched_at) between the tool returning a URL and the
-# adapter sending the reply, so a model that forgets to paste it still posts it.
+# "pending" holds (url, fetched_at, inbound_reply_anchor) until the requesting
+# turn sends its reply, so a different turn cannot carry its GIF.
 # One bucket per profile: a process-wide dict would attach one seat's GIF to
 # another seat's next send under multiplex.
 _gif_buckets: dict = {}
@@ -6125,7 +6226,7 @@ def _gif_key() -> str:
 
         return (get_env_value("KLIPY_API_KEY") or "").strip()
     except Exception:
-        return (os.getenv("KLIPY_API_KEY") or "").strip()
+        return ""
 
 
 def _gif_enabled() -> bool:
@@ -6260,7 +6361,10 @@ def _gif_handle(args: dict, **_: Any) -> str:
     # adapter attaches it if the reply omits it — delivery is ours, not the
     # model's. Consumed (or expired) in send(); [SILENT] returns earlier, so a
     # reply the agent chose to swallow never drags a GIF out with it.
-    state["pending"] = (chosen, now)
+    scope = _verified_run_context.get(None)
+    anchor = str(scope.get("message_id") or "") if isinstance(scope, dict) else ""
+    if anchor:
+        state["pending"] = (chosen, now, anchor)
 
     logger.info("gif_search: %r -> %s", query, chosen[:60])
     # The URL is deliberately NOT returned to the model. There must be exactly
@@ -6301,10 +6405,11 @@ _GIF_SCHEMA = {
 
 # ── image-generation gate ───────────────────────────────────────────────────
 _GATED_TOOLS = {"image_generate"}
+_image_gate_hook_registered = True
 
 
-def _image_gate_cfg() -> dict:
-    """Read image-gate config from the profile active for this request."""
+def _image_gate_cfg() -> dict | None:
+    """Read active profile policy; None means configuration could not load."""
     try:
         from hermes_cli.config import load_config  # type: ignore
 
@@ -6318,7 +6423,7 @@ def _image_gate_cfg() -> dict:
         cfg = extra.get("image_gen_gate")
         return cfg if isinstance(cfg, dict) else {}
     except Exception:
-        return {}
+        return None
 
 
 def _normalize_ids(value: Any) -> set:
@@ -6531,6 +6636,11 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, **_: Any):
                     args[field] = styled
 
     cfg = _image_gate_cfg()
+    if cfg is None:
+        return {
+            "action": "block",
+            "message": "Image generation is temporarily unavailable because its configuration could not be loaded. Do not retry.",
+        }
     if not cfg.get("enabled"):
         return None                      # ungated profile (e.g. the operator's own)
     if _turn_binding_error is not None:
@@ -7107,6 +7217,7 @@ def _require_companion_framework() -> None:
     try:
         from agent import turn_context
         from gateway import turn_origin
+        from gateway.platforms import base as platform_base
         from gateway.platforms.base import BasePlatformAdapter, SendResult
         from hermes_state import SessionDB
     except Exception as exc:
@@ -7118,6 +7229,8 @@ def _require_companion_framework() -> None:
         raise RuntimeError("discord-ambient requires pre_llm_call.ephemeral_context")
     if not getattr(turn_context, "SUPPORTS_COMPANION_ZERO_RETENTION", False):
         raise RuntimeError("discord-ambient requires companion zero-retention context")
+    if not getattr(platform_base, "SUPPORTS_PARTIAL_DELIVERY_REPLAY", False):
+        raise RuntimeError("discord-ambient requires remaining-only partial delivery replay")
     if not (
         callable(getattr(turn_origin, "normalize_turn_origin", None))
         and callable(getattr(BasePlatformAdapter, "send_final_ledgered", None))
@@ -7155,10 +7268,12 @@ def register(ctx) -> None:
 
     _bundled.register(ctx)
 
-    # Per-user authorisation for metered tools. Registered once; the callback
-    # resolves the gate per profile, so an ungated profile is unaffected.
+    # The callback resolves policy per profile; gated profiles require this hook.
+    global _image_gate_hook_registered
+    _image_gate_hook_registered = False
     try:
         ctx.register_hook("pre_tool_call", _on_pre_tool_call)
+        _image_gate_hook_registered = True
         logger.info("ambient: image-generation gate registered")
     except Exception as exc:
         logger.warning("ambient: could not register image gate: %s", exc)

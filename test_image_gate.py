@@ -40,6 +40,10 @@ def check(name, condition, detail=""):
         FAILURES.append(name)
 
 
+async def async_connect(self, *, is_reconnect=False):
+    return True
+
+
 def main():
     manager = PluginManager(
         scope_key=os.path.join(os.environ["HERMES_HOME"], "image-gate-test")
@@ -95,6 +99,41 @@ def main():
     check("unauthorized image call never reaches backend", refused_calls == 0, repr(calls))
     check("allowed speaker reaches recorder backend", allowed is None and len(calls) == 1, repr((allowed, calls)))
     check("missing turn id is visibly refused", isinstance(missing, str), repr(missing))
+    from hermes_cli import config as config_mod
+    with mock.patch.object(config_mod, "load_config", side_effect=RuntimeError("unavailable")):
+        unavailable = ambient._on_pre_tool_call("image_generate", {"prompt": "x"})
+    check("unavailable gate configuration refuses image generation",
+          isinstance(unavailable, dict) and unavailable.get("action") == "block")
+    ambient._image_gate_cfg = lambda: {}
+    check("absent gate leaves image generation ungated",
+          ambient._on_pre_tool_call("image_generate", {"prompt": "x"}) is None)
+    ambient._image_gate_cfg = lambda: {"enabled": False}
+    check("disabled gate leaves image generation ungated",
+          ambient._on_pre_tool_call("image_generate", {"prompt": "x"}) is None)
+    ambient._image_gate_cfg = old_cfg
+    from plugins.platforms.discord import adapter as stock
+    from types import SimpleNamespace
+    with mock.patch.object(ambient, "_require_companion_framework"), \
+         mock.patch.object(stock.DiscordAdapter, "__init__", lambda self, config: setattr(self, "config", config)), \
+         mock.patch.object(ambient, "_bundled") as bundled, \
+         mock.patch.object(ambient, "_install_compaction_focus"), \
+         mock.patch.object(ambient, "_install_gateway_turn_scope"), \
+         mock.patch.object(stock.DiscordAdapter, "connect", new=async_connect):
+        class FailedHook:
+            def register_hook(self, name, callback):
+                if name == "pre_tool_call":
+                    raise RuntimeError("hook unavailable")
+            def register_middleware(self, *args):
+                pass
+        ambient.register(FailedHook())
+        gated = ambient.AmbientDiscordAdapter(SimpleNamespace(
+            extra={"ambient_presence": {"image_gen_gate": {"enabled": True}}}))
+        plain = ambient.AmbientDiscordAdapter(SimpleNamespace(extra={"ambient_presence": {}}))
+        check("missing image hook refuses gated connection",
+              asyncio.run(gated.connect(is_reconnect=True)) is False)
+        check("missing image hook permits ungated connection",
+              asyncio.run(plain.connect(is_reconnect=True)) is True)
+        ambient._image_gate_hook_registered = True
     if FAILURES:
         raise SystemExit(f"{len(FAILURES)} failure(s): {', '.join(FAILURES)}")
     print("image gate regression passed")

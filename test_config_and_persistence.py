@@ -15,6 +15,7 @@ import types
 import urllib.parse
 import urllib.request
 
+from unittest.mock import patch
 
 sys.path.insert(0, os.environ.get("HERMES_FRAMEWORK_PATH", "/var/lib/hermes/.hermes/hermes-agent"))
 os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="ambient-config-test-")
@@ -186,7 +187,7 @@ def check_gif_state_is_per_profile():
     first = ambient._gif_bucket("profile-a")
     second = ambient._gif_bucket("profile-b")
     check("two profiles get distinct GIF buckets", first is not second)
-    first["pending"] = ("https://example.test/a.webp", 1.0)
+    first["pending"] = ("https://example.test/a.webp", 1.0, "request-a")
     check(
         "a pending GIF on one profile does not appear on another",
         second.get("pending") is None,
@@ -252,14 +253,19 @@ def check_gif_request_uses_public_plugin_identity():
         captured.append(request.full_url) or Response()
     )
     token = ambient._gif_profile_context.set("999")
+    turn_token = ambient._verified_run_context.set({"message_id": "gif-request"})
     try:
         ambient._gif_handle({"query": "hello", "customer_id": "private-profile"})
     finally:
+        ambient._verified_run_context.reset(turn_token)
         ambient._gif_profile_context.reset(token)
         ambient._gif_config = original_cfg
         ambient._gif_key = original_key
         urllib.request.urlopen = original_urlopen
 
+    pending = ambient._gif_bucket("999").get("pending")
+    check("GIF request binds the verified inbound reply anchor",
+          pending is not None and pending[2] == "gif-request", repr(pending))
     query = urllib.parse.parse_qs(urllib.parse.urlparse(captured[0]).query)
     check(
         "customer_id names the public plugin, not a private profile",
@@ -272,7 +278,10 @@ def check_speaker_is_request_only():
     print("\n-- speaker identity stays off the persisted user turn --")
     adapter = make_adapter()
     inbound = message_in("channel-1", author_id=42, content="hey")
-    adapter._apply_speaker_tag(inbound)
+    with patch.object(discord_adapter.DiscordAdapter, "_discord_message_admission",
+                      lambda self, message, *, claim: (True, False)):
+        prepared = asyncio.run(adapter._prepare_turn_context(inbound))
+        adapter._discard_prepared_turn(prepared)
     check(
         "the inbound Discord text is left unchanged",
         inbound.content == "hey",
@@ -415,12 +424,21 @@ def check_local_fallback_window_covers_the_local_floor():
         )
 
 
+def check_gif_key_scoped_failure():
+    from hermes_cli import config as config_mod
+    with patch.dict(os.environ, {"KLIPY_API_KEY": "process-canary"}), \
+         patch.object(config_mod, "get_env_value", side_effect=RuntimeError("scope unavailable")):
+        check("scoped GIF lookup failure never uses process credential",
+              ambient._gif_key() == "")
+
+
 def main():
     check_channel_allowlist()
     check_name_triggers_are_normalized_and_bounded()
     check_last_seen_is_per_bot()
     check_gif_state_is_per_profile()
     check_gif_state_uses_turn_profile()
+    check_gif_key_scoped_failure()
     check_gif_request_uses_public_plugin_identity()
     check_speaker_is_request_only()
     check_private_envelope_is_bounded_and_escaped()

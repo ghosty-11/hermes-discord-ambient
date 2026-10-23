@@ -430,9 +430,90 @@ adapter4._mention_history_scanned["501"] = time.time() - 60
 asyncio.run(adapter4._refresh_plain_mention_history("@bob hi", "501"))
 check("a fresh scan is not repeated", adapter4._client.get_channel(501).calls == 0)
 adapter4._mention_history_scanned["501"] = time.time() - 99999
-asyncio.run(adapter4._refresh_plain_mention_history("@bob hi", "501"))
+with patch.object(discord_adapter.DiscordAdapter, "_discord_message_admission",
+                  lambda self, message, *, claim: (True, False)):
+    asyncio.run(adapter4._refresh_plain_mention_history("@bob hi", "501"))
 check("a stale scan re-runs", adapter4._client.get_channel(501).calls == 1)
 check("rescan refreshed the timestamp", time.time() - adapter4._mention_history_scanned["501"] < 60)
+
+print("stock admission protects speaker recall and room capture")
+privacy = build_adapter({
+    "speaker_identity": True,
+    "speaker_memory": {"enabled": True},
+    "room_context": {"enabled": True, "recent_messages": 6},
+    "text_hygiene": {"resolve_plain_mentions": True},
+})
+privacy._client = fake_client
+# Ambient's relaxed admission is deliberately not the stock sender policy.
+privacy._discord_message_admission = lambda message, *, claim: (True, False)
+stock_admission = lambda self, message, *, claim: (message.author.id == 101, False)
+recalls = []
+ticks = [False]
+def slow_recall(uid):
+    time.sleep(0.08)
+    recalls.append((uid, ticks[0]))
+    return "[known admitted]"
+privacy._speaker_memory = slow_recall
+refused = Message(700, BOB, GENERAL, "REFUSED_ROOM_CANARY")
+admitted_message = Message(701, ALICE, GENERAL, "ADMITTED_ROOM_CANARY")
+async def accepted_dispatch(self, message):
+    return True
+async def admission_case():
+    async def tick():
+        await asyncio.sleep(0.01)
+        ticks[0] = True
+    probe = asyncio.create_task(tick())
+    with patch.object(discord_adapter.DiscordAdapter, "_discord_message_admission",
+                      stock_admission), patch.object(
+                          discord_adapter.DiscordAdapter, "_dispatch_discord_message",
+                          accepted_dispatch):
+        await privacy._dispatch_inner(refused)
+        await privacy._dispatch_inner(admitted_message)
+    await probe
+    return ticks[0]
+check("refused sender causes no recall, admitted recall yields to event loop",
+      asyncio.run(admission_case()) and recalls == [("101", True)], repr(recalls))
+async def prepared_recall_case():
+    token = ambient._speaker_context.set(("", None))
+    try:
+        with patch.object(discord_adapter.DiscordAdapter, "_discord_message_admission",
+                          stock_admission):
+            before = len(recalls)
+            refused_bundle = await privacy._prepare_turn_context(refused)
+            admitted_bundle = await privacy._prepare_turn_context(admitted_message)
+            staged = ambient._speaker_context.get()
+        privacy._discard_prepared_turn(refused_bundle)
+        privacy._discard_prepared_turn(admitted_bundle)
+        return before, refused_bundle, admitted_bundle, staged
+    finally:
+        ambient._speaker_context.reset(token)
+before, refused_bundle, admitted_bundle, staged = asyncio.run(prepared_recall_case())
+check("queued-turn recall excludes refused senders",
+      len(recalls) == before + 1 and recalls[-1][0] == "101"
+      and refused_bundle["speaker_context"] == (None, None)
+      and refused_bundle["speaker_handle"] == "", repr((recalls, refused_bundle)))
+check("queued-turn recall stages admitted facts in the task",
+      admitted_bundle["speaker_context"][1] == "[known admitted]"
+      and staged == admitted_bundle["speaker_context"], repr(staged))
+check("refused sender never enters staged room talk",
+      "REFUSED_ROOM_CANARY" not in "\n".join(privacy._room_context_rows(
+          Message(702, ALICE, GENERAL, "now"))),
+      repr(privacy._room_talk.get("501")))
+privacy._discord_identities.clear()
+privacy._guild_identities.clear()
+privacy._mention_history_scanned.clear()
+hist.history = lambda limit=50: history_rows()
+async def history_rows():
+    yield refused
+    yield admitted_message
+with patch.object(discord_adapter.DiscordAdapter, "_discord_message_admission",
+                  stock_admission):
+    asyncio.run(privacy._refresh_plain_mention_history("@alice hi", "501"))
+check("history refresh admits only authorized talk and identities",
+      "REFUSED_ROOM_CANARY" not in "\n".join(privacy._room_context_rows(
+          Message(703, ALICE, GENERAL, "now")))
+      and "bob" not in privacy._discord_identities.get("501", {}),
+      repr(privacy._room_talk.get("501")))
 
 print()
 if FAILURES:

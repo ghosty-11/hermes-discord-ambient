@@ -107,6 +107,11 @@ def main():
     }
     adapter = ambient.AmbientDiscordAdapter(types.SimpleNamespace(extra={"ambient_presence": presence}))
     adapter._client = types.SimpleNamespace(user=Author(999, "agent"))
+    original_admission = discord_adapter.DiscordAdapter._discord_message_admission
+    discord_adapter.DiscordAdapter._discord_message_admission = (
+        lambda self, message, *, claim: (True, False)
+    )
+    adapter._discord_message_admission = lambda message, *, claim: (True, False)
     guild_a = Guild(1, "Guild A")
     channel_a = Channel(10, "hall", guild_a)
     alice = Message(1, Author(101, "alice"), channel_a, "first")
@@ -335,11 +340,11 @@ def main():
             platform=Platform.DISCORD, chat_id="10", chat_type="channel",
             user_id="101", user_name="alice", scope_id="1", message_id="4",
         )
-        adapter._prepare_turn_context(public_after_reset)
+        asyncio.run(adapter._prepare_turn_context(public_after_reset))
         asyncio.run(run_at_real_boundary(public_after_reset, public_source))
 
-        adapter._prepare_turn_context(reverse_a)
-        adapter._prepare_turn_context(reverse_b)
+        asyncio.run(adapter._prepare_turn_context(reverse_a))
+        asyncio.run(adapter._prepare_turn_context(reverse_b))
         for item, actor in ((reverse_b, "202"), (reverse_a, "101")):
             source = SessionSource(
                 platform=Platform.DISCORD, chat_id="10", chat_type="channel",
@@ -349,7 +354,7 @@ def main():
 
         hint_token = ambient._ambient_hint.set("CATCHUP_SENTINEL")
         try:
-            adapter._prepare_turn_context(catchup)
+            asyncio.run(adapter._prepare_turn_context(catchup))
             source = SessionSource(
                 platform=Platform.DISCORD, chat_id="10", chat_type="channel",
                 user_id="202", scope_id="1", message_id="7",
@@ -358,7 +363,7 @@ def main():
         finally:
             ambient._ambient_hint.reset(hint_token)
 
-        adapter._prepare_turn_context(threaded)
+        asyncio.run(adapter._prepare_turn_context(threaded))
         thread_source = SessionSource(
             platform=Platform.DISCORD, chat_id="10", chat_type="channel",
             user_id="202", scope_id="1", message_id="8",
@@ -385,13 +390,13 @@ def main():
             session_key="shared-session", event_message_id="3",
         ))
         conflict = Message(84, Author(101, "alice"), channel_a, "conflicting inbound id")
-        adapter._prepare_turn_context(conflict)
+        asyncio.run(adapter._prepare_turn_context(conflict))
         asyncio.run(runner._run_agent(
             conflict.content, "", [], SessionSource(
                 platform=Platform.DISCORD, chat_id="10", user_id="101", message_id="84"),
             "shared-session", inbound_message_id="85"))
         redelivered = Message(90, Author(101, "alice"), channel_a, "redelivered while queued")
-        adapter._prepare_turn_context(redelivered)
+        asyncio.run(adapter._prepare_turn_context(redelivered))
         refuse_dispatch = discord_adapter.DiscordAdapter._dispatch_discord_message
 
         async def dedup_refuses(_self, _message):
@@ -407,7 +412,7 @@ def main():
 
 
         delayed = Message(80, Author(101, "alice"), channel_a, "queued for a long turn")
-        adapter._prepare_turn_context(delayed)
+        asyncio.run(adapter._prepare_turn_context(delayed))
         delayed_source = SessionSource(
             platform=Platform.DISCORD, chat_id="10", user_id="101", message_id="80")
         clock = ambient.time.monotonic
@@ -415,7 +420,7 @@ def main():
             asyncio.run(run_at_real_boundary(delayed, delayed_source))
 
         no_key = Message(81, Author(101, "alice"), channel_a, "keep the session key")
-        adapter._prepare_turn_context(no_key)
+        asyncio.run(adapter._prepare_turn_context(no_key))
         key_token = session_context._VAR_MAP["HERMES_SESSION_KEY"].set("kept-session")
         try:
             asyncio.run(runner._run_agent(
@@ -489,8 +494,9 @@ def main():
         second_adapter = second_module.AmbientDiscordAdapter(
             types.SimpleNamespace(extra={"ambient_presence": presence}))
         second_adapter._client = types.SimpleNamespace(user=Author(888, "other-agent"))
+        second_adapter._discord_message_admission = lambda message, *, claim: (True, False)
         second_message = Message(88, Author(202, "bob"), channel_a, "second profile")
-        second_adapter._prepare_turn_context(second_message)
+        asyncio.run(second_adapter._prepare_turn_context(second_message))
         second_source = SessionSource(
             platform=Platform.DISCORD, chat_id="10", chat_type="channel",
             user_id="202", scope_id="1", message_id="88",
@@ -510,6 +516,7 @@ def main():
             runner._intake_adapter_for = lambda source: adapter
     finally:
         ambient._image_gate_cfg = old_cfg
+        discord_adapter.DiscordAdapter._discord_message_admission = original_admission
         plugins_mod._plugin_manager = old_manager
 
     req_a = observed["1"]["request"]
@@ -633,7 +640,9 @@ def main():
 
     presence["travel_log"]["channels"] = ["10"]
     excluded = Message(100, Author(101, "alice"), Channel(11, "excluded", guild_a), "work")
-    excluded_bundle = adapter._prepare_turn_context(excluded)
+    with mock.patch.object(discord_adapter.DiscordAdapter, "_discord_message_admission",
+                           lambda self, message, *, claim: (True, False)):
+        excluded_bundle = asyncio.run(adapter._prepare_turn_context(excluded))
     check("travel allowlist applies while bundling", excluded_bundle["travel_context"] == "", excluded_bundle["travel_context"])
     adapter._discard_prepared_turn(excluded_bundle)
 

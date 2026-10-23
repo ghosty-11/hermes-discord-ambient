@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.environ.get("HERMES_FRAMEWORK_PATH", "/var/lib/hermes/.hermes/hermes-agent"))
 os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="direct-reply-test-")
+import discord  # noqa: E402
 
 import plugins.platforms.discord.adapter as discord_adapter  # noqa: E402
 from gateway.platforms.base import MessageEvent  # noqa: E402
@@ -75,6 +76,7 @@ class RawMessage:
         self.reference = reference
         self.id = message_id
         self.content = "good girl"
+        self.type = discord.MessageType.default
         self.author = author
         self.mentions = mentions or []
         self.channel = types.SimpleNamespace(id="channel-1")
@@ -83,12 +85,14 @@ class RawMessage:
 class HistoryChannel:
     def __init__(self, channel_id, messages):
         self.id = channel_id
+        self.guild = types.SimpleNamespace(id=100)
         self._messages = messages
 
     def history(self, *, limit):
         async def rows():
             for message in self._messages[:limit]:
                 message.channel = self
+                message.guild = self.guild
                 yield message
 
         return rows()
@@ -363,7 +367,12 @@ async def main():
     sent.clear()
     gif_url = "https://example.com/pending.gif"
     gif_bucket = ambient._gif_bucket(adapter._bot_user_id() or None)
-    gif_bucket["pending"] = (gif_url, ambient.time.time())
+    gif_bucket["pending"] = (gif_url, ambient.time.time(), "gif-1")
+    await adapter.send("channel-1", "Another turn.", reply_to="other-1")
+    check("another turn cannot consume a pending GIF",
+          gif_bucket.get("pending") is not None and gif_url not in sent[-1][1],
+          repr(sent))
+    sent.clear()
     gif_result = await adapter.send("channel-1", "Cat approval.", reply_to="gif-1")
     check("pending GIF is attached to the same ledgered message",
           len(sent) == 1
@@ -371,6 +380,12 @@ async def main():
           and getattr(gif_result, "delivered_text", None) == sent[0][1],
           repr(sent))
     check("pending GIF is consumed once", gif_bucket.get("pending") is None)
+    gif_bucket["pending"] = (gif_url, ambient.time.time() - 181, "gif-expired")
+    sent.clear()
+    await adapter.send("channel-1", "A later turn.", reply_to="other-2")
+    check("expired GIF is discarded without leaking to another turn",
+          gif_bucket.get("pending") is None and gif_url not in sent[-1][1],
+          repr(sent))
 
     from gateway.platforms.base import BasePlatformAdapter, SendResult  # noqa: E402
 
@@ -526,19 +541,35 @@ async def main():
     )
     older = Author(321, "garden.account")
     older.display_name = "GardenMuse"
+    refused_author = Author(322, "blocked.account")
+    refused_author.display_name = "BlockedMuse"
     history_channel = HistoryChannel(
-        "channel-1", [RawMessage(None, author=older)],
+        "channel-1", [
+            RawMessage(None, message_id="history-321", author=older),
+            RawMessage(None, message_id="history-322", author=refused_author),
+        ],
     )
     adapter._client = types.SimpleNamespace(
         user=Author(999, "Muse"),
         get_channel=lambda channel_id: history_channel,
     )
+    adapter._dedup = types.SimpleNamespace(contains=lambda message_id: False)
+    adapter._allowed_user_ids = {"321"}
+    adapter._is_allowed_user = lambda user_id, *args, **kwargs: user_id == "321"
     await adapter.send(
         "channel-1", "The room saved a story for @GardenMuse!", reply_to="203b",
     )
     check(
         "an ambient name from recent channel history becomes a real mention",
         sent[-1][1] == "The room saved a story for <@321>!",
+        repr(sent[-1]),
+    )
+    await adapter.send(
+        "channel-1", "The room saved a story for @BlockedMuse!", reply_to="203c",
+    )
+    check(
+        "a refused author's name is not resolved from channel history",
+        sent[-1][1] == "The room saved a story for @BlockedMuse!",
         repr(sent[-1]),
     )
     collision = Author(456, "second.account")
@@ -550,6 +581,80 @@ async def main():
         sent[-1][1] == "Thanks, @Alice!",
         repr(sent[-1]),
     )
+
+    print("\n-- isolated media has one aggregate delivery receipt --")
+    from gateway.platforms.base import SendResult
+    adapter.config.extra["ambient_presence"]["text_hygiene"]["isolate_media_urls"] = True
+    original_send = discord_adapter.DiscordAdapter.send
+    original_spoke = adapter._travel_spoke
+    speech = []
+    async def mixed_send(self, chat_id, content, *args, **kwargs):
+        if content.startswith("https://"):
+            return SendResult(success=False, error="media refused")
+        return SendResult(success=True, message_id="landed")
+    discord_adapter.DiscordAdapter.send = mixed_send
+    adapter._travel_spoke = lambda chat_id: speech.append(chat_id)
+    try:
+        mixed = await adapter.send("channel-1", "Hello https://example.com/a.gif", reply_to="mixed")
+        check("partial media failure retains landed prose and fails the reply",
+              mixed.success is False and mixed.message_id == "landed"
+              and mixed.delivered_text == "Hello" and "1 carriage" in mixed.error,
+              repr(mixed))
+        speech.clear()
+        async def failed_send(self, chat_id, content, *args, **kwargs):
+            return SendResult(success=False, error="reject")
+        discord_adapter.DiscordAdapter.send = failed_send
+        failed = await adapter.send("channel-1", "Hello https://example.com/a.gif", reply_to="failed")
+        check("all-failed media never records room speech",
+              not failed.success and "2 carriage" in failed.error
+              and not speech, repr((failed, speech)))
+    finally:
+        discord_adapter.DiscordAdapter.send = original_send
+        adapter._travel_spoke = original_spoke
+
+    print("\n-- streamed edits obey final-frame screens --")
+    edits = []
+    async def fake_edit(self, chat_id, message_id, content, *, finalize=False, metadata=None):
+        edits.append(content)
+        return SendResult(success=True, message_id=message_id)
+    with patch.object(discord_adapter.DiscordAdapter, "edit_message", fake_edit):
+        edited = await adapter.edit_message(
+            "channel-1", "123", "[speaker @alice id:101] Hello <@101>",
+        )
+        check("edit removes speaker echo without mention conversion",
+              edits == ["Hello <@101>"] and edited.delivered_text == "Hello <@101>",
+              repr(edits))
+        before = len(edits)
+        blank = await adapter.edit_message("channel-1", "123", "[speaker @alice id:101]")
+        check("screened interim edit leaves prior frame untouched",
+              len(edits) == before and blank.delivered_text == "", repr(blank))
+        reasoning_frame = "<|im_start|>assistant<|meta_sep|>analysis<|im_sep|>secret"
+        sent_before = len(sent)
+        suppressed = await adapter.send("channel-1", reasoning_frame, reply_to="reasoning")
+        check("reasoning frame is suppressed on ordinary sends",
+              len(sent) == sent_before and suppressed.delivered_text == "",
+              repr((sent[sent_before:], suppressed)))
+        adapter._delete_streamed_message = lambda *_: asyncio.sleep(0, result=False)
+        deleted = await adapter.edit_message(
+            "channel-1", "123", reasoning_frame,
+            finalize=True,
+        )
+        check("failed deletion returns a failed final receipt",
+              deleted.success is False and "delete" in deleted.error
+              and len(edits) == before, repr(deleted))
+        final = await adapter.edit_message(
+            "channel-1", "123", "<|im_start|>assistant<|meta_sep|>final<|im_sep|>Hello",
+            finalize=True,
+        )
+        check("a streamed final envelope delivers only its reply",
+              edits[-1] == "Hello" and final.delivered_text == "Hello", repr(edits[-1]))
+        adapter.config.extra["ambient_presence"]["enabled"] = False
+        unprompted = await adapter.edit_message(
+            "channel-1", "123", "[speaker @alice id:101] Visible.",
+        )
+        check("stock-profile edit applies the same final speaker screen",
+              edits[-1] == "Visible." and unprompted.delivered_text == "Visible.",
+              repr(edits[-1]))
 
     print()
     if FAILURES:

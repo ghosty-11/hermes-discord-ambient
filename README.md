@@ -66,6 +66,27 @@ All opt-in per profile. A profile without `ambient_presence.enabled` behaves lik
 | **Voice hygiene** | zero | Kaomoji stripped from speech only. `voice_only_replies` drops the text twin (45s tool-path window, consume-once, reply-anchored). |
 | **Quiet resume** | zero | Request-only: do not announce a gateway restart into a public room. |
 
+Stock sender admission gates speaker recall and both room-history capture paths.
+Recall runs off the event loop and is reused only within one dispatch, including
+an ambient retry of the same inbound message. Recovered dispatch restores the
+caller's speaker context on success, refusal and exception.
+
+For standard Discord channels and threads, stock split sends retain acknowledged
+chunk IDs and text, and leave only unsent chunks owed. Isolated media delivery
+retains each carriage receipt; a tool-attached GIF omitted by the model stays in
+the owed payload even if every send fails. A partial failure stays a failed
+aggregate, while the delivery ledger records landed text and message identifiers
+with `partial: true`. Any visible carriage consumes the bounce and catch-up
+allowance once; a wholly failed delivery consumes neither. A partial reply is
+not resent in full: the remaining payload waits for durable replay when inline
+partial resumption is unavailable. Activation requires the matching framework's
+remaining-only durable replay capability; install the framework companion and
+adapter together. The first failed transport retains its reconnect, retry and
+flood classification even when the aggregate reports a failed-carriage count.
+Forum follow-up sends use a separate warning/success path; these chunk and
+no-duplicate guarantees cover only acknowledged standard-channel/thread sends
+and known-unsent carriage. An ambiguous transport outcome is not an acknowledgement.
+
 ## Turn identity boundary
 
 The plugin scopes each `GatewayRunner._run_agent` invocation, including queued
@@ -184,7 +205,7 @@ platforms:
             "<guild-id>": "the operator's home server"
           channel_notes:          # same, scoped to one channel's turns
             "<channel-id>": "the common room"
-        persist_room_talk: true  # talk buffer survives restarts; flushed on the travel-log sweep
+          persist_room_talk: true  # talk buffer survives restarts; flushed on the travel-log sweep
         travel_log:
           enabled: true
           channels: ["*"]        # allowlist scoping every travel touch point;
@@ -363,9 +384,11 @@ id as a request-only prefix.
 `image_gen_gate` is enforced at Hermes' `pre_tool_call` resolver boundary, not by
 prompt instructions. When enabled, the hook allows only IDs in `allowed_users` and
 returns the canonical Hermes directive `{"action": "block", "message": "…"}` for
-every other speaker (including an unknown speaker). The resolver turns that directive
-into the visible refusal and stops `image_generate` before the image provider is
-called. When disabled, the profile retains the framework's normal image behavior.
+every other speaker (including an unknown speaker). The resolver stops
+`image_generate` before the image provider is called. If profile configuration
+cannot be loaded, image generation is refused; if the enforcement hook cannot
+register, a gated profile cannot connect. An absent or disabled gate leaves
+the profile's normal image behavior intact.
 
 ### 6. Presence and rare sparks
 
@@ -379,16 +402,17 @@ bug, not a style choice.
 
 - **Opt-in.** No `enabled: true` → stock Discord, including on a multiplexed gateway that
   also serves operator profiles.
-- **Fail closed.** Exceptions degrade to stock behaviour, never to a mute or an auth bypass.
+- **Fail closed on image policy.** An unavailable gate configuration blocks image
+  generation; a missing gate hook prevents gated profiles from connecting.
 - **Auth is re-run.** Ambient re-dispatch cannot skip `_is_allowed_user`.
 - **Directives are request-only.** Ambient hints, speaker tags, speaker memory, room
   context and quiet resume are appended to the outgoing request. They are not written
   onto `message.content`.
-- **Room context is structurally safe.** Snippets are flattened to single lines and
-  capped, so user text cannot forge a wrapper row or an identity line; a reply that
-  repeats two lines of the surfaced talk is suppressed, exactly like a catch-up echo.
-  The bot's own messages are included for continuation and rendered as `you`, never
-  as a roster member.
+- **Room context is structurally safe.** Only stock-admitted senders enter live
+  room talk or mention-history refresh. Snippets are flattened to single lines
+  and capped, so user text cannot forge a wrapper row or an identity line;
+  a reply that repeats two lines of surfaced talk is suppressed, like a
+  catch-up echo.
 - **Beats are observed facts.** A travel-log beat records traffic the adapter saw —
   counts, participants, snippets from the room-talk buffer. Nothing in it is model
   output, and no inference ever summarises a visit.
@@ -532,6 +556,11 @@ append-only memory as tools, so a public bot can remember people without a shell
 `{"wakeAgent": false}`. Optional `MEMORY_DIR` / `MEMO_BIN` pull one remembered handle.
 
 ## Tests
+
+Async delivery fixtures shorten retry delays with a coroutine that yields
+through a captured `asyncio.sleep(0)`. Background typing and cancellation still
+need that yield. A module-wide no-yield sleep mock can starve the event loop
+and retain unbounded mock call history.
 
 ```bash
 cd /var/lib/hermes/.hermes/hermes-agent
